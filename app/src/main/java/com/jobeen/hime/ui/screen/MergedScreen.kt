@@ -157,14 +157,37 @@ private fun runSelfCheck(context: Context): String {
     line("scheme") { MergeWiring.currentScheme(context) }
     line("presets") { MergeWiring.schemePresets().joinToString(",") { it.name } }
     line("handwriting") { MergeWiring.handwritingCandidates(3, listOf(0, 1, 2, 3)) }
+    line("hwNormalize") {
+        MergeWiring.handwritingNormalize(
+            listOf(Handwriting.Point(0, 0), Handwriting.Point(3, 4), Handwriting.Point(9, 2)),
+        ).size
+    }
     line("ocr") { MergeWiring.ocrParse("Hime input method") }
     line("ocrFilter") {
         MergeWiring.ocrFilter(listOf(OcrResult.Segment("line1", 0.9f), OcrResult.Segment("low", 0.1f)))
     }
     line("assistant") { MergeWiring.assistantPrompt(Assistant.Intent.SUMMARIZE, "demo context").take(40) }
+    line("assistantAll") {
+        listOf(
+            Assistant.Intent.TRANSLATE,
+            Assistant.Intent.REWRITE,
+            Assistant.Intent.UNKNOWN,
+        ).joinToString("|") { MergeWiring.assistantPrompt(it, "demo context").take(24) }
+    }
+    line("assistantParse") {
+        listOf("/summarize", "/translate", "/rewrite", "总结", "翻译", "改写", "xyz")
+            .joinToString(",") { MergeWiring.assistantParseIntent(it) }
+    }
+    line("assistantClean") { MergeWiring.assistantCleanReply("  hello \nworld  ").length }
     line("multilang") { MergeWiring.multilangRoute("hello") }
     line("external") { MergeWiring.externalDecode(MergeWiring.externalEncode("Hime")) }
     line("script") { (MergeWiring.scriptValidate("demo", "1.0", listOf(ScriptExtension.Command("say", 1))) ?: "ok") }
+    line("scriptBadName") {
+        MergeWiring.scriptValidate("demo", "1.0", listOf(ScriptExtension.Command("x".repeat(40), 1)))
+    }
+    line("scriptBadCount") {
+        MergeWiring.scriptValidate("demo", "1.0", listOf(ScriptExtension.Command("say", 99)))
+    }
     line("backup") {
         val m = MergeWiring.backupBuild(listOf(UnifiedBackup.Entry("rime.lua", 42, "deadbeef")))
         if (m == null) "gated-off" else "verify=${MergeWiring.backupVerify(m)}"
@@ -177,6 +200,25 @@ private fun runSelfCheck(context: Context): String {
         "add=${d.add.size}"
     }
     line("layout") { MergeWiring.layoutToYaml(listOf(LayoutImport.KeyDef("a", "b"))) }
+    line("dvorak") {
+        MergeWiring.layoutToDvorak(
+            listOf(LayoutImport.KeyDef("a", "b"), LayoutImport.KeyDef("c", "d")),
+        ).size
+    }
+    line("ocrJob") { MergeWiring.ocrJob("img-1").toString() }
+    line("features") { MergeWiring.featureEntries().size }
+    line("neighborRec") {
+        MergeWiring.neighborRecord(context, 'g', 'f')
+        MergeWiring.neighborCorrect(context, 'g')
+    }
+    line("presetOne") { MergeWiring.schemePreset("wusong")?.name ?: "none" }
+    line("gates") {
+        listOf(
+            MergeWiring.isNeighborCorrectEnabled(context),
+            MergeWiring.isFuzzyEnabled(context),
+            MergeWiring.isClipboardChunkEnabled(context),
+        ).toString()
+    }
     line("floating") { MergeWiring.floatingFrame(context, 10, 10, 200, 100, 1080, 1920).toString() }
     return sb.toString().trimEnd()
 }
