@@ -1,0 +1,262 @@
+package com.jobeen.hime.ui.screen
+
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import com.jobeen.hime.R
+import com.jobeen.hime.data.manager.CandidateManager
+import com.jobeen.hime.ui.screen.ScreenComponent.SettingsGroup
+import com.jobeen.hime.ui.screen.ScreenComponent.SliderRow
+import com.jobeen.hime.ui.screen.ScreenComponent.SwitchRow
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun CandidateSettingsScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    var predictionEnabled by remember {
+        mutableStateOf(CandidateManager.isPredictionEnabled(context))
+    }
+    var rerankEnabled by remember {
+        mutableStateOf(CandidateManager.isRerankEnabled(context))
+    }
+    var emailSuffixEnabled by remember {
+        mutableStateOf(CandidateManager.isEmailSuffixEnabled(context))
+    }
+    var rareCharactersEnabled by remember {
+        mutableStateOf(CandidateManager.isRareCharactersEnabled(context))
+    }
+    var showIndex by remember {
+        mutableStateOf(CandidateManager.isShowIndex(context))
+    }
+    var showComment by remember {
+        mutableStateOf(CandidateManager.isShowComment(context))
+    }
+    var inlineInputModeEnabled by remember {
+        mutableStateOf(CandidateManager.isInlineInputModeEnabled(context))
+    }
+    var borderEnabled by remember {
+        mutableStateOf(CandidateManager.isBorderEnabled(context))
+    }
+    var lineLimitEnabled by remember {
+        mutableStateOf(CandidateManager.isLineLimitEnabled(context))
+    }
+    var maxLines by remember {
+        mutableFloatStateOf(CandidateManager.getMaxLines(context).toFloat())
+    }
+    var spacing by remember {
+        mutableFloatStateOf(
+            CandidateManager.getCandidateSpacingDp(context)
+                ?: CandidateManager.CANDIDATE_SPACING_DEFAULT_DP,
+        )
+    }
+    var candidateScale by remember {
+        mutableFloatStateOf(CandidateManager.getCandidateScale(context))
+    }
+    var autoShrinkEnabled by remember {
+        mutableStateOf(CandidateManager.isAutoShrinkEnabled(context))
+    }
+    var fullDisplayEnabled by remember {
+        mutableStateOf(CandidateManager.isFullDisplayEnabled(context))
+    }
+    var inlineSuggestionEnabled by remember {
+        mutableStateOf(CandidateManager.isInlineSuggestionEnabled(context))
+    }
+    var swipePagingEnabled by remember {
+        mutableStateOf(CandidateManager.isSwipePagingEnabled(context))
+    }
+    var manualPagingButtonEnabled by remember {
+        mutableStateOf(CandidateManager.isManualPagingButtonEnabled(context))
+    }
+
+    SettingsPageScaffold(
+        title = stringResource(R.string.prediction_candidates),
+        onBack = onBack,
+    ) {
+        // 候选页分组（2026-10-29 批量第 3 项，按参考分类重组）：
+            // 候选内容（预测与增强）＋窗口显示（序号、注释、边框）。
+            SettingsGroup(title = stringResource(R.string.candidate_content)) {
+                SwitchRow(
+                    title = stringResource(R.string.model_prediction_enable),
+                    checked = predictionEnabled,
+                    onCheckedChange = {
+                        predictionEnabled = it
+                        CandidateManager.setPredictionEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.model_rerank_enable),
+                    checked = rerankEnabled,
+                    onCheckedChange = {
+                        rerankEnabled = it
+                        CandidateManager.setRerankEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.email_suffix_enable),
+                    checked = emailSuffixEnabled,
+                    onCheckedChange = {
+                        emailSuffixEnabled = it
+                        CandidateManager.setEmailSuffixEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.rare_characters_enable),
+                    subtitle = stringResource(R.string.rare_characters_enable_desc),
+                    checked = rareCharactersEnabled,
+                    onCheckedChange = {
+                        rareCharactersEnabled = it
+                        CandidateManager.setRareCharactersEnabled(context, it)
+                    },
+                )
+            }
+
+            SettingsGroup(title = stringResource(R.string.candidate_window)) {
+                SwitchRow(
+                    title = stringResource(R.string.candidate_show_index),
+                    checked = showIndex,
+                    onCheckedChange = {
+                        showIndex = it
+                        CandidateManager.setShowIndex(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_show_comment),
+                    checked = showComment,
+                    onCheckedChange = {
+                        showComment = it
+                        CandidateManager.setShowComment(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_inline_input_mode),
+                    checked = inlineInputModeEnabled,
+                    onCheckedChange = {
+                        inlineInputModeEnabled = it
+                        CandidateManager.setInlineInputModeEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_border),
+                    checked = borderEnabled,
+                    onCheckedChange = {
+                        borderEnabled = it
+                        CandidateManager.setBorderEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_line_limit),
+                    checked = lineLimitEnabled,
+                    onCheckedChange = {
+                        lineLimitEnabled = it
+                        CandidateManager.setLineLimitEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SliderRow(
+                    title = stringResource(R.string.candidate_max_lines),
+                    value = maxLines,
+                    defaultValue = 5f,
+                    valueLabel = stringResource(R.string.candidate_max_lines_value, maxLines.toInt()),
+                    range = 1f..10f,
+                    enabled = lineLimitEnabled,
+                    onValueChange = {
+                        maxLines = it
+                        CandidateManager.setMaxLines(context, it.toInt())
+                    },
+                    showDivider = true,
+                )
+                SliderRow(
+                    title = stringResource(R.string.candidate_spacing),
+                    value = spacing,
+                    defaultValue = 8f,
+                    valueLabel = "${spacing.toInt()} dp",
+                    range = CandidateManager.CANDIDATE_SPACING_MIN_DP..
+                        CandidateManager.CANDIDATE_SPACING_MAX_DP,
+                    onValueChange = {
+                        spacing = it
+                        CandidateManager.setCandidateSpacingDp(context, it)
+                    },
+                    showDivider = true,
+                    steps = 23,
+                )
+                SliderRow(
+                    title = stringResource(R.string.candidate_scale),
+                    value = candidateScale,
+                    defaultValue = 1.0f,
+                    valueLabel = "${(candidateScale * 100).toInt()}%",
+                    range = CandidateManager.CANDIDATE_SCALE_MIN..
+                        CandidateManager.CANDIDATE_SCALE_MAX,
+                    onValueChange = {
+                        candidateScale = it
+                        CandidateManager.setCandidateScale(context, it)
+                    },
+                    showDivider = true,
+                    steps = 13,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_auto_shrink),
+                    checked = autoShrinkEnabled,
+                    onCheckedChange = {
+                        autoShrinkEnabled = it
+                        CandidateManager.setAutoShrinkEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_full_display),
+                    checked = fullDisplayEnabled,
+                    onCheckedChange = {
+                        fullDisplayEnabled = it
+                        CandidateManager.setFullDisplayEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_inline_suggestion),
+                    checked = inlineSuggestionEnabled,
+                    onCheckedChange = {
+                        inlineSuggestionEnabled = it
+                        CandidateManager.setInlineSuggestionEnabled(context, it)
+                    },
+                    showDivider = true,
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_swipe_paging),
+                    subtitle = stringResource(R.string.candidate_swipe_paging_desc),
+                    checked = swipePagingEnabled,
+                    onCheckedChange = {
+                        swipePagingEnabled = it
+                        CandidateManager.setSwipePagingEnabled(context, it)
+                    },
+                )
+                SwitchRow(
+                    title = stringResource(R.string.candidate_manual_paging_button),
+                    checked = manualPagingButtonEnabled,
+                    onCheckedChange = {
+                        manualPagingButtonEnabled = it
+                        CandidateManager.setManualPagingButtonEnabled(context, it)
+                    },
+                )
+                Text(
+                    text = stringResource(R.string.candidate_inline_suggestion_note),
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+    }
+}

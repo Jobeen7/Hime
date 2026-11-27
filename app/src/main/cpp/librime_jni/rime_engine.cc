@@ -1,0 +1,786 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Main JNI entry point and RIME engine bridge. Exposes the librime C API
+// (rime_api.h, BSD-3-Clause) to the Kotlin layer through a set of static
+// JNI methods on the com.jobeen.hime.engine.rime.core.Rime class.
+
+#include <rime_api.h>
+
+#include <csignal>
+#include <ctime>
+#include <cstdlib>
+#include <fcntl.h>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <tuple>
+#include <unistd.h>
+#include <vector>
+
+#include "jni_env.h"
+#include "rime_bridge.h"
+#include "rime_data.h"
+#include "t9_session.h"
+
+using namespace rime_jni;
+
+// Forward declarations for librime plugin module dependency registration.
+// These are defined in the plugin shared object files and must have external
+// linkage so the linker can resolve them.
+extern void rime_require_module_lua();
+
+extern void rime_require_module_octagram();
+
+extern void rime_require_module_predict();
+
+extern void rime_require_module_t9();
+
+namespace {
+
+    constexpr int kMaxSchemaIdLen = 2048;
+    // 首屏批量取数上限：条带一屏约十余个、展开首屏约二十余个，24 够用。
+    // 旧值 100 使每键都构造上百个候选对象过 JNI，绝大多数从未被看到；
+    // 更多候选由 UI 滚动到底时走 getCandidates(start, limit) 分页补取，
+    // 取满本上限时 bulk 的 size 报 -1（总数未知）即"还有更多"的信号。
+    constexpr int kBulkCandidateLimit = 24;
+
+    void requireModules() {
+        rime_require_module_lua();
+        rime_require_module_octagram();
+        rime_require_module_predict();
+        rime_require_module_t9();
+    }
+
+    class RimeSession {
+    public:
+        RimeSession() : id_(rime_get_api()->create_session()) {
+            if (!id_) throw std::runtime_error("create_session failed");
+        }
+
+        ~RimeSession() {
+            if (id_) rime_get_api()->destroy_session(id_);
+        }
+
+        RimeSession(const RimeSession &) = delete;
+
+        RimeSession &operator=(const RimeSession &) = delete;
+
+        RimeSessionId id() const { return id_; }
+
+    private:
+        RimeSessionId id_ = 0;
+    };
+
+    class RimeEngine {
+    public:
+        static RimeEngine &instance() {
+            static RimeEngine eng;
+            return eng;
+        }
+
+        RimeEngine() : api_(rime_get_api()) {}
+
+        RimeEngine(const RimeEngine &) = delete;
+
+        RimeEngine &operator=(const RimeEngine &) = delete;
+
+        void startup(bool fullCheck, RimeNotificationHandler handler) {
+            if (!api_) return;
+
+            RIME_STRUCT(RimeTraits, traits)
+            traits.shared_data_dir = std::getenv("RIME_SHARED_DATA_DIR");
+            traits.user_data_dir = std::getenv("RIME_USER_DATA_DIR");
+            traits.log_dir = "";
+            traits.app_name = "rime.cpp";
+            traits.distribution_name = "Hime";
+            traits.distribution_code_name = "Hime";
+            traits.distribution_version = std::getenv("RIME_DISTRIBUTION_VERSION");
+
+            api_->setup(&traits);
+            api_->initialize(&traits);
+            api_->set_notification_handler(handler, jni::g_refs->vm);
+            api_->start_maintenance(fullCheck);
+        }
+
+        void shutdown() {
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                session_.reset();
+            }
+            // N-S1：finalize() 内部就是 JoinMaintenanceThread（对同一
+            // future 调 get），必须与 joinMaintenanceThread() 持同一把
+            // join_mutex_ 串行，否则并发 get 第二次抛 std::future_error
+            // 穿过 JNI。锁顺序固定为 session_mutex_ → join_mutex_，
+            // joinMaintenanceThread() 只取后一把，无逆序死锁。
+            std::lock_guard<std::mutex> lock(join_mutex_);
+            api_->finalize();
+        }
+
+        // N-S1 之后 joinMaintenanceThread() 仍保留本方法：部署等待
+        // 路径在 IO 线程上 join，与 rime-main 的 shutdown() 串行于
+        // 同一把 join_mutex_（见 shutdown()）。
+        void joinMaintenanceThread() {
+            std::lock_guard<std::mutex> lock(join_mutex_);
+            api_->join_maintenance_thread();
+        }
+
+        bool syncUserData() {
+            {
+                std::lock_guard<std::mutex> lock(session_mutex_);
+                session_.reset();
+            }
+            return api_->sync_user_data();
+        }
+
+        bool processKey(int keycode, int mask) {
+            return api_->process_key(sessionId(), keycode, mask);
+        }
+
+        bool simulateKeySequence(const std::string &seq) {
+            return api_->simulate_key_sequence(sessionId(), seq.c_str());
+        }
+
+        bool setInput(const std::string &input) {
+            return api_->set_input(sessionId(), input.c_str());
+        }
+
+        bool appendInput(const std::string &input) {
+            return api_->append_input(sessionId(), input.c_str());
+        }
+
+        size_t getInputConfirmedPosition() {
+            return api_->get_input_confirmed_pos(sessionId());
+        }
+
+        bool commitComposition() {
+            return api_->commit_composition(sessionId());
+        }
+
+        bool commitCurrentSelection(const std::string &append) {
+            return api_->commit_current_selection(sessionId(), append.empty() ? nullptr : append.c_str());
+        }
+
+        void clearComposition() { api_->clear_composition(sessionId()); }
+
+        void freeContext() {
+            RIME_STRUCT(RimeContext, data)
+            auto sid = sessionId();
+            if (api_->get_context(sid, &data)) {
+                api_->free_context(&data);
+            }
+        }
+
+        std::unique_ptr<CommitData> commit() {
+            RIME_STRUCT(RimeCommit, data)
+            if (api_->get_commit(sessionId(), &data)) {
+                auto p = std::make_unique<CommitData>(&data);
+                api_->free_commit(&data);
+                return p;
+            }
+            return std::make_unique<CommitData>();
+        }
+
+        std::unique_ptr<ContextData> context() {
+            RIME_STRUCT(RimeContext, data)
+            auto sid = sessionId();
+            if (api_->get_context(sid, &data)) {
+                const char *input = api_->get_input(sid);
+                size_t caret = api_->get_caret_pos(sid);
+                auto p = std::make_unique<ContextData>(
+                        &data, input ? input : "", static_cast<int>(caret));
+                api_->free_context(&data);
+                return p;
+            }
+            return std::make_unique<ContextData>();
+        }
+
+        std::unique_ptr<StatusData> status() {
+            RIME_STRUCT(RimeStatus, data)
+            if (api_->get_status(sessionId(), &data)) {
+                auto p = std::make_unique<StatusData>(&data);
+                api_->free_status(&data);
+                return p;
+            }
+            return std::make_unique<StatusData>();
+        }
+
+        void setOption(const std::string &key, bool value) {
+            api_->set_option(sessionId(), key.c_str(), value);
+        }
+
+        bool getOption(const std::string &key) {
+            return api_->get_option(sessionId(), key.c_str());
+        }
+
+        std::string currentSchemaId() {
+            char buf[kMaxSchemaIdLen];
+            return api_->get_current_schema(sessionId(), buf, kMaxSchemaIdLen) ? buf
+                                                                               : "";
+        }
+
+        std::vector<SchemaEntry> schemaList() {
+            RimeSchemaList list{};
+            std::vector<SchemaEntry> out;
+            if (api_->get_schema_list(&list)) {
+                out = SchemaEntry::fromList(list);
+                api_->free_schema_list(&list);
+            }
+            return out;
+        }
+
+        bool selectSchema(const std::string &id) {
+            return api_->select_schema(sessionId(), id.c_str());
+        }
+
+        std::string rawInput() {
+            const char *s = api_->get_input(sessionId());
+            return s ? s : "";
+        }
+
+        // ---- T9 会话访问器（WO52 1.5，自研插件；API 面与对端
+        // RimeNative.t9PinyinList/t9SetPinyin 相同）----
+        // 列表与定拼音的展开/重写在插件纯函数里（t9_session.h），
+        // 本层只负责从会话读写 input/confirmedPos/preedit。
+
+        // 当前未解析数字段的首音节候选项（单个空格连接）；无组字
+        // 或无未解析段时为空串。
+        std::string t9PinyinList() {
+            return hime::t9::T9PinyinList(rawInput(), getInputConfirmedPosition());
+        }
+
+        // 把 pinyin 钉为当前未解析段的首音节后重算候选；pinyin
+        // 不在候选项内时返回 false、会话不动（调用方回落到既有
+        // Kotlin 重建输入）。
+        bool t9SetPinyin(const std::string &pinyin) {
+            std::string next;
+            if (!hime::t9::T9SetPinyin(rawInput(), getInputConfirmedPosition(),
+                                      pinyin, &next)) {
+                return false;
+            }
+            return setInput(next);
+        }
+
+        size_t caretPos() { return api_->get_caret_pos(sessionId()); }
+
+        void setCaretPos(size_t pos) { api_->set_caret_pos(sessionId(), pos); }
+
+        bool selectCandidate(size_t index, bool global) {
+            return global ? api_->select_candidate(sessionId(), index)
+                          : api_->select_candidate_on_current_page(sessionId(), index);
+        }
+
+        bool deleteCandidate(size_t index, bool global) {
+            return global ? api_->delete_candidate(sessionId(), index)
+                          : api_->delete_candidate_on_current_page(sessionId(), index);
+        }
+
+        bool changePage(bool backward) {
+            return api_->change_page(sessionId(), backward);
+        }
+
+        bool highlightCandidate(size_t index, bool onCurrentPage) {
+            return onCurrentPage
+                       ? api_->highlight_candidate_on_current_page(sessionId(), index)
+                       : api_->highlight_candidate(sessionId(), index);
+        }
+
+        std::vector<CandidateData> candidates(int start, int limit) {
+            std::vector<CandidateData> out;
+            // N-M2：limit 未校验即 reserve(limit)，负值转 size_t 为极大值，
+            // reserve 抛 std::length_error 穿过 JNI。limit <= 0 即空页，
+            // 与 Kotlin 侧 getCandidates 的 limit <= 0 守卫同口径。
+            if (limit <= 0) return out;
+            out.reserve(static_cast<size_t>(limit));
+            RimeCandidateListIterator iter{};
+            if (api_->candidate_list_from_index(sessionId(), &iter, start)) {
+                int count = 0;
+                while (api_->candidate_list_next(&iter)) {
+                    if (count >= limit) break;
+                    out.emplace_back(iter.candidate, std::to_string((count + 1) % 10));
+                    ++count;
+                }
+                api_->candidate_list_end(&iter);
+            }
+            return out;
+        }
+
+        // highlighted 由 Kotlin 侧从同批已取的 context 传入，不再为它
+        // 在这里重复调一次 get_context 全量查询。页号／页宽取自同一
+        // 批 context 的 menu（librime 自身记账，换组字即归零，无需
+        // 另设 native 记账变量）：快照候选恒为当前 native 页起的
+        // 24 条——此前恒取全局第 0–23 条，翻页后快照仍是首页。
+        // 步长取方案 page_size（非 bulk 上限 24：方案页宽 6 时，
+        // 页号×24 会每翻一页跳过 3 个 native 页）；页宽未知时
+        // 回落 24。
+        std::tuple<int, int, std::vector<CandidateData>> bulkCandidates(
+                int highlighted, int pageNumber, int pageSize) {
+            const int stride = pageSize > 0 ? pageSize : kBulkCandidateLimit;
+            const int start = pageNumber > 0 ? pageNumber * stride : 0;
+            auto list = candidates(start, kBulkCandidateLimit);
+            int size = static_cast<int>(list.size()) < kBulkCandidateLimit
+                       ? static_cast<int>(list.size())
+                       : -1;
+            return std::make_tuple(size, highlighted, std::move(list));
+        }
+
+    private:
+        RimeApi *api_;
+        std::shared_ptr<RimeSession> session_;
+        std::mutex join_mutex_;
+        // session_ 的读写跨两个线程：引擎线程（全部 API 调用）与通知分发
+        // 线程（只读查询走 sessionId 懒建），外加 shutdown/syncUserData 的
+        // reset。shared_ptr 控制块并发读写是未定义行为，统一用这把锁串行；
+        // 无竞争时开销可忽略，懒建本身也只在首次/重置后发生一次
+        std::mutex session_mutex_;
+
+        RimeSessionId sessionId() {
+            std::lock_guard<std::mutex> lock(session_mutex_);
+            if (!session_) {
+                try {
+                    session_ = std::make_shared<RimeSession>();
+                } catch (...) {
+                    session_.reset();
+                }
+            }
+            return session_ ? session_->id() : 0;
+        }
+    };
+
+}  // namespace
+
+jni::GlobalRefs *jni::g_refs = nullptr;
+
+JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
+    jni::g_refs = new jni::GlobalRefs(vm);
+    requireModules();
+    return JNI_VERSION_1_6;
+}
+
+// ---- Native crash evidence (CrashTrap companion) ----
+// Minimal async-signal-safe handler: appends one journal line
+// "<epochMs> native:<signum>:<faultAddrHex>\n" to a pre-opened fd (the same
+// crash_journal.txt the Java handler appends to with O_APPEND), then
+// restores the default handler and re-raises so the process dies exactly
+// as it would without this handler. It NEVER returns to the faulting code
+// and NEVER swallows the crash: a native crash still terminates the
+// process by its signal (tombstone included); this handler only adds one
+// evidence line for the crash-loop breaker. No backtrace: backtrace() is
+// not async-signal-safe. No malloc/stdio/JNI inside the handler, and no
+// sprintf anywhere on this path (hand-rolled digit conversion only).
+// Runs on a dedicated alternate stack (sigaltstack + SA_ONSTACK) so a
+// stack-overflow fault can still record its line.
+namespace {
+
+int g_crash_journal_fd = -1;
+
+// Fixed alternate stack: 16 KiB, comfortably above MINSIGSTKSZ and far
+// more than the ~40-byte journal line plus call frames need.
+char g_crash_alt_stack[16384];
+
+void crash_write_all(const char *buf, int len) {
+    while (len > 0) {
+        ssize_t n = ::write(g_crash_journal_fd, buf, static_cast<size_t>(len));
+        if (n <= 0) return;
+        buf += n;
+        len -= static_cast<int>(n);
+    }
+}
+
+int crash_append_u64(char *buf, int pos, unsigned long long value, int base) {
+    char tmp[32];
+    int digits = 0;
+    if (value == 0) {
+        tmp[digits++] = '0';
+    } else {
+        while (value > 0) {
+            int d = static_cast<int>(value % static_cast<unsigned long long>(base));
+            tmp[digits++] = static_cast<char>(d < 10 ? '0' + d : 'a' + d - 10);
+            value /= static_cast<unsigned long long>(base);
+        }
+    }
+    for (int i = digits - 1; i >= 0; --i) buf[pos++] = tmp[i];
+    return pos;
+}
+
+void native_crash_handler(int sig, siginfo_t *info, void *) {
+    if (g_crash_journal_fd >= 0) {
+        struct timespec ts;
+        long long ms = 0;
+        if (::clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+            ms = static_cast<long long>(ts.tv_sec) * 1000LL + ts.tv_nsec / 1000000LL;
+        }
+        char buf[128];
+        int pos = 0;
+        pos = crash_append_u64(buf, pos, static_cast<unsigned long long>(ms), 10);
+        const char *mid = " native:";
+        for (int i = 0; mid[i] != '\0'; ++i) buf[pos++] = mid[i];
+        pos = crash_append_u64(buf, pos, static_cast<unsigned long long>(sig), 10);
+        buf[pos++] = ':';
+        pos = crash_append_u64(
+            buf, pos,
+            reinterpret_cast<unsigned long long>(info ? info->si_addr : nullptr), 16);
+        buf[pos++] = '\n';
+        crash_write_all(buf, pos);
+    }
+    struct sigaction sa;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_handler = SIG_DFL;
+    sa.sa_flags = 0;
+    ::sigaction(sig, &sa, nullptr);
+    ::raise(sig);
+    // raise() with the default disposition must terminate; if it ever
+    // returns, exit immediately rather than resuming the faulting code.
+    ::_exit(128 + sig);
+}
+
+}  // namespace
+
+extern "C" {
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_base_CrashTrap_installNativeCrashHandler(
+        JNIEnv *env, jclass, jstring journal_path) {
+    jni::StringChars path(env, journal_path);
+    if (g_crash_journal_fd >= 0) {
+        ::close(g_crash_journal_fd);
+        g_crash_journal_fd = -1;
+    }
+    int fd = ::open(path.get(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return JNI_FALSE;
+    g_crash_journal_fd = fd;
+    stack_t ss;
+    ss.ss_sp = g_crash_alt_stack;
+    ss.ss_flags = 0;
+    ss.ss_size = sizeof(g_crash_alt_stack);
+    ::sigaltstack(&ss, nullptr);
+    struct sigaction sa;
+    ::sigemptyset(&sa.sa_mask);
+    sa.sa_sigaction = native_crash_handler;
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    const int signals[] = {SIGSEGV, SIGABRT, SIGBUS, SIGILL, SIGFPE};
+    for (int sig : signals) {
+        // Partial install is still useful (other signals covered);
+        // keep going rather than failing the whole install.
+        ::sigaction(sig, &sa, nullptr);
+    }
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_bootstrap(
+        JNIEnv *env, jclass, jstring shared_dir, jstring user_dir,
+        jstring version_name, jboolean full_check) {
+    jni::StringChars shared(env, shared_dir);
+    jni::StringChars user(env, user_dir);
+    jni::StringChars version(env, version_name);
+
+    setenv("RIME_SHARED_DATA_DIR", shared.get(), 1);
+    setenv("RIME_USER_DATA_DIR", user.get(), 1);
+    setenv("RIME_DISTRIBUTION_VERSION", version.get(), 1);
+
+    auto handler = [](void * /*ctx*/, RimeSessionId, const char *type,
+                      const char *value) {
+        int code = 0;
+        if (std::strcmp(type, "schema") == 0) {
+            code = 1;
+        } else if (std::strcmp(type, "option") == 0) {
+            code = 2;
+        } else if (std::strcmp(type, "deploy") == 0) {
+            code = 3;
+        }
+        // N-L1：未知类型（含 librime 的 "property"，name=value 串）
+        // 不再丢弃，照 code 0 转发；Kotlin 侧 types[0] 是 Unknown
+        //（Key 是 ordinal 10），nativeCreate 的 else 分支产
+        // UnknownMessage，不会如旧注释所称去构造 Key 消息。
+        jni::ScopedEnv scoped = jni::g_refs->attach();
+        JNIEnv *env = scoped;
+        // N-L3：attach 失败时 env 为 null，绝不能在空 env 上调 JNI。
+        if (env == nullptr) return;
+        jobjectArray args =
+                env->NewObjectArray(1, jni::g_refs->Object, nullptr);
+        jni::LocalRef<jstring> ref(env, jni::makeString(env, value));
+        if (args == nullptr || ref.get() == nullptr) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            if (args != nullptr) env->DeleteLocalRef(args);
+            return;
+        }
+        env->SetObjectArrayElement(args, 0, ref.get());
+        env->CallStaticVoidMethod(jni::g_refs->Rime, jni::g_refs->HandleRimeMessage,
+                                  code, args);
+        // Kotlin 侧处理若抛异常，未决异常会留在 librime 的工作线程上，
+        // 此后该线程任何 JNI 调用都会 abort：必须当场记录并清除。
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        env->DeleteLocalRef(args);
+    };
+
+    RimeEngine::instance().startup(full_check, handler);
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_shutdown(JNIEnv *env, jclass) {
+    // N-S1 纵深防线：锁已串行 finalize 与 join（见 shutdown()），
+    // 此处再兜住任何 C++ 异常转 Java 异常，绝不让它穿过 JNI 边界。
+    try {
+        RimeEngine::instance().shutdown();
+    } catch (const std::exception &e) {
+        jni::throwException(env, e.what());
+    } catch (...) {
+        jni::throwException(env, "rime_jni: unknown error in shutdown");
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_joinMaintenanceThread(JNIEnv *env, jclass) {
+    try {
+        RimeEngine::instance().joinMaintenanceThread();
+    } catch (const std::exception &e) {
+        jni::throwException(env, e.what());
+    } catch (...) {
+        jni::throwException(env, "rime_jni: unknown error in joinMaintenanceThread");
+    }
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_syncUserData(JNIEnv *, jclass) {
+    return RimeEngine::instance().syncUserData();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_processKey(
+        JNIEnv *, jclass, jint keycode, jint mask) {
+    return RimeEngine::instance().processKey(keycode, mask);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_commitComposition(
+        JNIEnv *, jclass) {
+    return RimeEngine::instance().commitComposition();
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_commitCurrentSelection(
+        JNIEnv *env, jclass, jstring append) {
+    jni::StringChars suffix(env, append);
+    return RimeEngine::instance().commitCurrentSelection(suffix.str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_clearComposition(
+        JNIEnv *, jclass) {
+    RimeEngine::instance().clearComposition();
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_freeContext(
+        JNIEnv *, jclass) {
+    RimeEngine::instance().freeContext();
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getCommit(JNIEnv *env,
+                                                       jclass) {
+    auto c = RimeEngine::instance().commit();
+    return toJavaCommit(env, *c);
+}
+
+JNIEXPORT jobject JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getStatus(JNIEnv *env,
+                                                       jclass) {
+    auto s = RimeEngine::instance().status();
+    return toJavaStatus(env, *s);
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_setOption(
+        JNIEnv *env, jclass, jstring option, jboolean value) {
+    jni::StringChars key(env, option);
+    RimeEngine::instance().setOption(key.str(), value);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getOption(JNIEnv *env,
+                                                       jclass,
+                                                       jstring option) {
+    jni::StringChars key(env, option);
+    return RimeEngine::instance().getOption(key.str());
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getSchemaList(JNIEnv *env,
+                                                           jclass) {
+    return toJavaSchemaArray(env, RimeEngine::instance().schemaList());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getCurrentSchema(
+        JNIEnv *env, jclass) {
+    return jni::makeString(env, RimeEngine::instance().currentSchemaId());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_selectSchema(
+        JNIEnv *env, jclass, jstring schema_id) {
+    jni::StringChars id(env, schema_id);
+    return RimeEngine::instance().selectSchema(id.str());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_simulateKeySequence(
+        JNIEnv *env, jclass, jstring key_sequence) {
+    jni::StringChars seq(env, key_sequence);
+    return RimeEngine::instance().simulateKeySequence(seq.str());
+}
+
+JNIEXPORT jstring JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getRawInput(JNIEnv *env,
+                                                         jclass) {
+    return jni::makeString(env, RimeEngine::instance().rawInput());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_setInput(JNIEnv *env,
+                                                       jclass, jstring input) {
+    jni::StringChars raw(env, input);
+    return RimeEngine::instance().setInput(raw.str());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_appendInput(JNIEnv *env,
+                                                         jclass, jstring input) {
+    jni::StringChars raw(env, input);
+    return RimeEngine::instance().appendInput(raw.str());
+}
+
+
+JNIEXPORT jint JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getInputConfirmedPosition(JNIEnv *env,
+                                                      jclass) {
+    return static_cast<jint>(RimeEngine::instance().getInputConfirmedPosition());
+}
+
+// ---- T9 会话访问器（WO52 1.5）----
+
+JNIEXPORT jstring JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_t9PinyinList(JNIEnv *env, jclass) {
+    return jni::makeString(env, RimeEngine::instance().t9PinyinList());
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_t9SetPinyin(JNIEnv *env, jclass,
+                                                      jstring pinyin) {
+    jni::StringChars p(env, pinyin);
+    return RimeEngine::instance().t9SetPinyin(p.str());
+}
+
+JNIEXPORT void JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_setCaretPos(JNIEnv *, jclass,
+                                                         jint caret_pos) {
+    RimeEngine::instance().setCaretPos(static_cast<size_t>(caret_pos));
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_selectCandidate(
+        JNIEnv *, jclass, jint index, jboolean global) {
+    return RimeEngine::instance().selectCandidate(
+            static_cast<size_t>(index), global);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_deleteCandidate(
+        JNIEnv *, jclass, jint index, jboolean global) {
+    return RimeEngine::instance().deleteCandidate(
+            static_cast<size_t>(index), global);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_changeCandidatePage(
+        JNIEnv *, jclass, jboolean backward) {
+    return RimeEngine::instance().changePage(backward);
+}
+
+JNIEXPORT jboolean JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_highlightCandidate(
+        JNIEnv *, jclass, jint index, jboolean onCurrentPage) {
+    return RimeEngine::instance().highlightCandidate(
+            static_cast<size_t>(index), onCurrentPage);
+}
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getCandidates(
+        JNIEnv *env, jclass, jint start_index, jint limit) {
+    auto list = RimeEngine::instance().candidates(start_index, limit);
+    return toJavaCandidateArray(env, list);
+}
+
+namespace {
+
+// bulk 三元数组 [size, highlighted, candidates]：快照专用构造
+//（Kotlin 侧 Candidate 消息解析只认此形）。
+jobjectArray toJavaBulkArray(JNIEnv *env, int size, int highlighted,
+                             const std::vector<CandidateData> &list) {
+    jni::LocalRef<> sizeObj(
+            env, env->NewObject(jni::g_refs->Integer, jni::g_refs->IntegerCtor, size));
+    jni::LocalRef<> hlObj(env, env->NewObject(jni::g_refs->Integer,
+                                              jni::g_refs->IntegerCtor, highlighted));
+    jni::LocalRef<jobjectArray> listObj(env, toJavaCandidateArray(env, list));
+    // N-L2：任一子对象 OOM 为 null 时不得继续往数组里塞 null 再调 JNI——
+    // 当场清掉 OOM 异常、返回 null 交 Kotlin 侧以可控失败处理。
+    if (sizeObj.get() == nullptr || hlObj.get() == nullptr ||
+        listObj.get() == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+
+    jobjectArray result =
+            env->NewObjectArray(3, jni::g_refs->Object, nullptr);
+    if (result == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    env->SetObjectArrayElement(result, 0, sizeObj.get());
+    env->SetObjectArrayElement(result, 1, hlObj.get());
+    env->SetObjectArrayElement(result, 2, listObj.get());
+    return result;
+}
+
+}  // namespace
+
+JNIEXPORT jobjectArray JNICALL
+Java_com_jobeen_hime_engine_rime_core_Rime_getSnapshotAfterKey(JNIEnv *env,
+                                                               jclass) {
+    // 一次 JNI 取回按键响应全量：commit + context + bulk 首屏。
+    // bulk 的 highlighted 直接取自同批 context（此前由 Kotlin 侧从
+    // context 转交，不再重复取 context）；三次 native 会话读仍在
+    // C++ 内完成，省的是两次 JNI 往返（marshalling 与局部引用管理）。
+    auto commit = RimeEngine::instance().commit();
+    auto ctx = RimeEngine::instance().context();
+    auto [size, hl, list] = RimeEngine::instance().bulkCandidates(
+            ctx->menu.highlightedIndex, ctx->menu.pageNumber, ctx->menu.pageSize);
+
+    jni::LocalRef<> commitObj(env, toJavaCommit(env, *commit));
+    jni::LocalRef<> contextObj(env, toJavaContext(env, *ctx));
+    jni::LocalRef<jobjectArray> bulkObj(env, toJavaBulkArray(env, size, hl, list));
+    // N-L2：同 toJavaBulkArray，任一子对象为 null 即整体返回 null，
+    // 不把 null 塞进结果数组（Kotlin 侧对 null 元素做非空强转会失败）。
+    if (commitObj.get() == nullptr || contextObj.get() == nullptr ||
+        bulkObj.get() == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+
+    jobjectArray result =
+            env->NewObjectArray(3, jni::g_refs->Object, nullptr);
+    if (result == nullptr) {
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        return nullptr;
+    }
+    env->SetObjectArrayElement(result, 0, commitObj.get());
+    env->SetObjectArrayElement(result, 1, contextObj.get());
+    env->SetObjectArrayElement(result, 2, bulkObj.get());
+    return result;
+}
+
+}  // extern "C"

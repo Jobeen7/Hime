@@ -1,0 +1,192 @@
+package com.jobeen.hime.base.util
+
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
+import org.apache.commons.compress.compressors.bzip2.BZip2CompressorInputStream
+import timber.log.Timber
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.InputStream
+import java.io.OutputStream
+
+/**
+ * .tar.bz2 解包工具：针对 BZip2 的流特性进行了多层缓存优化，支持保留文件和目录的 mtime。
+ */
+object TarBz2ExtractorUtil {
+
+    private const val BUFFER_SIZE = 64 * 1024
+    private const val STREAM_BUFFER = 256 * 1024
+    private const val REPORT_STEP = 256 * 1024L
+    private const val LOG_STEP = 16 * 1024 * 1024L
+
+    // 解压体积上限（防解压炸弹）：现用最大的语音模型包解压后约 600MB，
+    // 上限取单文件 1GB、总量 2GB，留足余量又不至于被恶意包撑爆磁盘
+    private const val MAX_ENTRY_BYTES = 1L * 1024 * 1024 * 1024
+    private const val MAX_TOTAL_BYTES = 2L * 1024 * 1024 * 1024
+
+    /** 解压体积超过上限时抛出，调用方按解压失败处理 */
+    class ExtractLimitException(message: String) : java.io.IOException(message)
+
+    fun extract(
+        archive: File,
+        destDir: File,
+        onProgress: (current: Long, total: Long) -> Unit = { _, _ -> },
+        filter: (entryName: String) -> Boolean = { true },
+    ) {
+        destDir.mkdirs()
+        val destPath =
+            destDir.canonicalPath.let { if (it.endsWith(File.separator)) it else "$it${File.separator}" }
+        val total = archive.length()
+
+        val counting = CountingInputStream(FileInputStream(archive))
+        val state = ProgressState()
+        val sharedBuffer = ByteArray(BUFFER_SIZE)
+
+        counting.use { cis ->
+            BufferedInputStream(cis, STREAM_BUFFER).use { bufferedIn ->
+                BZip2CompressorInputStream(bufferedIn).use { bzIn ->
+                    BufferedInputStream(bzIn, STREAM_BUFFER).use { tarBufferedIn ->
+                        TarArchiveInputStream(tarBufferedIn).use { tarIn ->
+                            var entry = tarIn.nextEntry
+                            while (entry != null) {
+                                val entryName = entry.name
+                                val outFile = File(destDir, entryName)
+                                val outPath = outFile.canonicalPath
+
+                                // 严格路径穿越防护
+                                if (!outPath.startsWith(destPath) && outPath != destDir.canonicalPath) {
+                                    Timber.w("Skip unsafe archive entry: %s", entryName)
+                                } else if (entry.isSymbolicLink || entry.isLink) {
+                                    // 符号链接／硬链接条目一律跳过（B-L9）：不创建
+                                    // 链接，否则其后同名文件条目的写出会跟随链接
+                                    // 写到链接目标处（包外任意路径）。
+                                    Timber.w("Skip link archive entry: %s", entryName)
+                                } else {
+                                    val shouldExtract = filter(entryName)
+                                    if (entry.isDirectory) {
+                                        if (shouldExtract) {
+                                            // 目标位置已是符号链接时不跟随建目录：
+                                            // 先删链接、再建真实目录。
+                                            deleteStaleLinks(outFile, destDir)
+                                            outFile.mkdirs()
+                                            // 恢复目录的修改时间
+                                            setEntryTime(outFile, entry)
+                                        }
+                                    } else {
+                                        if (shouldExtract) {
+                                            // 目标位置已是符号链接时不跟随写出：
+                                            // 先删链接、再写真实文件。
+                                            deleteStaleLinks(outFile, destDir)
+                                            outFile.parentFile?.mkdirs()
+                                            BufferedOutputStream(
+                                                outFile.outputStream(), STREAM_BUFFER
+                                            ).use { os ->
+                                                pump(tarIn, os, counting, total, onProgress, state, sharedBuffer)
+                                            }
+                                            // 文件写入完成后，恢复文件的修改时间 (mtime)
+                                            setEntryTime(outFile, entry)
+                                        } else {
+                                            // 过滤条目：纯消费跳过，不写盘
+                                            pump(tarIn, null, counting, total, onProgress, state, sharedBuffer)
+                                        }
+                                    }
+                                }
+                                entry = tarIn.nextEntry
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        onProgress(counting.bytesRead.coerceAtMost(total), total)
+    }
+
+    /**
+     * 删掉 [file] 自身及其到 [destDir] 之间祖先链上的符号链接（B-L9）：
+     * 写出不跟随链接。指向 dest 外的链接早被 canonical 前缀检查拦下；
+     * 这里处理指向 dest 内的链接（写出会落到错误位置、覆盖目标文件）。
+     * destDir 本身不碰；真实目录／文件原样保留。
+     */
+    private fun deleteStaleLinks(file: File, destDir: File) {
+        val destPath = destDir.absolutePath
+        var current: File? = file.absoluteFile
+        while (current != null && current.absolutePath != destPath) {
+            if (current.canonicalFile != current.absoluteFile) {
+                current.delete()
+            }
+            current = current.parentFile
+        }
+    }
+
+    private fun setEntryTime(file: File, entry: TarArchiveEntry) {
+        try {
+            entry.lastModifiedDate?.time?.let { time ->
+                if (time > 0) {
+                    file.setLastModified(time)
+                }
+            }
+        } catch (e: Exception) {
+            Timber.w(e, "Failed to set mtime for %s", file.name)
+        }
+    }
+
+    private fun pump(
+        tarIn: TarArchiveInputStream,
+        out: OutputStream?,
+        counting: CountingInputStream,
+        total: Long,
+        onProgress: (Long, Long) -> Unit,
+        state: ProgressState,
+        buffer: ByteArray,
+    ) {
+        var entryBytes = 0L
+        var n: Int
+        while (tarIn.read(buffer).also { n = it } != -1) {
+            if (out != null) {
+                out.write(buffer, 0, n)
+                entryBytes += n
+                state.extractedBytes += n
+                if (entryBytes > MAX_ENTRY_BYTES || state.extractedBytes > MAX_TOTAL_BYTES) {
+                    throw ExtractLimitException(
+                        "Extracted size exceeds limit (entry=$entryBytes, total=${state.extractedBytes})",
+                    )
+                }
+            }
+            val currentBytes = counting.bytesRead
+
+            if (currentBytes - state.lastReported >= REPORT_STEP) {
+                state.lastReported = currentBytes
+                onProgress(currentBytes, total)
+            }
+            if (currentBytes - state.lastLogged >= LOG_STEP) {
+                state.lastLogged = currentBytes
+                Timber.d("Extracting... %.1f%%", currentBytes * 100f / total)
+            }
+        }
+        out?.flush()
+    }
+
+    private data class ProgressState(
+        var lastReported: Long = 0L,
+        var lastLogged: Long = 0L,
+        /** 已实际写盘的解压字节数（过滤跳过的条目不计） */
+        var extractedBytes: Long = 0L,
+    )
+
+    private class CountingInputStream(private val src: InputStream) : InputStream() {
+        var bytesRead = 0L
+            private set
+
+        override fun read(): Int {
+            return src.read().also { if (it >= 0) bytesRead++ }
+        }
+
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            return src.read(b, off, len).also { if (it > 0) bytesRead += it }
+        }
+
+        override fun close() = src.close()
+    }
+}

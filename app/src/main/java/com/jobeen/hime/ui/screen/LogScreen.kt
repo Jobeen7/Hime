@@ -1,0 +1,277 @@
+package com.jobeen.hime.ui.screen
+
+import android.content.ClipData
+import android.content.ClipDescription
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.PersistableBundle
+import androidx.core.content.FileProvider
+import java.io.File
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.DeleteSweep
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Scaffold
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.jobeen.hime.R
+import com.jobeen.hime.base.CrashTrap
+import com.jobeen.hime.base.log.AppLogBuffer
+import com.jobeen.hime.base.log.AppLogEntry
+import com.jobeen.hime.base.util.ToastUtil
+import com.jobeen.hime.skin.diag.DiagExporter
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.data.manager.takeCodePoints
+import com.jobeen.hime.ui.screen.ScreenComponent.barFontSize
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun LogScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val entries by AppLogBuffer.entries.collectAsStateWithLifecycle()
+    val listState = rememberLazyListState()
+    // 最近崩溃记录（CrashTrap 落盘）：有内容才显示复制入口与发生
+    // 时间，纯手动取回——复制带敏感标记，不进自家剪贴板历史
+    var pendingCrash by remember { mutableStateOf<CrashTrap.PendingCrash?>(null) }
+    LaunchedEffect(Unit) {
+        pendingCrash = withContext(Dispatchers.IO) { CrashTrap.readPendingCrashInfo(context) }
+    }
+    val scope = rememberCoroutineScope()
+
+    // 跟随尾部只在用户本就在看尾部时（U-L2）：旧代码每来一条新日志就
+    // 强制滚到底，正在翻旧日志也会被拽走。prevEntriesSize 是上一次的
+    // 条数——拿新条数到达前的可见末行与它比，才能判断用户之前是否在尾部。
+    var prevEntriesSize by remember { mutableIntStateOf(0) }
+    LaunchedEffect(entries.size) {
+        val followTail = shouldFollowTail(
+            listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index,
+            prevEntriesSize,
+        )
+        prevEntriesSize = entries.size
+        if (entries.isNotEmpty() && followTail) {
+            listState.animateScrollToItem(entries.lastIndex)
+        }
+    }
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = { Text(stringResource(R.string.app_logs), fontSize = barFontSize, fontWeight = FontWeight.Bold) },
+                navigationIcon = {
+                    IconButton(onClick = onBack) {
+                        Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = null)
+                    }
+                },
+                actions = {
+                    val crash = pendingCrash
+                    if (crash != null) {
+                        val copiedLabel = stringResource(R.string.crash_copied)
+                        IconButton(onClick = {
+                            copySensitiveClip(
+                                context,
+                                // 字素口径截断：String.take 按 UTF-16
+                                // 码元计数会劈开代理对/组合 emoji
+                                crash.text.takeCodePoints(CrashTrap.MAX_CHARS),
+                                "Hime crash log",
+                            )
+                            ToastUtil.showToast(context, copiedLabel)
+                        }) {
+                            Icon(
+                                Icons.Filled.BugReport,
+                                contentDescription = stringResource(R.string.copy_last_crash),
+                            )
+                        }
+                    }
+                    // 导出诊断日志（详设十三.5）：DiagLog 近期日志 +
+                    // CrashTrap 崩溃文件打成单个 zip 走系统分享
+                    val exportFailedLabel = stringResource(R.string.diag_export_failed)
+                    IconButton(onClick = {
+                        scope.launch {
+                            val zip = withContext(Dispatchers.IO) {
+                                runCatching {
+                                    DiagLog.flush()
+                                    DiagExporter.buildExportZip(
+                                        logsDir = DiagLog.logsDir()
+                                            ?: File(context.filesDir, "logs"),
+                                        // CrashTrap 的崩溃目录（filesDir/crash）
+                                        crashDir = File(context.filesDir, "crash"),
+                                        outDir = File(context.cacheDir, "shared"),
+                                        // 性能报告目录（2026-10-29 item-1 B）
+                                        performanceDir = File(
+                                            context.filesDir,
+                                            "Logs/performance",
+                                        ),
+                                    )
+                                }.getOrNull()
+                            }
+                            if (zip == null) {
+                                ToastUtil.showToast(context, exportFailedLabel)
+                            } else {
+                                val uri = FileProvider.getUriForFile(
+                                    context,
+                                    "${context.packageName}.fileprovider",
+                                    zip,
+                                )
+                                val intent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "application/zip"
+                                    putExtra(Intent.EXTRA_STREAM, uri)
+                                    addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                }
+                                context.startActivity(Intent.createChooser(intent, null))
+                            }
+                        }
+                    }) {
+                        Icon(
+                            Icons.Filled.Share,
+                            contentDescription = stringResource(R.string.export_diag_logs),
+                        )
+                    }
+                    val logsLabel = stringResource(R.string.app_logs)
+                    IconButton(onClick = { copyLogs(context, entries.joinToString("\n") { "${it.time} ${it.tag} ${it.message}" }, logsLabel) }, enabled = entries.isNotEmpty()) {
+                        Icon(Icons.Filled.ContentCopy, contentDescription = stringResource(R.string.copy_logs))
+                    }
+                    IconButton(
+                        onClick = {
+                            AppLogBuffer.clear()
+                            // 崩溃记录一并清除（此前只清日志：崩溃文件
+                            // 只读不删、旧崩溃入口永久留在页面上）
+                            pendingCrash = null
+                            scope.launch(Dispatchers.IO) {
+                                CrashTrap.clearPendingCrashes(context)
+                            }
+                        },
+                        enabled = entries.isNotEmpty() || pendingCrash != null,
+                    ) {
+                        Icon(Icons.Filled.DeleteSweep, contentDescription = stringResource(R.string.clear_logs))
+                    }
+                },
+                
+            )
+        },
+    ) { padding ->
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(8.dp)
+                .background(MaterialTheme.colorScheme.surfaceContainerLowest),
+        ) {
+            // 最近崩溃的发生时间：记录只读不删，没有时间用户无从判断
+            // 顶栏那个入口是几天前的旧崩溃还是刚刚发生的
+            val crash = pendingCrash
+            if (crash != null) {
+                val crashTimeText = remember(crash.occurredAtMs) {
+                    java.text.SimpleDateFormat("yyyy-MM-dd HH:mm", java.util.Locale.getDefault())
+                        .format(java.util.Date(crash.occurredAtMs))
+                }
+                Text(
+                    text = stringResource(R.string.last_crash_time, crashTimeText),
+                    color = MaterialTheme.colorScheme.error,
+                    fontSize = 11.sp,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                )
+            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(8.dp),
+                verticalArrangement = Arrangement.spacedBy(3.dp),
+            ) {
+                itemsIndexed(entries, key = { _, entry -> entry.seq }) { _, entry ->
+                    LogLine(entry)
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 日志页是否应跟随尾部（U-L2）：尚未布局（lastVisibleIndex 为 null，
+ * 首次打开）或上次可见末行已是旧表尾部、或仅在尾部上方一行时跟随；
+ * 用户正翻旧日志（可见末行在尾部上方两行或更早）时不跟随。
+ * 尾部上方一行也算尾部：Lazy 列布局上报的可见末行常比实际底端
+ * 滞后一行，严卡末行本身会让正在看尾部的用户漏跟随。
+ * previousSize 是本次新条数到达前的条数。
+ */
+internal fun shouldFollowTail(lastVisibleIndex: Int?, previousSize: Int): Boolean =
+    lastVisibleIndex == null || lastVisibleIndex >= previousSize - 2
+
+@Composable
+private fun LogLine(entry: AppLogEntry) {
+    val color = when (entry.priority) {
+        android.util.Log.ERROR, android.util.Log.ASSERT -> MaterialTheme.colorScheme.error
+        android.util.Log.WARN -> MaterialTheme.colorScheme.tertiary
+        android.util.Log.INFO -> MaterialTheme.colorScheme.primary
+        else -> MaterialTheme.colorScheme.onSurfaceVariant
+    }
+    Text(
+        text = "${entry.time} ${entry.tag}: ${entry.message}",
+        color = color,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp,
+        lineHeight = 15.sp,
+        modifier = Modifier.fillMaxWidth(),
+    )
+}
+
+private fun copyLogs(context: Context, text: String, label: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, text))
+}
+
+/**
+ * 带敏感标记的复制：标记键与 ClipboardManager 读取侧口径一致
+ * （API 33+ 用公开常量、低版本用同一字符串键），自家剪贴板监控
+ * 见标记即跳过入库，系统层面也按敏感内容处理。
+ */
+private fun copySensitiveClip(context: Context, text: String, label: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+    val description = ClipDescription(label, arrayOf(ClipDescription.MIMETYPE_TEXT_PLAIN))
+    description.extras = PersistableBundle().apply {
+        putBoolean(
+            if (Build.VERSION.SDK_INT >= 33) ClipDescription.EXTRA_IS_SENSITIVE
+            else "android.content.extra.IS_SENSITIVE",
+            true,
+        )
+    }
+    clipboard.setPrimaryClip(ClipData(description, ClipData.Item(text)))
+}

@@ -1,0 +1,1142 @@
+package com.jobeen.hime.input.keyboard.impl
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import androidx.constraintlayout.widget.ConstraintLayout
+import com.jobeen.hime.R
+import com.jobeen.hime.data.PunctuationMode
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.base.feedback.InputFeedbacks
+import com.jobeen.hime.input.EnterDecision
+import com.jobeen.hime.input.EnterFieldBoundary
+import com.jobeen.hime.input.EnterOutcome
+import com.jobeen.hime.input.keyboard.key.AltTextKeyView
+import com.jobeen.hime.input.keyboard.key.CustomGestureView
+import com.jobeen.hime.input.keyboard.key.ImageKeyView
+import com.jobeen.hime.input.keyboard.key.ImageTextKeyView
+import com.jobeen.hime.input.keyboard.key.KeyboardAction
+import com.jobeen.hime.input.keyboard.key.KeyActionListener
+import com.jobeen.hime.input.keyboard.key.KeyDef
+import com.jobeen.hime.input.keyboard.key.KeyPreviewPopup
+import com.jobeen.hime.input.keyboard.key.KeyboardPopup
+import com.jobeen.hime.input.keyboard.key.KeyView
+import com.jobeen.hime.input.keyboard.key.KeyboardRippleView
+import com.jobeen.hime.input.keyboard.window.KeyboardStateManager
+import com.jobeen.hime.input.keyboard.key.SidePanelKeyView
+import com.jobeen.hime.input.keyboard.key.SwipeThresholds
+import com.jobeen.hime.input.keyboard.key.TextKeyView
+import com.jobeen.hime.skin.model.StyleStatePriority
+import com.jobeen.hime.skin.runtime.KeyActionMapping
+import com.jobeen.hime.skin.symbol.SymbolGridResolver
+import com.jobeen.hime.skin.symbol.SymbolGridSpec
+import kotlin.math.abs
+import splitties.dimensions.dp
+import splitties.views.dsl.constraintlayout.above
+import splitties.views.dsl.constraintlayout.below
+import splitties.views.dsl.constraintlayout.bottomOfParent
+import splitties.views.dsl.constraintlayout.centerVertically
+import splitties.views.dsl.constraintlayout.constraintLayout
+import splitties.views.dsl.constraintlayout.lParams
+import splitties.views.dsl.constraintlayout.leftOfParent
+import splitties.views.dsl.constraintlayout.leftToRightOf
+import splitties.views.dsl.constraintlayout.rightOfParent
+import splitties.views.dsl.constraintlayout.rightToLeftOf
+import splitties.views.dsl.constraintlayout.topOfParent
+import splitties.views.dsl.core.add
+import splitties.views.imageResource
+import timber.log.Timber
+
+// 长按弹窗选中条目的高亮蓝（新定值；全仓无现行选中蓝可复用）
+private const val LONG_PRESS_HIGHLIGHT_BLUE: Int = 0xFF0A84FF.toInt()
+
+abstract class BaseKeyboard(
+    context: Context,
+    protected val colors: KeyboardColors.ColorScheme,
+    private val keyLayout: List<List<KeyDef>>,
+) : ConstraintLayout(context), IKeyboard {
+    override var keyActionListener: KeyActionListener? = null
+    private val previewPopup = KeyPreviewPopup(context)
+    private val keyboardPopup = KeyboardPopup(context)
+    // 复用坐标数组，避免每次按键分配
+    private val keyLoc = IntArray(2)
+    private val boardLoc = IntArray(2)
+    protected val keyRows: List<ConstraintLayout>
+    val rippleView: KeyboardRippleView
+
+    private var spanPanelViews: List<KeyView> = emptyList()
+    private var spaceKeyView: TextKeyView? = null
+    /** 空格键的皮肤文案（建键时记下的布局 label；空串 = 皮肤未定义）。 */
+    private var spaceKeySkinText: String? = null
+    private var returnKeyView: ImageKeyView? = null
+
+    companion object {
+        /**
+         * 空格文案决议（空格标跟皮肤走）：皮肤空格文案非空时用皮肤文案；
+         * 皮肤未定义空格文案（空串/缺失）时回落传入的方案名（现行行为）。
+         * 纯函数，可单测；视图刷新本身依赖 Android View，走真机验收。
+         */
+        fun resolveSpaceText(skinText: String?, fallback: String): String =
+            if (!skinText.isNullOrEmpty()) skinText else fallback
+
+        /**
+         * 跨行键在某行的占位格列号（纯函数，可单测）：显式 spanCol
+         * 按该行行内键数钳制；无显式值时靠右键（alignSpanEnd）在
+         * 每行都放最后（= 该行行内键数），靠左键放行首（0）。
+         * 起始行算出的列号只决定 span 视图自身的 bias，不决定
+         * 其他行的占位格位置——九宫格回车键在第 3 行 spanCol=3，
+         * 第 4 行有 4 个行内键，旧实现沿用 3 把占位格插在切换键
+         * 前面，切换键被后画的跨行回车键盖住（.18 回归）；修后
+         * 第 4 行列号为 4，占位格落在全部行内键之后。
+         */
+        fun spacerCol(spanCol: Int?, alignSpanEnd: Boolean, inRowCount: Int): Int =
+            spanCol?.coerceIn(0, inRowCount) ?: if (alignSpanEnd) inRowCount else 0
+
+        /** 行链一段：占位格（spacer）或行内键，宽为行宽占比。 */
+        data class RowElement(val isSpacer: Boolean, val width: Float)
+
+        /**
+         * 行链装配顺序（纯函数，可单测）：行内键按序，spacer 插在
+         * 其有效列号个键之后（列号 = 其左侧的行内键数）；同列多
+         * span 按给定序（调用方须先按列号升序排）。宽：行内键乘
+         * spanScale、spacer 取 span 自身宽（不缩放，与 span 视图恒对齐）。
+         */
+        fun assembleRowElements(
+            inRowWidths: List<Float>,
+            coveringCols: List<Int>,
+            coveringWidths: List<Float>,
+            spanScale: Float,
+        ): List<RowElement> {
+            require(coveringCols.size == coveringWidths.size)
+            val elements = mutableListOf<RowElement>()
+            var inserted = 0
+            for ((keyIndex, width) in inRowWidths.withIndex()) {
+                while (inserted < coveringCols.size && coveringCols[inserted] <= keyIndex) {
+                    elements += RowElement(true, coveringWidths[inserted])
+                    inserted++
+                }
+                elements += RowElement(false, width * spanScale)
+            }
+            while (inserted < coveringCols.size) {
+                elements += RowElement(true, coveringWidths[inserted])
+                inserted++
+            }
+            return elements
+        }
+    }
+
+    /**
+     * 布局键→视图注册表：组装期建成（行内键＋跨行键全量），不重建布局
+     * 即可按 KeyDef 单键失效。键以布局的 KeyDef 本体标识（同一键盘
+     * 实例内稳定；KeyDef 为 open class、按实例相等）。
+     */
+    private val keyViewsByDef: Map<KeyDef, KeyView>
+    /**
+     * 本键盘有无专用换行键（回车精简决策输入，以键盘身份判定）：
+     * 九宫格覆写为 true（第二行那颗专用换行键），其他键盘恒 false。
+     * 只影响回车键决策与显示反推，不改任何键宽与布局。
+     */
+    open val hasDedicatedNewlineKey: Boolean = false
+    /**
+     * 回车键图标缓存：仅作显示去重（updateEditorInfo 内写），
+     * 精简决策后不再决定行为——onAction 不许再读它做变换。
+     */
+    private var returnKeyIcon: Int = 0
+    /** G1 动态文字运行时跟随：可原地刷新文本的动态键（setter + 来源 + 静态回退）。 */
+    private data class DynamicView(
+        val setText: (String) -> Unit,
+        val source: String,
+        val fallback: String,
+    )
+
+    private val dynamicViews = mutableListOf<DynamicView>()
+
+    /** 前景层实时变量刷新器（审计 K 余项：与主显动态键同批刷新）。 */
+    private val foregroundDynamicViews = mutableListOf<KeyView.ForegroundDynamic>()
+
+    /** 文字回车键刷新器（自定义布局的文本回车键，建键时按行为记下）。 */
+    private val enterTextSetters = mutableListOf<(String) -> Unit>()
+
+    override fun updateSpaceKeyText(text: String) {
+        // 参数 text 是回退值（方案名）：皮肤有空格文案时不用它，
+        // 只有皮肤未定义空格文案时才写它（现行行为）。
+        spaceKeyView?.updateText(resolveSpaceText(spaceKeySkinText, text))
+    }
+
+    override fun updateDynamicTexts(values: Map<String, String>) {
+        for (dynamic in dynamicViews) {
+            dynamic.setText(
+                KeyActionMapping.resolveDynamicDisplayText(
+                    dynamic.fallback, dynamic.source, values,
+                ),
+            )
+        }
+        // 前景层实时变量与主显同一供给、同一线程、同一批刷新。
+        for (dynamic in foregroundDynamicViews) {
+            dynamic.setText(
+                KeyActionMapping.resolveForegroundLiveText(dynamic.template, values),
+            )
+        }
+    }
+
+    private fun textSetter(view: KeyView): ((String) -> Unit)? = when (view) {
+        is TextKeyView -> { text -> view.updateText(text) }
+        is AltTextKeyView -> { text -> view.updateText(text) }
+        is ImageTextKeyView -> { text -> view.updateText(text) }
+        else -> null
+    }
+
+    protected open fun updateSidePanel(items: List<KeyDef>) {
+        spanPanelViews.filterIsInstance<SidePanelKeyView>().firstOrNull()?.updateItems(items)
+    }
+
+    protected open fun resetSidePanelPosition() {
+        spanPanelViews.filterIsInstance<SidePanelKeyView>().firstOrNull()?.resetPosition()
+    }
+
+    fun setSidePanelItemListener(listener: (KeyboardAction) -> Unit) {
+        spanPanelViews.filterIsInstance<SidePanelKeyView>().firstOrNull()
+            ?.setOnItemActionListener(listener)
+    }
+
+    init {
+        /**
+         * L1 跨行列模型：spanCol = 其左侧的行内键数（0 = 行首，
+         * 已按起始行行内键数钳制）；null 列信息沿用 alignSpanEnd
+         * 旧口径（左 → 0，右 → 起始行行内键数）。spanCol 只决定
+         * span 视图自身的 bias；各行占位格的列号按该行各自的
+         * 行内键数重算（见 [spacerCol]），不沿用起始行列号——
+         * 否则行内键数多的行会把占位格插进键列中间。
+         */
+        data class SpanDef(
+            val def: KeyDef,
+            val startRow: Int,
+            val endRow: Int,
+            val spanCol: Int,
+        )
+
+        val spanDefs = mutableListOf<SpanDef>()
+        for (ri in keyLayout.indices) {
+            val inRowCount = keyLayout[ri].count { it.appearance.rowSpan <= 1 }
+            for (def in keyLayout[ri]) {
+                if (def.appearance.rowSpan > 1) {
+                    val col = spacerCol(
+                        def.appearance.spanCol, def.appearance.alignSpanEnd, inRowCount,
+                    )
+                    spanDefs.add(
+                        SpanDef(
+                            def,
+                            ri,
+                            (ri + def.appearance.rowSpan - 1).coerceAtMost(keyLayout.size - 1),
+                            col,
+                        )
+                    )
+                }
+            }
+        }
+        val spanViews = spanDefs.map { createKeyView(it.def).also { v -> v.id = generateViewId() } }
+        spanPanelViews = spanViews
+
+        val registry = mutableMapOf<KeyDef, KeyView>()
+        spanDefs.forEachIndexed { i, sd -> registry[sd.def] = spanViews[i] }
+
+        // L1 每行列布局：覆盖 span（按本行有效列号升序，见 spacerCol）、缩放因子
+        // spanScale = (1 − Σ覆盖 span 宽) / Σ行内键宽（行内键宽和
+        // 为 0 时取 1）。不变量成立时（Σ行内键宽 + Σ覆盖 span 宽
+        // = 1.0）spanScale = 1，旧布局逐像素不变；违反时行内键
+        // 等比缩放、spacer 恒为 span 自身宽，行总和恒为 1.0、
+        // 永不溢出（旧渲染以同口径缩放吸收超限，见 AGENTS.md
+        // 行和不变量；行宽重推见 LayoutKeyDefBuilder 空白目标）。
+        // rowSpans 每项为（跨行键定义，本行占位格列号）：同一跨行键
+        // 在不同行的列号可以不同（靠右键在每行都放最后）。
+        val rowSpans = keyLayout.indices.map { rowIndex ->
+            val inRowCount = keyLayout[rowIndex].count { it.appearance.rowSpan <= 1 }
+            spanDefs.filter { rowIndex in it.startRow..it.endRow }
+                .map { sd ->
+                    sd to spacerCol(
+                        sd.def.appearance.spanCol,
+                        sd.def.appearance.alignSpanEnd,
+                        inRowCount,
+                    )
+                }
+                .sortedBy { it.second }
+        }
+        val rowSpanScales = keyLayout.indices.map { rowIndex ->
+            val parts = keyLayout[rowIndex].filterNot { it.appearance.rowSpan > 1 }
+            val inRowSum = parts.sumOf { it.appearance.percentWidth.toDouble() }.toFloat()
+            val spanSum = rowSpans[rowIndex]
+                .sumOf { it.first.def.appearance.percentWidth.toDouble() }.toFloat()
+            if (inRowSum > 0f) ((1f - spanSum) / inRowSum).coerceAtLeast(0f) else 1f
+        }
+
+        keyRows = keyLayout.mapIndexed { rowIndex, row ->
+            val parts =
+                row.filterNot { it.appearance.rowSpan > 1 }
+            val keyViews = parts.map { def -> createKeyView(def).also { registry[def] = it } }
+            val covering = rowSpans[rowIndex]
+            val spanScale = rowSpanScales[rowIndex]
+            // 透明占位格（L1）：INVISIBLE（占位不交互；GONE 会塌掉
+            // 链宽），每覆盖 span 一个，宽 = span 自身 percentWidth
+            // （不缩放，与 span 视图恒对齐）。
+            val spacerViews = covering.map {
+                View(context).apply {
+                    visibility = View.INVISIBLE
+                    id = generateViewId()
+                }
+            }
+            // 合并链：行内键按序，spacer 插在其本行有效列号个键之后
+            // （列号 = 其左侧的行内键数）；同列多 span 按 spanDefs 序。
+            // 顺序与宽度的纯函数见 assembleRowElements（可单测）。
+            val rowElements = assembleRowElements(
+                parts.map { it.appearance.percentWidth },
+                covering.map { it.second },
+                covering.map { it.first.def.appearance.percentWidth },
+                spanScale,
+            )
+            var keyCursor = 0
+            var spacerCursor = 0
+            val elements = rowElements.map { element ->
+                if (element.isSpacer) {
+                    spacerViews[spacerCursor++] to element.width
+                } else {
+                    keyViews[keyCursor++] to element.width
+                }
+            }
+
+            constraintLayout {
+                elements.forEachIndexed { index, (view, width) ->
+                    add(view, lParams {
+                        centerVertically()
+                        if (index == 0) {
+                            leftOfParent()
+                            horizontalChainStyle = LayoutParams.CHAIN_PACKED
+                        } else {
+                            leftToRightOf(elements[index - 1].first)
+                        }
+                        if (index == elements.size - 1) {
+                            rightOfParent()
+                            horizontalChainStyle = LayoutParams.CHAIN_PACKED
+                        } else {
+                            rightToLeftOf(elements[index + 1].first)
+                        }
+                        matchConstraintPercentWidth = width
+                    })
+                }
+                // 原 expandKeypressArea 分支已删：该开关恒 false、全仓
+                // 无写入方，分支永不执行（死代码清理 L7）
+            }
+        }
+        keyRows.forEachIndexed { index, row ->
+            add(row, lParams {
+                if (index == 0) topOfParent()
+                else below(keyRows[index - 1])
+                if (index == keyRows.size - 1) bottomOfParent()
+                else above(keyRows[index + 1])
+                // L1：行恒整行全宽（span 占位由行内 spacer 承担，
+                // 不再把行夹在两侧 span 视图之间）。
+                leftOfParent()
+                rightOfParent()
+            })
+        }
+
+        for (i in spanDefs.indices) {
+            val sd = spanDefs[i]
+            // bias 取起始行列布局：占位格左缘 = 前置行内键宽和 ×
+            // spanScale + 前置 spacer 宽和；bias = 左缘 / (1 − span 宽)。
+            // 旧布局（左右边缘 span）：左 span 左缘 0 → bias 0，右 span
+            // 左缘 1−w → bias 1，与旧渲染逐像素一致。
+            val startParts =
+                keyLayout[sd.startRow].filterNot { it.appearance.rowSpan > 1 }
+            val startCovering = rowSpans[sd.startRow]
+            val startScale = rowSpanScales[sd.startRow]
+            var left = 0f
+            for (other in startCovering) {
+                if (other.first === sd) break
+                left += other.first.def.appearance.percentWidth
+            }
+            left += startParts.take(sd.spanCol)
+                .sumOf { it.appearance.percentWidth.toDouble() }.toFloat() * startScale
+            val spanWidth = sd.def.appearance.percentWidth
+            val bias =
+                if (1f - spanWidth > 0f) (left / (1f - spanWidth)).coerceIn(0f, 1f) else 0f
+            add(spanViews[i], lParams {
+                topToTop = keyRows[sd.startRow].id
+                bottomToBottom = keyRows[sd.endRow].id
+                leftOfParent()
+                rightOfParent()
+                horizontalBias = bias
+                matchConstraintPercentWidth = spanWidth
+            })
+        }
+
+        // 注册表收口：行内键在行装配时已记，跨行键在上文已记。
+        keyViewsByDef = registry
+
+        rippleView = KeyboardRippleView(context).apply {
+            id = generateViewId()
+            isClickable = false
+            isEnabled = false
+            isFocusable = false
+        }
+        add(rippleView, lParams {
+            topOfParent()
+            bottomOfParent()
+            leftOfParent()
+            rightOfParent()
+        })
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    protected fun createKeyView(def: KeyDef): KeyView {
+        return when (def.appearance) {
+            is KeyDef.Appearance.AltText -> AltTextKeyView(context, colors, def.appearance)
+            is KeyDef.Appearance.ImageText -> ImageTextKeyView(context, colors, def.appearance)
+            is KeyDef.Appearance.Text -> TextKeyView(context, colors, def.appearance)
+            is KeyDef.Appearance.Image -> ImageKeyView(context, colors, def.appearance)
+            is KeyDef.Appearance.SidePannel -> SidePanelKeyView(context, colors, def.appearance)
+        }.apply {
+            if (def.appearance.viewId == KeyView.button_return && this is ImageKeyView) {
+                returnKeyView = this
+            }
+            if (def.appearance.viewId == KeyView.button_space && this is TextKeyView) {
+                spaceKeyView = this
+                spaceKeySkinText =
+                    (def.appearance as? KeyDef.Appearance.Text)?.displayText
+            }
+            borderStroke = KeyboardManager.Keyboard.KeyBorderStroke.isEnabled(context)
+            // 手势可调口径（2026-10-29 批量第 4 项）：建键时按偏好注入，
+            // 与滑动阈值同口径（建键时取值，下次键盘重建生效）
+            longPressDelayMs = KeyboardManager.Keyboard.Gesture.getLongPressTimeoutMs(context).toLong()
+            repeatIntervalMs = KeyboardManager.Keyboard.Gesture.getRepeatIntervalMs(context).toLong()
+            doubleTapTimeoutMs = KeyboardManager.Keyboard.Gesture.getDoubleTapTimeoutMs(context).toLong()
+            minSwipeVelocityPxPerSec =
+                KeyboardManager.Keyboard.Gesture.getMinSwipeVelocityPxPerSec(context).toFloat()
+            // 松开振动参与：按键面结构属性，实际发振由反馈缓存的开关 gating
+            releaseFeedbackEnabled = true
+            val slideStepChars = KeyboardManager.Keyboard.Gesture.getSlideStepChars(context)
+            // 皮肤逐键音效注入（详设 §7.2-3）：解析结果已由覆写
+            // 装配器挂在 def 上；出厂 def 两字段恒为默认，注入后
+            // 播放路径与 1.1.14 一致
+            skinSoundAssetId = def.skinSoundAssetId
+            skinSoundMuted = def.skinSoundMuted
+            // G1 前景多层叠加：视图建成后挂一次（文本/图标层压主文字之上）
+            attachForegroundLayers()
+            // 滑动方向指示：flag 为总闸，方向以合并后滑动行为为准
+            // （含滑动切换键盘的 SwitchKeyboardTypeAction）。
+            if (def.appearance.skinShowSwipeIndicators) {
+                val swipes = def.behaviors.filterIsInstance<KeyDef.Behavior.Swipe>()
+                attachSwipeIndicators(
+                    hasUp = swipes.any { it.upAction != null },
+                    hasDown = swipes.any { it.downAction != null },
+                )
+            }
+            // 前景层实时变量：含变量的文本层刷新器随视图登记，
+            // 与主显动态键同一批由 updateDynamicTexts 刷新。
+            this@BaseKeyboard.foregroundDynamicViews += foregroundDynamics
+            // 文字回车键跟随（回车文案跟 returnKeyType）：自定义布局
+            // 的文本回车键（Press ReturnAction 的文本键）记下刷新器，
+            // updateEditorInfo 按编辑框动作改文案；内置图标回车键
+            // 另走图标（textSetter 对 ImageKeyView 为空，自然排除）。
+            // 组字态通知 label 冻结：本键样式正被带 label 的通知锁定
+            // 时不登记刷新器——updateEditorInfo 在每次重建后 switchTo
+            // 里都会重发，登记了就会以“换行”盖掉锁定的通知文字
+            // （如组字态“确认”）；锁清除后下一次重建恢复登记。
+            if (def.behaviors.any { b ->
+                    b is KeyDef.Behavior.Press && b.action is KeyboardAction.ReturnAction
+                }) {
+                textSetter(this)?.let { enterTextSetters += it }
+            }
+            // G1 动态文字运行时跟随：记下可刷新文本的动态键
+            // （来源 + 静态回退），供 updateDynamicTexts 原地刷新。
+            val dynamicSource = def.appearance.skinDynamicText
+            if (dynamicSource != null) {
+                textSetter(this)?.let { setter ->
+                    dynamicViews += DynamicView(
+                        setter,
+                        dynamicSource,
+                        def.appearance.skinDynamicFallback ?: (displayText ?: ""),
+                    )
+                }
+            }
+            onPressedChanged = { key ->
+                if (key.isPressed) {
+                    val isSwitchAction = def.behaviors.any { b ->
+                        b is KeyDef.Behavior.Press && (b.action is KeyboardAction.LayoutSwitchAction || b.action is KeyboardAction.RotateSchema || b.action is KeyboardAction.ResumeAction)
+                    }
+                    if (!isSwitchAction) {
+                        key.getLocationOnScreen(keyLoc)
+                        this@BaseKeyboard.getLocationOnScreen(boardLoc)
+                        val cx = keyLoc[0] + key.width / 2f - boardLoc[0]
+                        val cy = keyLoc[1] + key.height / 2f - boardLoc[1]
+                        rippleView.startRipple(cx, cy, key)
+                    }
+                }
+            }
+            if (this is SidePanelKeyView) {
+                onRippleRequest = { screenX, screenY ->
+                    // 复用类级 boardLoc：与 onPressedChanged 同为触摸线程
+                    // 同步使用、取到坐标立即消费，不存在交错改写窗口，
+                    // 不再每次侧栏波纹新建 IntArray
+                    this@BaseKeyboard.getLocationOnScreen(boardLoc)
+                    rippleView.startRipple(screenX - boardLoc[0], screenY - boardLoc[1], this)
+                }
+            }
+            // 单槽位监听的合成（审计 I-M1）：同一键上的 Popup 长按与
+            // LongPress 行为、Swipe 与 SwipeMoveCursor 各自共用一个
+            // 监听槽位，直接赋值会让后者覆盖前者。本处只收集，到循环
+            // 后统一装一个合成监听（见文末安装点）；弹窗优先于长按
+            // 动作（弹窗接管长按槽，见 layoutSwitchKey 注释），滑动
+            // 与慢滑移光标分属不同手势相位、两者都跑。
+            val longClickHandlers = mutableListOf<View.OnLongClickListener>()
+            // 手势 handler 只取 Event（不取 View）：合成核是纯函数，
+            // 可 JVM 单测；安装点再包一层 OnGestureListener。
+            val gestureHandlers = mutableListOf<(CustomGestureView.Event) -> Boolean>()
+            // Swipe 分支解出的纵向阈值（双声明时 SwipeMoveCursor 的
+            // 800dp 不得盖掉它，见文末阈值调和）。
+            var swipeThresholdYFromSwipe: Float? = null
+            var hasSwipeBehavior = false
+            var hasMoveCursorBehavior = false
+            def.popups?.forEach { popup ->
+                when (popup) {
+                    is KeyDef.Popup.Preview -> {
+                        longClickHandlers += View.OnLongClickListener {
+                            showPreview(it as KeyView)
+                            true
+                        }
+                        onTouchUpListener = { previewPopup.dismiss() }
+                    }
+
+                    is KeyDef.Popup.Keyboard -> {
+                        var gridHighlight: Int? = null
+                        var gridSpec: SymbolGridSpec? = null
+                        var originX = 0f
+                        var initialMove = true
+                        setOnTouchListener { view, event ->
+                            when (event.actionMasked) {
+                                android.view.MotionEvent.ACTION_MOVE -> {
+                                    if (keyboardPopup.isShowing()) {
+                                        if (initialMove) {
+                                            originX = event.x
+                                            initialMove = false
+                                            // 接线轮 R6：单行格＝弹出项本身（无空位），
+                                            // 步距＝itemStep、抖动＝半步，复现旧 roundToInt 手感；
+                                            // dy=0（单行忽略纵向漂移）。
+                                            val start = keyboardPopup.selectedIndex
+                                            gridHighlight = start
+                                            gridSpec = SymbolGridSpec.create(
+                                                cells = popup.keys.map { keyboardPopup.itemLabel(it) },
+                                                columns = popup.keys.size,
+                                                anchorIndex = start,
+                                                defaultIndex = start,
+                                                cellSizePx = keyboardPopup.itemStep,
+                                                sensitivity = 1f,
+                                                jitterPx = keyboardPopup.itemStep / 2f,
+                                            )
+                                        }
+                                        val spec = gridSpec ?: return@setOnTouchListener true
+                                        val h = SymbolGridResolver.highlightFor(
+                                            spec, event.x - originX, 0f,
+                                        )
+                                        if (h != gridHighlight) {
+                                            gridHighlight = h
+                                            if (h != null) keyboardPopup.selectIndex(h)
+                                            else keyboardPopup.clearSelection()
+                                            InputFeedbacks.hapticFeedback(view)
+                                        }
+                                        return@setOnTouchListener true
+                                    }
+                                }
+
+                                else -> {}
+                            }
+                            false
+                        }
+                        longClickHandlers += View.OnLongClickListener {
+                            showKeyboardPopup(it as KeyView, popup.keys, popup.initialSelectedIndex)
+                            gridHighlight = keyboardPopup.selectedIndex
+                            initialMove = true
+                            true
+                        }
+                        onTouchUpListener = {
+                            if (keyboardPopup.isShowing()) {
+                                // 接线轮 R6：出界取消（highlight 为 null）时只关闭不提交；
+                                // 回界内恢复后抬手照常提交恢复格。
+                                val h = gridHighlight
+                                if (h != null) {
+                                    popup.keys.getOrNull(h)?.let { onAction(it) }
+                                }
+                                keyboardPopup.dismiss()
+                                gridHighlight = null
+                            }
+                        }
+                    }
+
+                    else -> {}
+                }
+            }
+            // 按住上档标记（审计 E：momentary shift）：循环结束
+            // 后再链式接线（见循环后），避免与 popups/语音分支
+            // 的单槽位监听互相覆盖。
+            var hasMomentaryShift = false
+            def.behaviors.forEach { behavior ->
+                when (behavior) {
+                    is KeyDef.Behavior.Press -> {
+                        if (behavior.action is KeyboardAction.MomentaryShiftAction) {
+                            // 按住上档不走点击分发：按下/抬手由文末
+                            // 链式钩子驱动大写状态（无点击语义）。
+                            hasMomentaryShift = true
+                        } else {
+                            setOnClickListener({
+                                // 分发期状态解析（审计 E：preedit >
+                                // uppercased > normal）：组合与大写在点击
+                                // 瞬间求值，不在装配期定死。
+                                onAction(
+                                    resolvePressAction(
+                                        behavior,
+                                        KeyboardStateManager.isComposingNow,
+                                        isUppercased,
+                                    )
+                                )
+                            })
+                        }
+                    }
+
+                    is KeyDef.Behavior.LongPress -> {
+                        longPressEnabled = true
+                        longClickHandlers += View.OnLongClickListener {
+                            val action = behavior.action
+                            if (action is KeyboardAction.VoiceInputAction) {
+                                // 语音长按穿线：把触发瞬间记下的指针 id 带上，
+                                // 父容器从录音开始就认这根手指，不等首次 MOVE
+                                onAction(
+                                    KeyboardAction.VoiceInputAction(
+                                        pointerId = (it as? CustomGestureView)?.longPressPointerId ?: -1
+                                    )
+                                )
+                            } else {
+                                onAction(action)
+                            }
+                            true
+                        }
+                        if (behavior.action is KeyboardAction.VoiceInputAction) {
+                            // 语音拖拽需要 swipeEnabled=true，否则 MOVE 在 longPressTriggered
+                            // 时会提前 return，打乱手势状态（v1.0.972 删除 SwipeMoveCursor
+                            // 后引入的问题）。这里只开 flag，不加光标移动逻辑。
+                            swipeEnabled = true
+                            // 语音长按的取消改走位移判据（20dp）：默认的
+                            // 24px 步进/出界摘除会被拇指沉降漂移误触、
+                            // 把长按吃成普通空格（审计 G1）；慢滑移光标
+                            // 的大位移仍能自然摘除。只设这一个视图，
+                            // 其他键的长按口径不变。
+                            longPressCancelSlopPx = dp(20f)
+                            onTouchMoveListener = { pointerId, rawX, rawY ->
+                                onAction(KeyboardAction.VoiceDragPosition(pointerId, rawX, rawY))
+                            }
+                            onTouchUpListener = {
+                                onAction(KeyboardAction.VoiceDragUp)
+                            }
+                        }
+                    }
+
+                    is KeyDef.Behavior.Repeat -> {
+                        repeatEnabled = true
+                        onRepeatListener = { onAction(behavior.action) }
+                    }
+
+                    is KeyDef.Behavior.Swipe -> {
+                        swipeEnabled = true
+                        // G1 左右滑：仅当左右动作至少其一存在时开 X 阈值，
+                        // 否则 X 阈值仍为 800dp（与旧行为一致，纵滑不受横向漂移干扰）。
+                        val hasHorizontal = behavior.leftAction != null ||
+                            behavior.rightAction != null
+                        // 滑动触发距离（2026-10-28 截图 6 项）：逐键 > 皮肤 > 设置 > 36dp；
+                        // 800dp 等效禁用槽原样保留，不走可调解析。
+                        val threshold = SwipeThresholds.resolve(
+                            null,
+                            null,
+                            KeyboardManager.Keyboard.SwipeThreshold.getDp(context),
+                        )
+                        swipeThresholdX = dp(if (hasHorizontal) threshold else 800f)
+                        swipeThresholdY = dp(threshold)
+                        hasSwipeBehavior = true
+                        swipeThresholdYFromSwipe = swipeThresholdY
+                        gestureHandlers += { event ->
+                            when (event.type) {
+                                // 滑动方向前景色（审计 E）：滑动中按方向
+                                // 暂显该方向色（仅上/下有样式槽），抬手/
+                                // 取消恢复默认色；无样式时全程默认色。
+                                CustomGestureView.GestureType.Move -> {
+                                    applyTransientSwipeColor(
+                                        this,
+                                        def,
+                                        swipeDirectionFor(
+                                            hasHorizontal,
+                                            event.totalX,
+                                            event.totalY,
+                                        ),
+                                    )
+                                    false
+                                }
+
+                                CustomGestureView.GestureType.Up -> {
+                                    clearTransientSwipeColor(this, def)
+                                    if (!event.consumed) {
+                                        val action = resolveSwipeAction(
+                                            behavior,
+                                            swipeDirectionFor(
+                                                hasHorizontal,
+                                                event.totalX,
+                                                event.totalY,
+                                            ),
+                                            KeyboardStateManager.isComposingNow,
+                                        )
+                                        if (action != null) {
+                                            onAction(action)
+                                            true
+                                        } else false
+                                    } else false
+                                }
+
+                                CustomGestureView.GestureType.Cancel -> {
+                                    clearTransientSwipeColor(this, def)
+                                    false
+                                }
+
+                                else -> false
+                            }
+                        }
+                    }
+
+                    is KeyDef.Behavior.DoubleTap -> {
+                        doubleTapEnabled = true
+                        onDoubleTapListener = { onAction(behavior.action) }
+                    }
+
+                    is KeyDef.Behavior.SwipeMoveCursor -> {
+                        swipeEnabled = true
+                        hasMoveCursorBehavior = true
+                        swipeThresholdX = dp(32f)
+                        // 纵向滑动不处理，阈值设大等效禁用
+                        swipeThresholdY = dp(800f)
+                        gestureHandlers += { event ->
+                            if (event.type == CustomGestureView.GestureType.Move && event.countX != 0) {
+                                val direction = if (event.countX > 0) 1 else -1
+                                // 滑动步长：每步进移动 slideStepChars 个字符（默认 1）
+                                repeat(kotlin.math.abs(event.countX) * slideStepChars) {
+                                    onAction(KeyboardAction.CursorMoveAction(direction))
+                                }
+                                // 消费掉手势，抬手时不再触发按键点击（空格）
+                                true
+                            } else {
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+            // 长按面板挂载：仅无工厂长按的键才挂接——有 Preview/
+            // Keyboard 弹窗或 LongPress 行为的键保持原行为；
+            // 网格版优先，网格无效时回落旧版单行。挂接位置在
+            // 行为循环之后、按住上档链式接线之前，使上档链式
+            // 钩子能追加在面板的抬手回调之后。
+            val hasFactoryLongPress = def.popups?.any {
+                it is KeyDef.Popup.Preview || it is KeyDef.Popup.Keyboard
+            } == true || def.behaviors.any { it is KeyDef.Behavior.LongPress }
+            // t9Symbols 集合键分区提交（Bin 皮肤左竖栏 tall 键）：
+            // 前景层四符号纵向排布，抬手按 Y 落区提交对应符号；
+            // 滑出键界抬手不提交（与长按面板“出界取消”同口径）。
+            // 链式追加在既有抬手坐标钩子之后，不盖面板/上档接线；
+            // 不消费触摸（按压动效与音效走正常按键路径，tap none 本身无动作）。
+            val zoneSymbols = def.appearance.symbolZoneSymbols
+            if (!zoneSymbols.isNullOrEmpty()) {
+                val prevRelease = onReleasePointListener
+                onReleasePointListener = { v, x, y ->
+                    prevRelease?.invoke(v, x, y)
+                    if (x in 0f..v.width.toFloat() && y in 0f..v.height.toFloat()) {
+                        val zone = ((y / v.height.toFloat()) * zoneSymbols.size)
+                            .toInt().coerceIn(0, zoneSymbols.size - 1)
+                        zoneSymbols.getOrNull(zone)?.let { symbol ->
+                            onAction(KeyboardAction.KeySequenceAction(symbol))
+                        }
+                    }
+                }
+            }
+            // 单槽位监听合成安装（审计 I-M1）：循环里只收集、到此才
+            // 装一个合成监听，弹窗／长按、滑动／移光标不再互相覆盖。
+            if (longClickHandlers.isNotEmpty()) {
+                setOnLongClickListener(combineLongClickListeners(longClickHandlers))
+            }
+            if (gestureHandlers.isNotEmpty()) {
+                val composedGestures = composeGestureHandlers(gestureHandlers)
+                onGestureListener = CustomGestureView.OnGestureListener { _, event ->
+                    composedGestures(event)
+                }
+            }
+            // 双声明阈值调和：SwipeMoveCursor 的 800dp 纵向禁用不得
+            // 盖掉 Swipe 的纵向阈值；横向取两者较小值（移光标 32dp
+            // 与滑动阈值谁更灵敏听谁的）。
+            if (hasSwipeBehavior && hasMoveCursorBehavior) {
+                swipeThresholdX = minOf(swipeThresholdX, dp(32f))
+                swipeThresholdYFromSwipe?.let { swipeThresholdY = it }
+            }
+            if (hasMomentaryShift) {
+                // 按住上档链式接线：popups/语音分支已占位时
+                // 不得覆盖（单槽位监听），一律追加在原监听之后；
+                // 循环后接线与 Set 迭代顺序无关。
+                val prevDown = onTouchDownListener
+                val prevUp = onTouchUpListener
+                onTouchDownListener = { v ->
+                    prevDown?.invoke(v)
+                    onMomentaryShiftDown()
+                }
+                onTouchUpListener = { v ->
+                    prevUp?.invoke(v)
+                    onMomentaryShiftUp()
+                }
+            }
+        }
+    }
+
+    private fun showPreview(view: KeyView) {
+        val text = view.displayText ?: return
+        // 逐键短按气泡（hintStyle）：尺寸与溢出检测由皮肤逐键
+        // 指定，未配时弹窗走默认尺寸与顶层 bubbleOverflowCheck。
+        val hintBubble = view.def.skinHintBubble
+        previewPopup.show(
+            anchor = view,
+            text = text,
+            bubbleWidthPx = hintBubble?.size?.let { context.dp(it.width).toInt() },
+            bubbleHeightPx = hintBubble?.size?.let { context.dp(it.height).toInt() },
+            checkOverflow = hintBubble?.checkIfOverflowsParentHeight,
+            textColor = when (view.def.variant) {
+                KeyDef.Appearance.Variant.Normal, KeyDef.Appearance.Variant.AltForeground -> colors.keyText
+                KeyDef.Appearance.Variant.Alternative -> colors.specialKeyText
+                KeyDef.Appearance.Variant.Accent -> colors.accentKeyText
+                KeyDef.Appearance.Variant.None -> colors.keyText
+            },
+            bgColor = when (view.def.variant) {
+                KeyDef.Appearance.Variant.Normal, KeyDef.Appearance.Variant.AltForeground -> colors.keyBackground
+                KeyDef.Appearance.Variant.Alternative -> colors.specialKeyBackground
+                KeyDef.Appearance.Variant.Accent -> colors.accentKeyBackground
+                KeyDef.Appearance.Variant.None -> Color.TRANSPARENT
+            },
+        )
+    }
+
+    private fun showKeyboardPopup(
+        view: KeyView,
+        keys: List<KeyboardAction>,
+        initialSelectedIndex: Int? = null,
+    ) {
+        keyboardPopup.show(
+            anchor = view,
+            items = keys,
+            textColor = when (view.def.variant) {
+                KeyDef.Appearance.Variant.Normal, KeyDef.Appearance.Variant.AltForeground -> colors.keyText
+                KeyDef.Appearance.Variant.Alternative -> colors.specialKeyText
+                KeyDef.Appearance.Variant.Accent -> colors.accentKeyText
+                KeyDef.Appearance.Variant.None -> colors.keyText
+            },
+            bgColor = colors.keyBackground,
+            keyBgColor = when (view.def.variant) {
+                KeyDef.Appearance.Variant.Normal, KeyDef.Appearance.Variant.AltForeground -> colors.keyBackground
+                KeyDef.Appearance.Variant.Alternative -> colors.specialKeyBackground
+                KeyDef.Appearance.Variant.Accent -> colors.accentKeyBackground
+                KeyDef.Appearance.Variant.None -> Color.TRANSPARENT
+            },
+            keyPressedColor = LONG_PRESS_HIGHLIGHT_BLUE,
+            initialSelectedIndex = initialSelectedIndex,
+        )
+    }
+
+
+
+
+    protected open fun onAction(action: KeyboardAction) {
+        // 性能埋点（2026-10-29 item-1 B）：按键分发起点，终点在
+        // MessageHandler 的 Commit 处理（配对窗口 2s，首个提交为准）。
+        com.jobeen.hime.skin.perf.PerfMonitor.noteKeyPress()
+        // 输入统计（2026-10-29 item-1 C）：按键计数（语音拖动
+        // 探针除外，见 InputStats.noteKeyPress）。
+        com.jobeen.hime.input.stats.InputStats.noteKeyPress(action)
+        // 回车精简决策：图标不再决定行为（旧的按 returnKeyIcon
+        // 换成 MultiReturnAction 的变换已删），长按 force 旁路已删。
+        // 这里只把键盘身份（有无专用换行键）填进动作，真正的
+        // 决策在分发后的引擎串行 job 内由 EnterDecision 做；
+        // 显式绑定的 MultiReturnAction 不走本分支，原样不动。
+        val transformed = if (action is KeyboardAction.ReturnAction) {
+            action.copy(hasDedicatedNewlineKey = hasDedicatedNewlineKey)
+        } else {
+            action
+        }
+        keyActionListener?.onKeyAction(transformed)
+    }
+
+    /** 大写是否激活（含按住上档）：Qwerty 覆写；其余键盘恒 false。 */
+    protected open val isUppercased: Boolean get() = false
+
+    /** 按住上档按下：Qwerty 覆写（进 Momentary）；其余键盘无操作。 */
+    protected open fun onMomentaryShiftDown() {}
+
+    /** 按住上档抬手：Qwerty 覆写（回 None）；其余键盘无操作。 */
+    protected open fun onMomentaryShiftUp() {}
+
+    /**
+     * 主文字默认色（TextKeyView/AltTextKeyView 构造期同口径）：
+     * 图标色 > 皮肤文字色 > 变体色。滑动/大写暂显色恢复时共用。
+     */
+    protected fun defaultMainTextColor(appearance: KeyDef.Appearance): Int =
+        appearance.skinIconTintColor ?: appearance.skinTextColor ?: when (appearance.variant) {
+            KeyDef.Appearance.Variant.Normal,
+            KeyDef.Appearance.Variant.AltForeground -> colors.keyText
+            KeyDef.Appearance.Variant.Alternative -> colors.specialKeyText
+            KeyDef.Appearance.Variant.Accent -> colors.accentKeyText
+            KeyDef.Appearance.Variant.None -> colors.keyText
+        }
+
+    private fun setMainTextColor(view: View, appearance: KeyDef.Appearance, color: Int?) {
+        val target = color ?: defaultMainTextColor(appearance)
+        when (view) {
+            is TextKeyView -> view.mainText.setTextColor(target)
+            is AltTextKeyView -> view.mainText.setTextColor(target)
+            else -> Unit
+        }
+    }
+
+    /**
+     * 主文字字号（S6，与 setMainTextColor 平行）：null = 跟主字号
+     * （appearance.skinTextSize），仍空时不动（留初始字号）。
+     */
+    private fun setMainTextSize(view: View, appearance: KeyDef.Appearance, size: Float?) {
+        val target = size ?: appearance.skinTextSize ?: return
+        when (view) {
+            is TextKeyView -> view.mainText.setTextSize(
+                android.util.TypedValue.COMPLEX_UNIT_DIP, target,
+            )
+            is AltTextKeyView -> view.mainText.setTextSize(
+                android.util.TypedValue.COMPLEX_UNIT_DIP, target,
+            )
+            else -> Unit
+        }
+    }
+
+    /**
+     * 大写态前景色（子类覆写：QwertyKeyboard 按当前大写态取
+     * 锁定/大写色；缺省 null = 默认色）。滑动暂显清除时恢复到
+     * 该色（§5 序：滑动＞锁定＞大写＞基础），而非直接回默认。
+     */
+    protected open fun capsForegroundColor(appearance: KeyDef.Appearance): Int? = null
+
+    /** 大写态前景字号（S6，与 capsForegroundColor 平行；缺省 null = 主字号）。 */
+    protected open fun capsForegroundSize(appearance: KeyDef.Appearance): Float? = null
+
+    private fun applyTransientSwipeColor(view: View, def: KeyDef, direction: SwipeDirection?) {
+        // §5 序：滑动色优先；该方向无滑动色时退大写态色（再无则默认色，
+        // 由 setMainTextColor 的 null 回落处理）。
+        val color = StyleStatePriority.foregroundColor(
+            swipeUpColor = def.appearance.skinSwipeUpTextColor,
+            swipeDownColor = def.appearance.skinSwipeDownTextColor,
+            capsLockedColor = null,
+            uppercasedColor = null,
+            swipeDir = when (direction) {
+                SwipeDirection.UP -> StyleStatePriority.SwipeDir.UP
+                SwipeDirection.DOWN -> StyleStatePriority.SwipeDir.DOWN
+                else -> StyleStatePriority.SwipeDir.NONE
+            },
+            isCapsLocked = false,
+            isUppercased = false,
+        ) ?: capsForegroundColor(def.appearance)
+        setMainTextColor(view, def.appearance, color)
+        // S6：滑动字号同序（该方向滑动字号＞大写态字号＞主字号）。
+        val size = when (direction) {
+            SwipeDirection.UP -> def.appearance.skinSwipeUpTextSize
+            SwipeDirection.DOWN -> def.appearance.skinSwipeDownTextSize
+            else -> null
+        } ?: capsForegroundSize(def.appearance)
+        setMainTextSize(view, def.appearance, size)
+    }
+
+    private fun clearTransientSwipeColor(view: View, def: KeyDef) {
+        // §5 恢复口径：滑动色清除后回到大写态色（无则默认色，
+        // 由 setMainTextColor 的 null 回落处理）。
+        setMainTextColor(view, def.appearance, capsForegroundColor(def.appearance))
+        // S6：字号同序恢复（大写态字号＞主字号）。
+        setMainTextSize(view, def.appearance, capsForegroundSize(def.appearance))
+    }
+
+    override fun onAttach() = Timber.d("Keyboard onAttach")
+
+    override fun onDetach() {
+        Timber.d("Keyboard onDetach")
+        rippleView.cancelRipple()
+        resetSidePanelPosition()
+        previewPopup.dismiss()
+        keyboardPopup.dismiss()
+    }
+
+    abstract override fun name(): String
+
+    override fun setRippleEnabled(enabled: Boolean) {
+        rippleView.rippleEnabled = enabled
+        rippleView.visibility = if (enabled) VISIBLE else INVISIBLE
+    }
+
+    override fun updateEditorInfo(info: EditorInfo, empty: Boolean, isComposing: Boolean) {
+        // 回车精简决策反推显示：显示与行为同一来源（EnterDecision），
+        // 不再由空探针或图标单独定。empty 参数只为接口兼容而保留，
+        // 空框不再把回车翻回换行。isComposing 在此仅作显示时点的
+        // 预测输入（组字中显示为换行图标，与旧口径一致）；按键时
+        // 的组字以引擎 job 执行时点的原始输入为准，两者时点不同
+        // 但决策函数同一，逻辑不再各定各的。残余：状态管理器的
+        // 去重三元组（动作／空／组字）不含多行与不要换行标志，
+        // 同动作的单行↔多行换框时显示可能滞后一次输入变化，
+        // 按键行为本身在按键时点现算，不受显示滞后影响。
+        // empty 参数只为接口兼容而保留，不再参与决策。
+        val field = EnterFieldBoundary.fromEditorInfo(info)
+        val displayOutcome = EnterDecision.decide(
+            composing = isComposing,
+            field = field,
+            hasDedicatedNewlineKey = hasDedicatedNewlineKey,
+            isLongPress = false,
+        )
+        // 显示与行为同一来源（I-L2）：非 PerformAction 时 editorAction
+        // 不参与映射。组字中（CommitCandidate）与插换行、无动作在显示
+        // 上都落回车图标／“换行”文案——不显示“确认”（2026-11-13 用户
+        // 定 WO35/37/41 全删，恢复 1.1.18 正式版原样）。
+        val (icon, enterLabel) = when (displayOutcome) {
+            is EnterOutcome.PerformAction -> {
+                val editorAction = EnterFieldBoundary.toEditorAction(displayOutcome.action)
+                val iconForAction = when (editorAction) {
+                    EditorInfo.IME_ACTION_SEARCH -> R.drawable.ic_keyboard_search
+                    EditorInfo.IME_ACTION_SEND -> R.drawable.ic_keyboard_send
+                    EditorInfo.IME_ACTION_GO -> R.drawable.ic_keyboard_go
+                    EditorInfo.IME_ACTION_PREVIOUS -> R.drawable.ic_keyboard_arrow_left
+                    EditorInfo.IME_ACTION_NEXT -> R.drawable.ic_keyboard_arrow_right
+                    EditorInfo.IME_ACTION_DONE -> R.drawable.ic_keyboard_done
+                    else -> R.drawable.ic_keyboard_return
+                }
+                iconForAction to
+                    com.jobeen.hime.input.keyboard.window.ReturnKeyTypeText.labelFor(editorAction)
+            }
+            // 无动作（九宫格多行无标志）文案为空，不再谎称“换行”
+            // （I-L2，.10 审计修复，WO35/37/41 删除不碰它）。
+            is EnterOutcome.NoOp -> R.drawable.ic_keyboard_return to ""
+            // 上屏候选、插换行在显示上都落回车图标／换行文案。
+            else -> R.drawable.ic_keyboard_return to "换行"
+        }
+        if (icon != returnKeyIcon) {
+            returnKeyIcon = icon
+            returnKeyView?.img?.imageResource = returnKeyIcon
+        }
+        enterTextSetters.forEach { it(enterLabel) }
+        // 回车底色跟皮肤走：不设 backgroundOverride（分色已撤）。
+    }
+
+    override fun updatePunctuationMode(mode: PunctuationMode) {
+        keyRows.forEach { row ->
+            for (index in 0 until row.childCount) {
+                (row.getChildAt(index) as? KeyView)?.updateMode(mode)
+            }
+        }
+        spanPanelViews.forEach { it.updateMode(mode) }
+    }
+}
+
+/** 滑动方向（纯决策，与 CustomGestureView 事件口径一致）。 */
+internal enum class SwipeDirection { UP, DOWN, LEFT, RIGHT }
+
+/**
+ * 分发期点击动作解析（审计 E：preedit > uppercased > normal）：
+ * 组合中 preedit 动作优先；无 preedit 动作时大写动作次之；
+ * 均无时用普通动作。组合且无 preedit 时不跳过大写（两态
+ * 独立，preedit 只压过普通，不压过大写缺省）。
+ */
+internal fun resolvePressAction(
+    behavior: KeyDef.Behavior.Press,
+    isComposing: Boolean,
+    isUppercased: Boolean,
+): KeyboardAction = StyleStatePriority.action(
+    preeditAction = behavior.preeditAction,
+    uppercasedAction = behavior.uppercasedAction,
+    baseAction = behavior.action,
+    isComposing = isComposing,
+    isUppercased = isUppercased,
+)
+
+/**
+ * 滑动主导轴判定（与旧 Up 分支逐字同口径）：横向步数绝对值
+ * 不小于纵向且有左右动作时走横向，否则走纵向；零位移无方向。
+ */
+internal fun swipeDirectionFor(
+    hasHorizontal: Boolean,
+    totalX: Int,
+    totalY: Int,
+): SwipeDirection? = when {
+    hasHorizontal && totalX != 0 &&
+        kotlin.math.abs(totalX) >= kotlin.math.abs(totalY) ->
+        if (totalX < 0) SwipeDirection.LEFT else SwipeDirection.RIGHT
+    totalY < 0 -> SwipeDirection.UP
+    totalY > 0 -> SwipeDirection.DOWN
+    else -> null
+}
+
+/**
+ * 分发期滑动动作解析：组合中该方向 preedit 动作优先，
+ * 否则该方向普通动作；无方向或该方向无动作时为 null。
+ */
+internal fun resolveSwipeAction(
+    behavior: KeyDef.Behavior.Swipe,
+    direction: SwipeDirection?,
+    isComposing: Boolean,
+): KeyboardAction? {
+    if (direction == null) return null
+    if (isComposing) {
+        val preedit = when (direction) {
+            SwipeDirection.UP -> behavior.preeditUpAction
+            SwipeDirection.DOWN -> behavior.preeditDownAction
+            SwipeDirection.LEFT -> behavior.preeditLeftAction
+            SwipeDirection.RIGHT -> behavior.preeditRightAction
+        }
+        if (preedit != null) return preedit
+    }
+    return when (direction) {
+        SwipeDirection.UP -> behavior.upAction
+        SwipeDirection.DOWN -> behavior.downAction
+        SwipeDirection.LEFT -> behavior.leftAction
+        SwipeDirection.RIGHT -> behavior.rightAction
+    }
+}
+
+/**
+ * 长按监听合成（纯函数，可单测；I-M1）：多个长按 handler 按注册
+ * 顺序依次调用，首个返回 true 的胜出、其余不再调用——弹窗优先
+ * 于长按动作（弹窗接管长按槽，见 layoutSwitchKey 注释），长按
+ * 动作只在无弹窗认领时触发；都返回 false 时合成监听返回 false。
+ */
+internal fun combineLongClickListeners(
+    listeners: List<View.OnLongClickListener>,
+): View.OnLongClickListener = View.OnLongClickListener { view ->
+    for (listener in listeners) {
+        if (listener.onLongClick(view)) return@OnLongClickListener true
+    }
+    false
+}
+
+/**
+ * 手势 handler 合成（纯函数，可单测；I-M1）：滑动与慢滑移光标分属
+ * 不同手势相位（Move 计步移光标、Up 触发滑动动作），两者都须
+ * 看到同一事件，故全部调用、返回值取或——任一消费即本次手势
+ * 已被消费。调用顺序即注册顺序（behaviors 集合的声明顺序）。
+ */
+internal fun composeGestureHandlers(
+    handlers: List<(CustomGestureView.Event) -> Boolean>,
+): (CustomGestureView.Event) -> Boolean = { event ->
+    var consumed = false
+    for (handler in handlers) {
+        if (handler(event)) consumed = true
+    }
+    consumed
+}

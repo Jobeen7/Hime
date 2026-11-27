@@ -1,0 +1,156 @@
+<?xml version='1.0' encoding='utf-8'?>
+<issues format="6" by="lint 9.1.1" type="baseline" client="gradle" dependencies="false" name="AGP (9.1.1)" variant="all" version="9.1.1">
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                showStatus(context.getString(R.string.cloud_voice_error_load_failed), error = true)" errorLine2="                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="272" column="28" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                showStatus(context.getString(R.string.cloud_voice_error_too_large), error = true)" errorLine2="                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="276" column="28" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        context.getString(" errorLine2="                        ^">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="282" column="25" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                        context.getString(R.string.cloud_voice_need_keys)," errorLine2="                                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="508" column="41" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                    context.getString(R.string.cloud_voice_preferred_cleared)," errorLine2="                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="524" column="37" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                context.getString(R.string.cloud_voice_error_load_failed)," errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="595" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                showStatus(context.getString(R.string.cloud_voice_imported))" errorLine2="                                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="788" column="44" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                context.getString(R.string.cloud_voice_preferred_cleared)" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="816" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                context.getString(R.string.cloud_voice_deleted)" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/CloudVoicePluginsScreen.kt" line="818" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                if (ok) context.getString(R.string.import_success)" errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="141" column="25" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                else context.getString(R.string.stats_import_failed_format)," errorLine2="                     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="142" column="22" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            shareFile(file, &quot;application/json&quot;, context.getString(R.string.stats_export_json_title))" errorLine2="                                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="174" column="49" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                toast(context.getString(R.string.stats_share_image_failed))" errorLine2="                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="184" column="23" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                shareFile(file, &quot;image/png&quot;, context.getString(R.string.stats_share_image_title))" errorLine2="                                             ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="186" column="46" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="        context.startActivity(Intent.createChooser(intent, context.getString(R.string.stats_share_image_title)))" errorLine2="                                                           ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="197" column="60" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            toast(context.getString(R.string.stats_copy_failed))" errorLine2="                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="203" column="19" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            manager.setPrimaryClip(ClipData.newPlainText(context.getString(R.string.input_stats_title), text))" errorLine2="                                                         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="205" column="58" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            toast(context.getString(R.string.copied))" errorLine2="                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="206" column="19" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                toast(context.getString(R.string.stats_cleared))" errorLine2="                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="621" column="23" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                toast(context.getString(R.string.stats_fastest_cleared))" errorLine2="                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="637" column="23" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                toast(context.getString(R.string.stats_image_share_only))" errorLine2="                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/InputStatsScreen.kt" line="751" column="39" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                            context.getString(R.string.rime_sync_cleanup_empty)" errorLine2="                                            ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="254" column="45" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                            toast(context.getString(R.string.rime_sync_folder_invalid))" errorLine2="                                  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="314" column="35" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                toast(context.getString(R.string.rime_sync_path_invalid))" errorLine2="                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="351" column="39" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                                toast(context.getString(R.string.rime_sync_path_server_changed))" errorLine2="                                      ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="354" column="39" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        var msg = context.getString(" errorLine2="                                  ^">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="394" column="35" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                            msg += context.getString(" errorLine2="                                   ^">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/RimeScreen.kt" line="400" column="36" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            ToastUtil.showToast(context.getString(R.string.fab_deploy_busy))" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="382" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            ToastUtil.showToast(context.getString(R.string.schema_update_busy))" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="386" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                    ToastUtil.showToast(context.getString(R.string.schema_dir_empty_schemes))" errorLine2="                                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="405" column="41" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                    context.getString(" errorLine2="                    ^">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="459" column="21" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            ToastUtil.showToast(context.getString(R.string.schema_update_busy))" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="507" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="            ToastUtil.showToast(context.getString(importFailureString(outcome.failure)))" errorLine2="                                ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="578" column="33" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        context.getString(R.string.schema_import_error_too_large)" errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="625" column="25" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        context.getString(" errorLine2="                        ^">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="630" column="25" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        context.getString(R.string.schema_import_error_copy)" errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/SchemaSettingsScreen.kt" line="641" column="25" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        errorText = context.getString(R.string.toolbar_name_empty)" errorLine2="                                    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/ToolbarScreen.kt" line="1870" column="37" />
+    </issue>
+
+    <issue id="LocalContextGetResourceValueCall" message="Querying resource values using LocalContext.current" errorLine1="                        context.getString(R.string.voice_input_switch_save_failed)," errorLine2="                        ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~">
+        <location file="src/main/java/com/jobeen/hime/ui/screen/VoiceSettingsScreen.kt" line="254" column="25" />
+    </issue>
+
+    </issues>

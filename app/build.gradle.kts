@@ -1,0 +1,286 @@
+plugins {
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.compose)
+    alias(libs.plugins.kotlin.serialization)
+    alias(libs.plugins.ksp)
+}
+
+import java.util.zip.ZipFile
+
+/**
+ * D-L3（WO36）构建期盖戳：内置万象方案版本取自随包 resource.zip
+ * 内的 shared/version.txt，不再手写常量（常量曾停在 v18.0.15 与
+ * 实际内置 18.1.0 脱节，方案页本地版本错报）。配置期读取：zip
+ * 不在／条目缺失／内容非法时回落到哨兵值并告警，不让
+ * 构建失败——resource.zip 是 gitignored 生成物，干净检出时可
+ * 能不在。回落值是哨兵（WO45 P3：旧回落值 18.1.13 与真实
+ * 18.1.13 无法区分，WanxiangUpdateManagerTest 钉住
+ * BUILTIN_SCHEMA_VERSION == "v18.1.13" 时 zip 缺失也照过；
+ * 哨兵使测试在 zip 缺失时失败，显式告警）。
+ * 盖戳验证：unzip -p app/src/main/assets/resource.zip
+ * shared/version.txt 应为 18.1.14，且 WanxiangUpdateManagerTest
+ * 钉住 BUILTIN_SCHEMA_VERSION == "v18.1.14"（该测试只在盖戳值
+ * 正确时通过）。
+ * 注意：构建脚本里 `java` 会解析到 Java 插件扩展，不能写
+ * `java.util.zip.ZipFile` 全限定名，故用上面 import；`try` 不作
+ * 返回值表达式，用语句形式＋显式 return。
+ */
+fun readBundledWanxiangVersionForStamp(): String {
+    val fallback = "0.0.0-unknown"
+    val zipFile = file("src/main/assets/resource.zip")
+    if (!zipFile.isFile) {
+        logger.warn("D-L3: resource.zip 缺失，BUILTIN_SCHEMA_VERSION 回落到 v$fallback")
+        return fallback
+    }
+    try {
+        ZipFile(zipFile).use { zip ->
+            val entry = zip.getEntry("shared/version.txt")
+            if (entry == null) {
+                logger.warn("D-L3: resource.zip 内无 shared/version.txt，BUILTIN_SCHEMA_VERSION 回落到 v$fallback")
+                return fallback
+            }
+            val text = zip.getInputStream(entry).bufferedReader().readText().trim()
+            if (!text.matches(Regex("\\d+\\.\\d+\\.\\d+.*"))) {
+                logger.warn("D-L3: shared/version.txt 内容非法（'$text'），BUILTIN_SCHEMA_VERSION 回落到 v$fallback")
+                return fallback
+            }
+            return text
+        }
+    } catch (e: Exception) {
+        logger.warn("D-L3: 读 resource.zip 失败（${e.message}），BUILTIN_SCHEMA_VERSION 回落到 v$fallback")
+        return fallback
+    }
+}
+
+@Suppress("UnstableApiUsage") android {
+    namespace = "com.jobeen.hime"
+    compileSdk = 37
+    // 显式锁定 NDK 版本，避免换机器或 AGP 升级时默认 NDK 悄悄变化、
+    // 原生产物不可复现（取本机实际在用版本）
+    ndkVersion = "28.2.13676358"
+
+    defaultConfig {
+        applicationId = "com.jobeen.hime"
+        minSdk = 24
+        //noinspection OldTargetApi
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.0.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        // 应用名/输入法名不写在 strings.xml 里：debug 需要在同一资源名上
+        // 覆盖成不同值（见 buildTypes.debug），resValue 按构建类型生成
+        resValue("string", "app_name", "Hime")
+
+        // D-L3 构建期盖戳：内置万象版本由构建期从 resource.zip 内
+        // shared/version.txt 取值生成（见文件头 readBundledWanxiangVersionForStamp），
+        // 运行时只作 shared/version.txt 读不到时的兜底。
+        buildConfigField(
+            "String",
+            "BUILTIN_SCHEMA_VERSION",
+            "\"v${readBundledWanxiangVersionForStamp()}\"",
+        )
+
+        ndk {
+            //noinspection ChromeOsAbiSupport
+            abiFilters += listOf("arm64-v8a")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += "-DANDROID_STL=c++_shared"
+                arguments += "-DENABLE_LOGGING=OFF"
+                arguments += "-DALSO_LOG_TO_STDERR=OFF"
+                arguments += "-DCMAKE_BUILD_TYPE=Release"
+            }
+        }
+    }
+
+    packaging {
+        // window-core 与 window-core-jvm
+        // 两个包都带同路径 LICENSE 文本，类不冲突、仅资源文件撞路径，排除即可
+        resources {
+            excludes += "META-INF/androidx/window/window-core/LICENSE.txt"
+        }
+        jniLibs {
+            useLegacyPackaging = true
+            // QNN 运行时已删除：剔除 sherpa-onnx AAR 内随包的 QNN 原生库
+            //（选包写死 int8 家族、运行时无 QNN 路径，此前为纯死重量）
+            excludes += listOf(
+                "**/libQnnHtp.so",
+                "**/libQnnSystem.so",
+                "**/libQnnHtpV81*.so",
+            )
+        }
+    }
+
+    // Hime 专用持久签名：VM 重置会丢 /root/.android 下的 debug key，
+    // 为避免签名变化导致无法覆盖安装，所有构建统一用此 key。
+    // 密码放在 ~/.gradle/gradle.properties（HIME_*），不进仓库；没有配置时回退默认 debug 签名。
+    signingConfigs {
+        create("himeStable") {
+            val ksPath = project.findProperty("HIME_STORE_FILE") as String?
+            if (ksPath != null && file(ksPath).exists()) {
+                storeFile = file(ksPath)
+                storePassword = project.findProperty("HIME_STORE_PASSWORD") as String?
+                keyAlias = project.findProperty("HIME_KEY_ALIAS") as String?
+                keyPassword = project.findProperty("HIME_KEY_PASSWORD") as String?
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            // debug 带 .debug 后缀，与正式版不同包名：同机可并存，
+            // 跑仪器测试/调试装包不会覆盖或清掉正式版的数据
+            applicationIdSuffix = ".debug"
+            // 同机并存时与正式版区分应用名/输入法名，避免启用错输入法
+            resValue("string", "app_name", "Hime Debug")
+            val ksPath = project.findProperty("HIME_STORE_FILE") as String?
+            if (ksPath != null && file(ksPath).exists()) {
+                signingConfig = signingConfigs.getByName("himeStable")
+            }
+        }
+        release {
+            // 与已发布版本同一把 key，保证覆盖升级；无配置时回退默认 debug 签名
+            val ksPath = project.findProperty("HIME_STORE_FILE") as String?
+            if (ksPath != null && file(ksPath).exists()) {
+                signingConfig = signingConfigs.getByName("himeStable")
+            }
+            // R8 第二步：2026-10-01 开启 isShrinkResources（资源均为静态引用，无动态 getIdentifier）
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            )
+        }
+    }
+    compileOptions {
+        sourceCompatibility = JavaVersion.VERSION_11
+        targetCompatibility = JavaVersion.VERSION_11
+    }
+    buildFeatures {
+        compose = true
+        buildConfig = true
+        // WO52 3.1b：IRimeService.aidl（:ime Service Binder 面）
+        aidl = true
+        // app_name 走 resValue 按构建类型生成（见 defaultConfig）
+        resValues = true
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.directories.add("src/main/libs")
+            assets {
+                directories.add("src/main/assets")
+                // 许可证文件单源生成的 assets（见 syncLicenses 任务）
+                directories.add("build/generated/licensesAssets")
+            }
+        }
+    }
+
+    // Lint 基线（WO47）：107 个 LocalContextGetResourceValueCall 存量冻结——
+    // 回调 lambda 里调不了 stringResource()，换语言不刷新对本应用零影响；
+    // 新增的同类错误仍会拦 CI。真缺陷（16 NewApi＋1 NonObservableLocale）已修掉，不在基线里。
+    lint {
+        baseline = file("lint-baseline.xml")
+    }
+}
+
+// 许可证单源：根目录 THIRD_PARTY_NOTICES.md 与 licenses/ 是唯一维护源，
+// 构建时同步进生成的 assets 目录随 APK 分发（应用内「关于 → 开源许可」
+// 读 assets/licenses/）。不要再往 app/src/main/assets 里放手工副本。
+val syncLicenses = tasks.register<Copy>("syncLicenses") {
+    from(rootProject.file("THIRD_PARTY_NOTICES.md")) {
+        into("licenses")
+    }
+    from(rootProject.file("licenses")) {
+        into("licenses")
+    }
+    into(layout.buildDirectory.dir("generated/licensesAssets"))
+}
+tasks.named("preBuild") {
+    dependsOn(syncLicenses)
+}
+
+// release 构建 fail-fast：HIME 持久签名未配置时，release 的 signingConfig
+// 不会被赋值，AGP 产出未签名包——能装但覆盖不了已发布版本，且构建不报错、
+// 极易误发。仅当本次调用包含 release 产物任务时拦截；debug 构建、单元测试、
+// lint 等不受影响（debug 仍可回退默认签名）。产物任务判定：任务名含
+// Release 且以前缀 assemble/bundle/install/publish/package/sign 任一
+// 开头——旧版只筛前四类，漏了直接跑 packageRelease（assemble 的
+// 依赖链外单点产物入口）与签名任务；testReleaseUnitTest、lintRelease、
+// mergeReleaseResources 等非产物任务前缀不在此列，恒不拦截。
+// 判断按实际任务图（taskGraph.whenReady）而非 startParameter 原始字符串：
+// 命令行缩写（aR）与聚合任务（build 经 assemble 带出 assembleRelease）的
+// 原始字符串都对不上 Release 任务名，会漏拦；任务图展开后是真实任务名。
+val himeKsPath = project.findProperty("HIME_STORE_FILE") as String?
+val himeSigningConfigured = himeKsPath != null && file(himeKsPath).exists()
+if (!himeSigningConfigured) {
+    // whenReady 在 Kotlin DSL 里用对象表达式实现 Action，避免 SAM 推断歧义
+    gradle.taskGraph.whenReady(
+        object : org.gradle.api.Action<org.gradle.api.execution.TaskExecutionGraph> {
+            override fun execute(graph: org.gradle.api.execution.TaskExecutionGraph) {
+                val releaseTaskRequested = graph.allTasks.any { task ->
+                    val name = task.name
+                    name.contains("Release") &&
+                        (name.startsWith("assemble") || name.startsWith("bundle") ||
+                            name.startsWith("install") || name.startsWith("publish") ||
+                            name.startsWith("package") || name.startsWith("sign"))
+                }
+                if (releaseTaskRequested) {
+                    throw GradleException(
+                        "Hime 签名配置缺失（gradle.properties 未配置 HIME_STORE_FILE 或 key 文件不存在），" +
+                            "release 构建已拦截：未签名包无法覆盖升级已发布版本。"
+                    )
+                }
+            }
+        }
+    )
+}
+
+// Room 架构导出（配合 @Database exportSchema=true）：每次版本升级把
+// schema JSON 生成到 app/schemas 并随代码提交，供迁移测试比对
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
+dependencies {
+    // sherpa-onnx 1.13.5-qnn：唯一本地 AAR，来源 k2-fsa/sherpa-onnx releases；
+    // sha256: 49fb0cb0e8ff126471080886f47cae6e71fc253ce0e348036da4c7ca7dd74f3a
+    implementation(files("libs/sherpa-onnx-1.13.5-qnn.aar"))
+    implementation(libs.kotlinx.serialization.json)
+    implementation(libs.timber)
+    implementation(libs.okhttp)
+    implementation(libs.rhino)
+    implementation(libs.commons.compress)
+    implementation(libs.zxing.android.embedded)
+    implementation(libs.splitties.bitflags)
+    implementation(libs.splitties.views.dsl)
+    implementation(libs.splitties.views.dsl.constraintlayout)
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.autofill)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.activity.compose)
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.material3)
+    implementation(libs.material)
+    implementation(libs.androidx.compose.material.icons.extended)
+    implementation(libs.kotlinx.coroutines.android)
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    ksp(libs.androidx.room.compiler)
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    debugImplementation(libs.androidx.compose.ui.tooling)
+}

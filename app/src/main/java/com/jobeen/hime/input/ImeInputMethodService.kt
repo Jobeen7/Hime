@@ -1,0 +1,961 @@
+package com.jobeen.hime.input
+
+import android.content.SharedPreferences
+import android.content.res.Configuration
+import android.inputmethodservice.InputMethodService
+import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.ExtractedTextRequest
+import android.view.inputmethod.InputConnection
+import java.io.File
+import kotlin.math.roundToInt
+import com.jobeen.hime.ImeApplication
+import com.jobeen.hime.base.feedback.InputFeedbacks
+import com.jobeen.hime.base.speech.VoiceUndoLedger
+import com.jobeen.hime.base.util.InputConnectionUtil
+import com.jobeen.hime.base.util.ToastUtil
+import com.jobeen.hime.R
+import com.jobeen.hime.data.manager.CandidateManager
+import com.jobeen.hime.data.manager.ClipboardManager
+import com.jobeen.hime.data.manager.DeployAwaitResult
+import com.jobeen.hime.data.manager.KeyboardDeployController
+import com.jobeen.hime.data.manager.KeyboardDeployPhase
+import com.jobeen.hime.data.manager.KeyboardDeployProgress
+import com.jobeen.hime.data.manager.KeyboardDeployTexts
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.data.manager.RimeSyncPrefs
+import com.jobeen.hime.data.manager.SchemaManager
+import com.jobeen.hime.engine.EngineFactory
+import com.jobeen.hime.engine.RimeEngine
+import com.jobeen.hime.engine.IEngine
+import com.jobeen.hime.input.keyboard.window.KeyboardWindow
+import com.jobeen.hime.input.keyboard.window.KeyboardStateManager
+import com.jobeen.hime.input.panel.component.TextEditView
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.skin.symbolbar.shouldResetSymbolBarOnOrientationChange
+import com.jobeen.hime.ui.FabActions
+import com.jobeen.hime.ui.theme.AppAppearance
+import timber.log.Timber
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.launch
+
+class ImeInputMethodService : InputMethodService() {
+    companion object {
+        /**
+         * E2（WO39-9）键盘可见标志（进程内静态，供 PeriodicSyncJobService 读）：
+         * onWindowShown 置真、onWindowHidden 置假——框架自身的窗口可见
+         * 回调（KeyboardWindowView.isVisibleNow() 是视图级同义判定，
+         * 但 JobService 拿不到视图实例）。与 JobService 同进程
+         * （manifest 未给 PeriodicSyncJobService 配 android:process），
+         * 故静态可见；进程新起只跑 job 时服务未跑过、默认假——键盘
+         * 确实未可见，重排正确。
+         */
+        @Volatile
+        var isKeyboardVisible: Boolean = false
+            private set
+    }
+
+    internal val engine: IEngine? get() = EngineFactory.current()
+    internal var keyboardWindow: KeyboardWindow? = null
+    private var lastOrientation = Configuration.ORIENTATION_UNDEFINED
+    internal var keyActionListener: KeyActionListener? = null
+
+    /** 桥接模式：添加常用语时为真，所有提交/删除/语音输出写入 [virtualInputConnection] 而非真实编辑器。 */
+    var phraseAddBridgeActive = false
+    val virtualInputConnection = ImeInputConnection(this)
+
+    fun activeInputConnection(): android.view.inputmethod.InputConnection? =
+        if (phraseAddBridgeActive) virtualInputConnection else currentInputConnection
+
+    var scope: CoroutineScope? = null
+    var messageObserveJob: Job? = null
+    private var showingDialog: android.app.Dialog? = null
+
+    // 接线轮 R7：键盘内部署控制器（窗口创建时挂接；同步恒 null，
+    // 见 onCreateInputView 注释）与上次已提示阶段（阶段进入才提示一次）。
+    private var deployController: KeyboardDeployController? = null
+    private var lastDeployToastPhase: KeyboardDeployPhase? = null
+    private var lastSelectionStart = 0
+    private var lastSelectionEnd = 0
+
+    /**
+     * 内联自动填充（Android 11+ IME Inline Autofill）：建议膨胀线程与
+     * 响应代次。膨胀是异步 IPC 回调：代次保证旧响应在新响应到达后不再上屏。
+     */
+    private val inlineAutofillExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    private var inlineAutofillGeneration = 0
+
+    /** onUpdateSelection 的探针合并：窗口内连发只保留最后一次 */
+    private val mainHandler = android.os.Handler(android.os.Looper.getMainLooper())
+    private val pendingNotifyInputChanged = Runnable { notifyInputChanged() }
+
+    /**
+     * 输入框字段身份跟踪（R3）：onStartInput 与 onStartInputView
+     * 两入口共用一份快照（见 [trackInputField]）。
+     */
+    private val inputFieldTracker = InputFieldTracker()
+
+    private val themePrefs: SharedPreferences by lazy {
+        getSharedPreferences(KeyboardManager.PREFS_NAME, MODE_PRIVATE)
+    }
+
+    private val schemaPrefs: SharedPreferences by lazy {
+        getSharedPreferences(SchemaManager.PREFS_NAME, MODE_PRIVATE)
+    }
+
+    private val candidatePrefs: SharedPreferences by lazy {
+        getSharedPreferences(CandidateManager.PREFS_NAME, MODE_PRIVATE)
+    }
+
+    /**
+     * 皮肤库颜色模式偏好（2026-10-27 第一组）：与库页菜单共用
+     * `skin_library` / `color_mode`（见 SkinColorMode 存储契约）。
+     * 不监听它，库页改动只会在下次重建/配置变化时生效；监听后
+     * 键变化经 onConfigChanged 走 KeyboardWindowView 的
+     * scheduleRefreshColors，键盘即时换板。服务与设置页同进程
+     * （仅语音走 :speech 进程），监听跨组件生效。
+     */
+    private val skinColorPrefs: SharedPreferences by lazy {
+        getSharedPreferences(com.jobeen.hime.skin.runtime.SkinColorMode.PREFS_NAME, MODE_PRIVATE)
+    }
+
+    /** 外观页偏好（2026-10-29 外观轮）：字体／视频开关改动经同一监听进窗口刷新。 */
+    private val appearancePrefs: SharedPreferences by lazy {
+        getSharedPreferences(AppAppearance.PREFS_NAME, MODE_PRIVATE)
+    }
+
+    private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        keyboardWindow?.onConfigChanged(key.orEmpty())
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        lastOrientation = resources.configuration.orientation
+        // 已删除功能的残留清理：删掉旧版语音专名纠错学到的词对文件
+        // （及其 tmp）；只删不建，文件不存在时为空操作，后续不再生成。
+        runCatching {
+            File(filesDir, "voice_corrections.tsv").delete()
+            File(filesDir, "voice_corrections.tsv.tmp").delete()
+        }
+        virtualInputConnection.addOnChangeListener {
+            if (phraseAddBridgeActive) {
+                // 桥接文本是本地 Editable：程序性改字（清空/替换）可以
+                // 不伴随选区变化，文本变更回调里直接同步状态（探针
+                // 每次直探、结果永远新鲜，见 probeAroundCursorText）
+                syncActiveInputState()
+            }
+        }
+        //service scope & message subscribe
+        scope = CoroutineScope(SupervisorJob() + Dispatchers.Main).apply {
+            launch {
+                val app = applicationContext as? ImeApplication
+                // 监听应用状态，当引擎启动的时候时开始绑定消息
+                app?.state?.collectLatest { state ->
+                    if (state == ImeApplication.AppState.EngineStarting) {
+                        messageObserveJob?.cancel()
+                        messageObserveJob = engine?.observeMessages(this) { message ->
+                            keyboardWindow?.handleEngineMessage(message)
+                        }
+                    }
+                }
+            }
+        }
+        // KeyActionListener & prefrece change listenter
+        keyActionListener = KeyActionListener(service = this)
+        themePrefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        schemaPrefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        candidatePrefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        skinColorPrefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        appearancePrefs.registerOnSharedPreferenceChangeListener(prefsListener)
+        InputFeedbacks.initFeedbackCache(this)
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        // 横竖屏切换关闭符号栏（指南口径：打开态不记住；视图在配置
+        // 变化时复用，不随窗口重建而消失，故须显式关闭）。
+        if (shouldResetSymbolBarOnOrientationChange(lastOrientation, newConfig.orientation)) {
+            keyboardWindow?.view?.onOrientationChanged()
+        }
+        if (newConfig.orientation != Configuration.ORIENTATION_UNDEFINED) {
+            lastOrientation = newConfig.orientation
+        }
+        // 任何配置变化此前都无条件全量重建键盘（字体缩放/区域等与外观
+        // 无关的变化也触发）；改走带变更检测的版本，配色未变不重建
+        keyboardWindow?.view?.refreshColorsIfChanged()
+    }
+
+    override fun onCreateInputView(): View {
+        keyboardWindow?.let {
+            // InputMethodService adds the returned root to its own container.
+            // Detach it first when the same window instance is requested again.
+            (it.view.parent as? ViewGroup)?.removeView(it.view)
+            return it.view
+        }
+        val panelListener = PanelActionListener(this)
+        val window = KeyboardWindow(
+            service = this,
+            keyboardStateManager = KeyboardStateManager,
+            panelActionListener = panelListener,
+        )
+        // 接线轮 R7：部署／同步菜单项的服务层接线（此前回调恒空，
+        // 点按无动作）。部署复用引擎 deployAndAwait 互斥（超时走
+        // FAB／切换路径共用的 deployTimeoutForDir 口径：180 秒
+        // 基线＋每 8MB 加 30 秒、上限 1800 秒，不再是键盘侧独
+        // 有的固定 600 秒）；同步恒为 null——词库 WebDAV
+        // 同步须持设置侧会话（RimeSession＋已配 WebDAV 绑定），
+        // 键盘服务内无此基础设施；只写本地同步目录的接口不上传，
+        // 接上会误导用户以为已同步，故不接。菜单文案“部署／同步”
+        // 为既有文案不动，进度／成功文案只说部署。
+        deployController = KeyboardDeployController(
+            deploy = {
+                (EngineFactory.current() as? RimeEngine)?.deployAndAwaitIfChanged(
+                    FabActions.deployTimeoutForCurrentDir(this@ImeInputMethodService),
+                )
+                    ?: DeployAwaitResult.FAILED
+            },
+            sync = null,
+            hasPreedit = { KeyboardStateManager.isComposingNow },
+        ).also { controller ->
+            controller.onProgressChanged = { progress -> onDeployProgress(progress) }
+        }
+        panelListener.onDeploySyncRequest = { handleDeploySyncRequest() }
+        keyboardWindow = window
+        // onCreate 已初始化；防御性兜底：若为空（不应发生）则重建，避免 !! 崩溃
+        val listener = keyActionListener
+            ?: KeyActionListener(service = this).also { keyActionListener = it }
+        window.setKeyActionListener(listener)
+        // KeyboardStateManager 是进程级单例，其键盤注册表可能残留上一实例（旧配色）的键盘；
+        // 新建窗口（销毁重建路径）时重建一次，让键盘用本次实例解析出的新配色生成。
+        KeyboardStateManager.rebuild()
+        return window.view
+    }
+
+    /**
+     * 展开候选页返回（施工单 10 H2-6）：展开态下 BACK 先收起展开页
+     * （走现有 collapse()，与点收起按钮同一路径），本次不收键盘；
+     * 未展开时放行，系统默认收键盘，行为与改前一致。
+     * 系统把 BACK 先送到输入法服务的 onKeyDown，返回 true 即消费。
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val panelView = keyboardWindow?.view?.panel?.view
+        if (ExpandBackPolicy.shouldCollapseOnBack(
+                keyCode,
+                event.action,
+                event.repeatCount,
+                panelView?.isExpanded == true,
+            )
+        ) {
+            panelView?.collapse()
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
+    }
+
+    /**
+     * 接线轮 R7：键盘内“部署／同步”点按入口。
+     * 无组字直接执行；有组字先弹确认框（明示丢字风险），
+     * 确认才继续；运行中重复请求直接忽略，不排队。
+     * 退键关闭确认框视为取消（经 showDialog 的 onDismiss
+     * 参入，不自设监听），避免待确认态无框可点而卡住。
+     */
+    private fun handleDeploySyncRequest() {
+        val controller = deployController ?: return
+        if (controller.requestDeploy()) {
+            scope?.launch {
+                controller.execute()
+                onDeployFinished()
+            }
+        } else if (controller.progress.phase == KeyboardDeployPhase.NEEDS_CONFIRM) {
+            val dialog = android.app.AlertDialog.Builder(this)
+                .setTitle(R.string.deploy_confirm_title)
+                .setMessage(R.string.deploy_confirm_message)
+                .setPositiveButton(R.string.deploy_confirm_continue) { _, _ ->
+                    if (controller.confirmPending()) {
+                        scope?.launch {
+                            controller.execute()
+                            onDeployFinished()
+                        }
+                    }
+                }
+                .setNegativeButton(R.string.deploy_confirm_cancel) { _, _ ->
+                    controller.cancelPending()
+                }
+                .create()
+            showDialog(dialog, onDismiss = { controller.cancelPending() })
+        }
+    }
+
+    /** 接线轮 R7：阶段进入才提示一次（重复进度回调不重复弹）。 */
+    private fun onDeployProgress(progress: KeyboardDeployProgress) {
+        if (progress.phase == lastDeployToastPhase) return
+        lastDeployToastPhase = progress.phase
+        val text = KeyboardDeployTexts.toastFor(progress) ?: return
+        keyboardWindow?.showToast(text)
+    }
+
+    /**
+     * 接线轮 R7：部署成功后刷新——重建键盘与面板（refreshColors
+     * 内含 rebuild），再显式刷一次选项态（同方案部署也可能改
+     * 选项值；差分守卫，无变化时无动作）。
+     */
+    private fun onDeployFinished() {
+        if (deployController?.progress?.phase != KeyboardDeployPhase.SUCCESS) return
+        keyboardWindow?.view?.refreshColors()
+        keyboardWindow?.view?.refreshOptionStateAsync()
+    }
+
+    /**
+     * 字段身份跟踪（R3）：把本次输入开始的字段身份喂给
+     * [inputFieldTracker]（与引擎联想共用 InputFieldKey 口径），
+     * 关键字段变化即实为逻辑换框——无论宿主以 restarting 真假
+     * 哪种形式投递。restart 型换框没有 FINISH 回调，S1 收窄后
+     * 的两个真结束信号都不会来，旧框的语音结算尾会按旧纪元通
+     * 过复检、写进新框；故判变即经与 FINISH 侧共用的投递点
+     * （invalidateSpeechAfterInputEnd）同步投递同一作废，作废
+     * 内容单点定义、日后增项两路不会漏跟。投递在 IMS 回调内
+     * 同步完成，早于本回调之后一切语音结算路径对新连接的使
+     * 用；同框 hide/show 与同框 restarting 身份不变、恒不投
+     * 递，不误杀同框待结算整句（S1 的收窄口径不变）。
+     *
+     * 引擎联想的代次仍由引擎在自己 onStartInputView 内自算推
+     * 进（其快照只在该入口滚动，与改前逐字一致），本跟踪不碰
+     * 预测代次，不存在双重推进。
+     *
+     * 返回值（施工单 12）：本次喂入是否实为逻辑换框。onStartInput
+     * 可能先于 onStartInputView 投递一次换框（键盘隐藏中换框时
+     * 只有本入口能先行），新窗口复位须在视图弹出时才执行，故变
+     * 化先记在 [windowResetGate]、由 onStartInputView 消费；
+     * 同框 restarting 两入口都返回 false，标志恒不置位。
+     *
+     * 新窗口复位门（WO32）：复位门不再走本跟踪的四项比对（微信
+     * 各会话四项全同、恒判不变），改走 [WindowResetGate] 的
+     * LatinIME 公式（`!restarting || inputTypeChanged`），门在
+     * onStartInput 算、pending 由 onStartInputView 消费；本跟踪
+     * 只保留语音作废（R3）一途。
+     *
+     * 语音作废与复位门统一（I-M2）：R3 不再只吃四项比对——四项在
+     * 微信各会话上恒判不变，复位门已用 LatinIME 公式逃出同一盲
+     * 区，语音门须跟同一信号。调用方把门值（onStartInput 的
+     * noteStartInput 返回、onStartInputView 的 consumePending
+     * 返回）以 gateChanged 传入：任一路为真即作废。门真只在
+     * !restarting 或 inputType 变时成立，同框 restarting＋同
+     * inputType 时门为假、不误杀同框待结算整句；restarting 型
+     * 逻辑换框且 inputType 全同时两门都判不变——那是 LatinIME
+     * 公式本身的盲区（复位与语音同限），不由本处掩盖。
+     *
+     * 锁存（V-中1）：返回值同时是停云端会话的独立身份信号——
+     * onStartInput 的判变经 [fieldIdentityLatch] 锁存，留到视图
+     * 弹出时由窗口层消费；与复位门分开传下，复位逻辑不动。
+     */
+    private val windowResetGate = WindowResetGate()
+
+    /** I-M3 停云端会话的独立身份信号锁存（V-中1）：见 [FieldIdentityChangeLatch]。 */
+    private val fieldIdentityLatch = FieldIdentityChangeLatch()
+
+    /**
+     * 窗口层消费一次锁存的字段身份变化（V-中1）：由
+     * KeyboardWindowView.onStartInput 在视图弹出时调用；返回本次
+     * 弹出前 onStartInput 是否判过字段身份变化。消费即清零。
+     */
+    internal fun consumeFieldIdentityChangeForCloudVoice(): Boolean =
+        fieldIdentityLatch.consume()
+
+    private fun trackInputField(info: EditorInfo?, gateChanged: Boolean = false): Boolean {
+        val changed = inputFieldTracker.track(InputFieldKey.of(info))
+        if (changed || gateChanged) {
+            invalidateSpeechAfterInputEnd()
+        }
+        return changed
+    }
+
+    override fun onStartInput(attribute: EditorInfo?, restarting: Boolean) {
+        // 输入框获焦比输入视图弹出更早一步：语音预热/存活预检抢在这里
+        // 发起，等用户点开键盘、长按语音时冷加载多半已经完成（函数内
+        // 部按连接状态与节流自判，重复调用无副作用）
+        com.jobeen.hime.base.speech.SherpaSpeechClient.preStartSync(this)
+        // 新窗口复位门（WO32，LatinIME 公式）：门在 onStartInput
+        // 算——该入口每会话必调、restarting 是框架契约（新会话
+        // 必 false，同框重开才 true）；门为真即置位待投递，由
+        // onStartInputView 在窗口弹出时消费。取证行（INFO 级，
+        // 无条件落盘、随诊断导出可见，不依赖诊断模式开关）：
+        // 切两次微信聊天框后导诊断包，应见两行 restarting=false、
+        // gate=true。
+        val resetGate = windowResetGate.noteStartInput(restarting, attribute?.inputType)
+        // 字段身份跟踪（R3，I-M2）：视图尚未弹出时（如键盘隐藏中换框）
+        // 只有本入口能先于结算路径更新身份，故两入口都喂；门值一并
+        // 传入——四项比对在微信各会话上恒判不变，复位门已逃出该盲区，
+        // 语音作废须跟同一信号。判变同时锁存（V-中1），留到视图弹出
+        // 时供窗口层停云端会话。
+        fieldIdentityLatch.note(trackInputField(attribute, resetGate))
+        DiagLog.i(
+            "wo12reset",
+            "start_input",
+            mapOf(
+                "pkg" to attribute?.packageName,
+                "fieldId" to attribute?.fieldId,
+                "inputType" to attribute?.inputType?.let { "0x%08x".format(it) },
+                "imeOptions" to attribute?.imeOptions?.let { "0x%08x".format(it) },
+                "restarting" to restarting,
+                "gate" to resetGate,
+            ),
+        )
+        super.onStartInput(attribute, restarting)
+    }
+
+    override fun onStartInputView(info: EditorInfo, restarting: Boolean) {
+        // 语音的输入结束作废（纠错沉淀观察/待就绪整句/撤销账本/
+        // 输入框纪元）的 FINISH 口径不在此投递（S1，判定见
+        // advancesEditorEpoch：START_INPUT_VIEW 恒不推进）：同框
+        // 收起再打开走的正是本回调且 restarting=false，在此作
+        // 废会把同框待结算的整句误杀；真换框的结束作废由先行的
+        // onFinishInput（doStartInput 在 !restarting 时必先
+        // doFinishInput）与 onFinishInputView(true) 承担，不漏。
+        // 例外是字段身份变化（R3，见 trackInputField）：restart
+        // 型逻辑换框没有 FINISH 回调、上面的承担链断裂，故以字
+        // 段比对在本回调内单独投递同一作废——身份不变恒不触发
+        // 语音预热/存活预检（onStartInput 已先行一步，这里再兜一次）：
+        // App 冷启动时不再 eager 拉起 :speech 进程
+        com.jobeen.hime.base.speech.SherpaSpeechClient.preStartSync(this)
+        // 新窗口复位（施工单 12／WO32）：消费 onStartInput 算好
+        // 的待投递。门不在本层重算——同框收起再打开走本回调且
+        // restarting=false，在此按 restarting 算会误复位；本层只
+        // 消费 onStartInput 的权威判定。键盘未显示时框架不调本
+        // 回调，pending 留到下次弹出时消费，复位不丢。
+        // 消费在身份跟踪之前：门只动复位 pending，与跟踪互不干扰；
+        // 先消费可保跟踪的作废投递万一抛错时 pending 不残留。
+        val fieldChanged = windowResetGate.consumePending()
+        // 字段身份跟踪（R3，I-M2）：同步投递，先于下方 engine 与窗口
+        // 对新连接的使用。onStartInput 已先行投递过时此处 track
+        // 返回 false，门值一并传入——onStartInput 未跑到的会话
+        // （同框收起再打开无新 startInput）门恒为假，不误杀同框
+        // 待结算整句。返回值不再参与复位门（WO32），只保留语音作废
+        // 一途；四项判变另由锁存供窗口层停云端会话（V-中1，见 onStartInput）。
+        trackInputField(info, fieldChanged)
+        DiagLog.i(
+            "wo12reset",
+            "start_input_view",
+            mapOf(
+                "pkg" to info.packageName,
+                "fieldId" to info.fieldId,
+                "inputType" to "0x%08x".format(info.inputType),
+                "imeOptions" to "0x%08x".format(info.imeOptions),
+                "restarting" to restarting,
+                "fieldChanged" to fieldChanged,
+            ),
+        )
+        keyboardWindow?.onStartInputView(info, restarting, fieldChanged)
+        engine?.onStartInputView(currentInputConnection, info, restarting)
+        // 直调即时探针前先撤掉合并通道里排队的那次：它捕获的是旧
+        // 输入框的待发任务，再跑一次只会在新框上多做一轮无用探针
+        mainHandler.removeCallbacks(pendingNotifyInputChanged)
+        notifyInputChanged()
+        super.onStartInputView(info, restarting)
+    }
+
+    override fun onFinishInput() {
+        // 输入会话结束：待投递的复位标志同步清零（WO32）——
+        // onStartInput 置位后若视图未弹出，会话结束时 pending 残留，
+        // 下一会话同框重启会在 onStartInputView 误消费、误触发新窗
+        // 口复位；清零后残留不再跨会话。
+        windowResetGate.clearPending()
+        // 字段身份锁存同理清零（V-中1）：onStartInput 锁存后若视图
+        // 未弹出，残留会在下一会话同框重显时被窗口层消费、误停云端会话。
+        fieldIdentityLatch.clear()
+        // 输入会话结束（W2）：待就绪整句的作废只认真正的输入结
+        // 束信号——本回调与 onFinishInputView(true)（投递判定
+        // 见 advancesEditorEpoch）。onFinishInput 按 AOSP 语义
+        // 只在输入会话结束时投递（仅隐藏键盘不投递、整句仍可
+        // 落回同一框的 N13 场景不受影响）；「先收起键盘再换
+        // 框」时框架对新框可能只投递 onStartInput（视图未弹出）
+        // 或以 restarting=true 投递 onStartInputView：!restarting
+        // 的换框必先经 doFinishInput、作废在本处承担；
+        // restarting=true 的逻辑换框不经任何 FINISH 回调
+        // （doStartInput 在 restarting 时不调 doFinishInput），
+        // 其作废不在本处、由字段身份跟踪在判变时经共用投递点
+        // 单独投递（R3，见 trackInputField）。个别厂商若在隐
+        // 藏键盘时也投递本回调，该场景会被误作废——此点代码
+        // 层无法证伪，列入真机验收项待核。与
+        // onFinishInputView(true) 先后重复调用无碍：
+        // onInputViewFinished 对重复调用幂等（快照清零是重复赋
+        // 空、作废支内保留音频已清空后二次进入只重撤待发 START
+        // 并按「确有音频被清」判提示，不重复置位）
+        if (com.jobeen.hime.base.speech.advancesEditorEpoch(
+                com.jobeen.hime.base.speech.InputLifecycleCallback.FINISH_INPUT
+            )
+        ) {
+            invalidateSpeechAfterInputEnd()
+        }
+        super.onFinishInput()
+    }
+
+    /**
+     * 输入真正结束时的语音作废一并执行：客户端侧作废（纠错沉
+     * 淀观察、显示快照、对账窗与暂存、待就绪保留音频、输入框
+     * 纪元推进）与语音上屏撤销账本整表作废（账本是旧框的账，
+     * 不能把旧框的段拿来新框删）。本函数是语音作废的单点投
+     * 递定义，投递点有三：onFinishInput 与
+     * onFinishInputView(true) 两个真结束信号（S1），以及
+     * trackInputField 判得字段身份变化时（R3：restart 型逻辑
+     * 换框没有 FINISH 回调）；账本作废此前挂在
+     * onStartInputView(!restarting)，同框收起再打开会被误清，
+     * 已随投递收窄一并归位到此处。
+     */
+    private fun invalidateSpeechAfterInputEnd() {
+        com.jobeen.hime.base.speech.SherpaSpeechClient.onInputViewFinished()
+        VoiceUndoLedger.clearAll()
+        // 打字账本与污染标记与语音账本同生命周期：输入框结束
+        // 时整表作废，旧框的账与污染标记不能带进新框。
+        TypedUndoLedger.clearAll()
+        // 上滑清字账本同理：旧框清掉的文字不能拿到新框去写回。
+        ClearedTextLedger.clearAll()
+    }
+
+    override fun onFinishInputView(finishingInput: Boolean) {
+        showingDialog?.dismiss()
+        // 录音中切换输入框：立即丢弃本次录音。否则识别结果会经
+        // activeInputConnection() 写进新输入框，且待定文字会残留在旧框。
+        // 放在最前面，保证清待定文字时连接仍指向旧输入框。
+        if (com.jobeen.hime.base.speech.SherpaSpeechClient.isHolding()) {
+            com.jobeen.hime.base.speech.SherpaSpeechClient.stopHoldSession(discard = true)
+        }
+        // 待就绪整句的作废只认真正结束输入（finishingInput=true，
+        // 框架换框/收尾走 doFinishInput 的情形）：仅收起键盘
+        // （false）时输入会话并未结束、连接仍指向同一框，作废会
+        // 把已说完待落屏的整句误删并误报「已切换输入框」。换框
+        // 的作废与 onFinishInput 同口径承担（S1：投递判定见
+        // advancesEditorEpoch），两处重复调用幂等、不重叠误伤
+        if (com.jobeen.hime.base.speech.advancesEditorEpoch(
+                com.jobeen.hime.base.speech.InputLifecycleCallback.FINISH_INPUT_VIEW,
+                finishingInput,
+            )
+        ) {
+            invalidateSpeechAfterInputEnd()
+        }
+        engine?.resetComposition()
+        keyboardWindow?.onFinishInputView(finishingInput)
+        engine?.onFinishInputView()
+        super.onFinishInputView(finishingInput)
+    }
+
+
+    /**
+     * 内联自动填充（Android 11+）：向密码管理器声明可接受的胶囊规格。
+     * 样式只声明 v1 版本（空 Style＝渲染细节交密码管理器自带样式），
+     * 尺寸上限＝条区（全宽×条高），数量上限 6。API 30 以下框架不调用。
+     * 与 HIME 已有「内联建议」（幽灵文本）无关，是另一功能。
+     */
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.R)
+    override fun onCreateInlineSuggestionsRequest(
+        extras: android.os.Bundle,
+    ): android.view.inputmethod.InlineSuggestionsRequest? {
+        val metrics = resources.displayMetrics
+        val styles = androidx.autofill.inline.UiVersions.newStylesBuilder()
+            .addStyle(androidx.autofill.inline.v1.InlineSuggestionUi.newStyleBuilder().build())
+            .build()
+        val spec = android.widget.inline.InlinePresentationSpec.Builder(
+            android.util.Size(0, 0),
+            android.util.Size(
+                metrics.widthPixels,
+                (com.jobeen.hime.input.keyboard.window.KeyboardWindowView.PANEL_HEIGHT_DP *
+                    metrics.density).roundToInt(),
+            ),
+        ).setStyle(styles).build()
+        return android.view.inputmethod.InlineSuggestionsRequest.Builder(listOf(spec))
+            .setMaxSuggestionCount(6)
+            .build()
+    }
+
+    /**
+     * 内联自动填充：密码管理器建议到达。空列表即隐藏；非空则逐条膨胀
+     * （pinned 进右固定槽，余下进滚动区），全部到齐后在主线程一次上屏；
+     * 代次过期（更新的响应已到／服务已销毁）的膨胀结果直接丢弃。
+     * 胶囊点击由系统直接填入，绝不走 commitText、绝不进用户词库。
+     */
+    @androidx.annotation.RequiresApi(android.os.Build.VERSION_CODES.R)
+    override fun onInlineSuggestionsResponse(
+        response: android.view.inputmethod.InlineSuggestionsResponse,
+    ): Boolean {
+        val view = keyboardWindow?.view ?: return true
+        val suggestions = response.inlineSuggestions
+        if (suggestions.isEmpty()) {
+            // R-2 边角：空响应也走 showInlineAutofill（空到达 → HIDE 分支先清
+            // 待重放缓存再隐藏），不直接 hide——组字中缓存的建议若不
+            // 在此清掉，组字结束时会重放一次服务已撤回的过期建议。
+            mainHandler.post { view.showInlineAutofill(emptyList(), emptyList()) }
+            return true
+        }
+        val generation = ++inlineAutofillGeneration
+        val pinnedViews =
+            java.util.Collections.synchronizedList(mutableListOf<android.view.View>())
+        val scrollViews =
+            java.util.Collections.synchronizedList(mutableListOf<android.view.View>())
+        val remaining = java.util.concurrent.atomic.AtomicInteger(suggestions.size)
+        val size = android.util.Size(
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+            android.view.ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        for (suggestion in suggestions) {
+            val pinned = suggestion.info?.isPinned == true
+            suggestion.inflate(this, size, inlineAutofillExecutor) { contentView ->
+                if (contentView != null) {
+                    (if (pinned) pinnedViews else scrollViews).add(contentView)
+                }
+                if (remaining.decrementAndGet() == 0) {
+                    mainHandler.post {
+                        if (generation == inlineAutofillGeneration) {
+                            view.showInlineAutofill(pinnedViews.toList(), scrollViews.toList())
+                        }
+                    }
+                }
+            }
+        }
+        return true
+    }
+
+    override fun onWindowHidden() {
+        // E2（WO39-9）：键盘收起→定期同步可见性门置假。
+        isKeyboardVisible = false
+        keyboardWindow?.onWindowHidden()
+        // 重点候选 8-5：键盘收起时不再停监听——提示条需在下次出现时
+        // 显示收起期间复制的最新剪贴板／验证码；监听只在 onDestroy 停。
+        super.onWindowHidden()
+    }
+
+    override fun onWindowShown() {
+        // E2（WO39-9）：键盘弹出→定期同步可见性门置真。
+        isKeyboardVisible = true
+        super.onWindowShown()
+        keyboardWindow?.onWindowShown()
+        ClipboardManager.startMonitoring(this)
+        // 键盘 RIME 通知：设置侧部署/同步完成时投递的待显示通知，在键盘
+        // 下次出现时经键盘区 Toast 显示一次；开关关时直接丢弃。
+        // （现有通道：KeyboardWindowView.showImeToast / ImeToastView，
+        // 语音失败提示也在用；本开关只管部署/同步结果通知。）
+        runCatching {
+            RimeSyncPrefs.drainNotice(this)?.let { keyboardWindow?.showToast(it) }
+        }
+        // 部署失败单发补跑：上次部署失败时引擎记的标记，在本次出现时
+        // 恰好消费一次 deployAndAwait（成功静默——Finish 收尾已刷新
+        // 方案表；失败按 FAB 失败口径弹提示＋投递通知；超时在跑静默，
+        // 后台结果仍经 Failure 处理器通知）。补跑自身的失败不续订
+        // （PendingRedeploy 补跑期抑制），finally 解除抑制。
+        val currentEngine = engine as? RimeEngine
+        if (currentEngine?.consumePendingRedeploy() == true) {
+            scope?.launch {
+                try {
+                    val result = currentEngine.deployAndAwait(
+                        FabActions.deployTimeoutForCurrentDir(this@ImeInputMethodService)
+                    )
+                    when (result) {
+                        DeployAwaitResult.COMPLETED -> {
+                            Timber.d("Pending redeploy completed")
+                        }
+                        DeployAwaitResult.FAILED -> {
+                            ToastUtil.showToast(getString(R.string.fab_deploy_failed))
+                            RimeSyncPrefs.postNotice(
+                                this@ImeInputMethodService,
+                                getString(R.string.fab_deploy_failed),
+                            )
+                        }
+                        DeployAwaitResult.TIMEOUT_RUNNING -> {
+                            Timber.w("Pending redeploy still running in background")
+                        }
+                    }
+                } finally {
+                    currentEngine.finishRedeployRetry()
+                }
+            }
+        }
+        if (messageObserveJob == null) {
+            messageObserveJob = scope?.let { scope ->
+                engine?.observeMessages(scope) {
+                    keyboardWindow?.handleEngineMessage(it)
+                }
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        // 内联自动填充：作废在途响应（迟到回调不再上屏），停膨胀线程。
+        inlineAutofillGeneration++
+        inlineAutofillExecutor.shutdown()
+        // 清掉还没跑的选区探针合并任务，避免销毁后它再碰输入连接
+        mainHandler.removeCallbacks(pendingNotifyInputChanged)
+        messageObserveJob?.cancel()
+        scope?.cancel()
+        scope = null
+        keyboardWindow = null
+        // KeyActionListener 持有 service，销毁后置空避免泄漏
+        keyActionListener = null
+
+        ClipboardManager.stopMonitoring(this)
+        InputFeedbacks.releaseFeedbackCache(this)
+        KeyboardStateManager.onDestroy()
+        themePrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        schemaPrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        candidatePrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        // onCreate 注册了 5 个偏好监听：漏掉的 2 个（肤色/外观）此前随服务
+        // 销毁残留——SharedPreferences 强持有监听、监听持有 keyboardWindow。
+        skinColorPrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        appearancePrefs.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        // 销毁时若有弹窗在展示必须主动关掉，否则窗口泄漏（WindowLeaked）。
+        // 先置空字段再 dismiss：弹窗自带的 onDismiss 回调见字段已空即 no-op，
+        // 销毁路径不会因此再跑一次用户回调。
+        val dialog = showingDialog
+        showingDialog = null
+        showingDialogOnDismiss = null
+        dialog?.dismiss()
+        // 待确认的部署随服务销毁一并取消，控制器置空避免残留引用。
+        // （运行中的部署由上面 scope?.cancel() 覆盖；此处只清待确认态。）
+        deployController?.cancelPending()
+        deployController = null
+        super.onDestroy()
+    }
+
+    override fun onEvaluateFullscreenMode(): Boolean = false
+
+    override fun onEvaluateInputViewShown(): Boolean {
+        super.onEvaluateInputViewShown()
+        return true
+    }
+
+    /** 当前弹窗的关闭回调（经 [showDialog] 注册，随弹窗一并清理） */
+    private var showingDialogOnDismiss: (() -> Unit)? = null
+
+    /**
+     * 显示挂在本窗口 token 上的弹窗。关闭监听由服务侧独占：先清自身
+     * 状态，再转调调用方经 [onDismiss] 注册的回调——调用方不得再对
+     * 弹窗直接 setOnDismissListener，那会把这里的监听整份覆盖掉，
+     * 服务侧状态与调用方自己的收尾便一起失效（编号 24 的原故障）。
+     * [dim] 控制非弹层区域压暗：默认压暗 0.5；不需要压暗的弹窗传
+     * false（方案选择弹窗——其构建侧曾自清压暗标志，但这里后写覆盖，
+     * 两处设置互相矛盾，最终以这里为准，统一收口到这个参数）。
+     */
+    fun showDialog(
+        dialog: android.app.Dialog,
+        dim: Boolean = true,
+        onDismiss: (() -> Unit)? = null,
+    ) {
+        showingDialog?.dismiss()
+        val tokenView = keyboardWindow?.view ?: return
+        // view 已存在但尚未挂上窗口时 windowToken 为 null，拿它去
+        // show() 会抛 BadTokenException，直接放弃本次显示
+        val token = tokenView.windowToken ?: return
+        dialog.window?.apply {
+            attributes.token = token
+            attributes.type = WindowManager.LayoutParams.TYPE_APPLICATION_ATTACHED_DIALOG
+            addFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            if (dim) {
+                addFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                setDimAmount(0.5f)
+            } else {
+                clearFlags(WindowManager.LayoutParams.FLAG_DIM_BEHIND)
+                setDimAmount(0f)
+            }
+        }
+        showingDialog = dialog
+        showingDialogOnDismiss = onDismiss
+        dialog.setOnDismissListener {
+            // dismiss 回调异步投递：到达时可能已有新弹窗顶替上来，
+            // 只认仍指向本弹窗的那次，旧弹窗的迟到回调不得清新状态
+            if (showingDialog === dialog) {
+                showingDialog = null
+                val callback = showingDialogOnDismiss
+                showingDialogOnDismiss = null
+                callback?.invoke()
+            }
+        }
+        dialog.show()
+    }
+
+    internal fun handleTextEditingAction(action: TextEditView.Action) {
+        val ic = activeInputConnection()
+        when (action) {
+            is TextEditView.Action.MoveLeft -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_DPAD_LEFT, action.shift
+            )
+
+            is TextEditView.Action.MoveRight -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_DPAD_RIGHT, action.shift
+            )
+
+            is TextEditView.Action.MoveUp -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_DPAD_UP, action.shift
+            )
+
+            is TextEditView.Action.MoveDown -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_DPAD_DOWN, action.shift
+            )
+
+            is TextEditView.Action.MoveHome -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_MOVE_HOME, action.shift
+            )
+
+            is TextEditView.Action.MoveEnd -> sendCombinationKeyEvent(
+                ic, KeyEvent.KEYCODE_MOVE_END, action.shift
+            )
+
+            TextEditView.Action.SelectToggle -> { /* local state toggle handled in view */
+            }
+
+            TextEditView.Action.CancelSelection -> {
+                if (ic != null) {
+                    // 实时选区（I-L4）：桥接模式读虚拟连接的实时选区，
+                    // 其余优先读连接当下的选区，读不到才回落快照——快照
+                    // 只在异步 onUpdateSelection 里更新，紧跟提交／光标
+                    // 移动后点“取消选择”会把光标送回旧位置。
+                    val selection = if (phraseAddBridgeActive) virtualInputConnection.selection
+                    else liveSelectionOrFallback(ic, lastSelectionStart to lastSelectionEnd)
+                    if (selection.first != selection.second) {
+                        ic.setSelection(selection.second, selection.second)
+                    }
+                }
+            }
+
+            TextEditView.Action.SelectAll -> ic?.performContextMenuAction(android.R.id.selectAll)
+            TextEditView.Action.Cut -> {
+                ic?.performContextMenuAction(android.R.id.cut)
+            }
+
+            TextEditView.Action.Copy -> ic?.performContextMenuAction(android.R.id.copy)
+            TextEditView.Action.Paste -> {
+                ic?.performContextMenuAction(android.R.id.paste)
+            }
+
+            TextEditView.Action.Backspace -> engine?.processKey(
+                this, com.jobeen.hime.engine.event.KeyEvent.CodeEvent(
+                    KeyEvent.KEYCODE_DEL, com.jobeen.hime.engine.event.KeyModifiers.Empty
+                )
+            )
+        }
+    }
+
+    private fun sendCombinationKeyEvent(
+        ic: android.view.inputmethod.InputConnection?, keyCode: Int, shift: Boolean,
+    ) {
+        InputConnectionUtil.sendCombinationKeyEvent(ic, keyCode, shift = shift)
+    }
+
+    override fun onUpdateSelection(
+        oldSelStart: Int, oldSelEnd: Int,
+        newSelStart: Int, newSelEnd: Int,
+        candidatesStart: Int, candidatesEnd: Int,
+    ) {
+        super.onUpdateSelection(
+            oldSelStart, oldSelEnd, newSelStart, newSelEnd, candidatesStart, candidatesEnd
+        )
+        lastSelectionStart = newSelStart
+        lastSelectionEnd = newSelEnd
+        keyboardWindow?.onSelectionUpdate(newSelStart, newSelEnd)
+        // 光标/选区变化：已登记位置的清字账本条目，位置不一致即作废
+        ClearedTextLedger.onSelectionChanged(newSelStart, newSelEnd)
+        // 光标/选区变化：engine 侧光标前文本缓存失效
+        engine?.onSelectionChanged()
+        // 探针走 24ms 合并（见 scheduleNotifyInputChanged）；onStartInputView
+        // 的即时调用不走此路、不受影响
+        scheduleNotifyInputChanged()
+    }
+
+    /**
+     * 输入变化探针的 24ms 合并通道：选区变化（拖动光标/程序调整选区）与
+     * Commit 上屏都会高频连发，每次都跨进程探针是浪费；下游
+     * （onInputChanged/onInputCleared）只用文本空/非空，窗口内取最后一次
+     * 即可。需要即时结果的入口（onStartInputView）仍直调 notifyInputChanged。
+     */
+    fun scheduleNotifyInputChanged() {
+        mainHandler.removeCallbacks(pendingNotifyInputChanged)
+        mainHandler.postDelayed(pendingNotifyInputChanged, 24L)
+    }
+
+    /** 当帧选区：桥接模式读虚拟连接选区，其余读最近一次选区回调。 */
+    private fun currentSelectionSignature(): Pair<Int, Int> =
+        if (phraseAddBridgeActive) virtualInputConnection.selection
+        else lastSelectionStart to lastSelectionEnd
+
+    internal fun syncActiveInputState() {
+        val ic = activeInputConnection() ?: return
+        val selection = currentSelectionSignature()
+        keyboardWindow?.onSelectionUpdate(selection.first, selection.second)
+        // 下游只用空/非空：旧实现用 Int.MAX_VALUE 全量抓前后文拼接（桥接模式
+        // 下整篇文档跨进程过一遍），改为每次直探的 1 字符探针（帧缓存已于
+        // 清点 S14 拆除：直探永远新鲜，原「空框首上屏后被误判已清空」故障
+        // 由此天然不成立；高频连发的降本由 24ms 合并通道承担）
+        // 探针未知（I-M6）时不投递：不把未知当成空，不清联想、不碰语音。
+        probeAroundCursorText(ic)?.let { text ->
+            keyboardWindow?.onInputChanged(
+                text,
+                virtualInputConnection = phraseAddBridgeActive,
+            )
+        }
+    }
+
+    /**
+     * 光标前后各取 1 字符作「输入框是否有内容」的探针：下游全部消费方只用
+     * 空/非空。前文非空即可短路，省掉第二次 Binder 调用（打字常态路径）。
+     * 返回 null = 内容未知（I-M6）：两路任一路返回 null 时不能证明框空，
+     * 绝不能把 null 当成空串——部分编辑器（不支持该调用、或密码类字段）
+     * 返回 null 而非空串，明明非空的框会被当成空框（联想被清、回车键按
+     * “空”态显示、语音会话被误杀）。调用方见 null 即跳过本次投递。
+     */
+    private fun probeAroundCursorText(ic: android.view.inputmethod.InputConnection): String? {
+        val before = ic.getTextBeforeCursor(1, 0)?.toString()
+        if (!before.isNullOrEmpty()) return before
+        val after = ic.getTextAfterCursor(1, 0)?.toString()
+        return mergeProbeResults(before, after)
+    }
+
+    fun notifyInputChanged() {
+        val ic = activeInputConnection() ?: return
+        // 探针未知（I-M6）时不投递、不清联想：未知不是空。
+        val text = probeAroundCursorText(ic) ?: return
+        keyboardWindow?.onInputChanged(text, virtualInputConnection = phraseAddBridgeActive)
+        if (text.isEmpty()) engine?.onInputCleared()
+
+    }
+}
+
+/**
+ * 1 字符探针的两路结果合并（纯函数，可单测；I-M6）：任一路非空即
+ * 框非空（取该路的 1 字符）；两路都返回空串才判空；任一路返回 null
+ * 且无一路证明非空时内容未知——返回 null，绝不把 null 等同于空文本。
+ */
+internal fun mergeProbeResults(before: CharSequence?, after: CharSequence?): String? {
+    if (!before.isNullOrEmpty()) return before.toString()
+    if (!after.isNullOrEmpty()) return after.toString()
+    if (before == null || after == null) return null
+    return ""
+}
+
+/**
+ * getExtractedText 的选区解析（纯函数，可单测；I-L4）：选区端点
+ * 任一小于 0 即读不到有效选区，返回 null（调用方回落快照）；否则
+ * 返回起止端点原值（不归一化 min/max——折叠判定由调用方按原值做）。
+ */
+internal fun selectionFromExtracted(selectionStart: Int, selectionEnd: Int): Pair<Int, Int>? =
+    if (selectionStart < 0 || selectionEnd < 0) null else selectionStart to selectionEnd
+
+/**
+ * 文本编辑取消选择的实时选区（I-L4）：优先读连接当下的选区
+ * （getExtractedText），读不到才回落调用方给的快照——快照只在异步
+ * Binder 回调 onUpdateSelection 里更新，紧跟提交／光标移动后点
+ * “取消选择”会把光标 setSelection 回旧位置。桥接模式不在此列
+ * （调用方直接读虚拟连接的实时选区）。
+ */
+internal fun liveSelectionOrFallback(
+    ic: android.view.inputmethod.InputConnection,
+    fallback: Pair<Int, Int>,
+): Pair<Int, Int> {
+    val extracted = runCatching {
+        ic.getExtractedText(ExtractedTextRequest(), 0)
+    }.getOrNull() ?: return fallback
+    return selectionFromExtracted(extracted.selectionStart, extracted.selectionEnd) ?: fallback
+}

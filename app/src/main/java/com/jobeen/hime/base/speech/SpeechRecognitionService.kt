@@ -1,0 +1,757 @@
+package com.jobeen.hime.base.speech
+
+import android.app.Service
+import android.content.Intent
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.Message
+import android.os.Messenger
+import android.os.SystemClock
+import android.widget.Toast
+import com.k2fsa.sherpa.onnx.FeatureConfig
+import com.k2fsa.sherpa.onnx.OnlineModelConfig
+import com.k2fsa.sherpa.onnx.OnlineRecognizer
+import com.k2fsa.sherpa.onnx.OnlineRecognizerConfig
+import com.k2fsa.sherpa.onnx.OnlineStream
+import com.k2fsa.sherpa.onnx.OnlineTransducerModelConfig
+import com.jobeen.hime.R
+import com.jobeen.hime.data.App
+import com.jobeen.hime.base.util.appContext
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import android.util.Log
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
+
+/**
+ * Runs in the isolated `:speech` process. Owns sherpa-onnx recognition only:
+ * audio capture lives in the main process (audio-first), PCM chunks are
+ * pushed here via Messenger and decoded from a per-session queue; results
+ * are streamed back to the main process via Messenger.
+ */
+class SpeechRecognitionService : Service() {
+    private val scope = CoroutineScope(Dispatchers.IO + kotlinx.coroutines.SupervisorJob())
+
+    private val recognizerRef = AtomicReference<OnlineRecognizer?>(null)
+    private val streamRef = AtomicReference<OnlineStream?>(null)
+
+    /**
+     * 销毁短路标志：onDestroy 在主线程置位并封消息入口后，在飞的消息
+     * 收尾协程与销毁守护线程不再并发碰同一批资源引用（见 onDestroy）
+     */
+    @Volatile
+    private var destroying = false
+    private val holding = AtomicBoolean(false)
+
+    // 会话状态机：START 用 CAS 保证幂等；STOP 以 sessionActive/代次为准，
+    // 不依赖在解码协程里迟置位的 holding（STOP 先到时旧逻辑会直接吞掉停止请求）
+    private val sessionActive = AtomicBoolean(false)
+
+    @Volatile
+    private var sessionGen = 0
+
+    // 客户端随 START 发来的会话代次令牌：本会话全部回信原样带回，
+    // 客户端据此丢弃旧会话迟到的结果（服务端内部代次 sessionGen 只管服务端自身防串扰）
+    @Volatile
+    private var sessionClientGen = 0
+    private val audioLock = Any()
+
+    /**
+     * 会话状态锁：只保护会话字段组的换代/复位临界区——MSG_START
+     * 的通道换手＋代次推进、初始化失败收尾、解码 finally 的代次
+     * 复检＋全局复位（sessionActive/sessionGen/sessionClientGen/
+     * stopRequested/cancelRequestedGen，及随之换手/清空的
+     * clientMessenger）。与 audioLock 的分工：audioLock 只管流
+     * 与识别器本体（createStream/换流/延迟释放集合/喂块与收尾
+     * 解码/引擎构建），长操作只在 audioLock 内、不持本锁，故
+     * START 不再排在收尾解码与模型加载之后。两把锁禁止嵌套：
+     * finally 先在 audioLock 内按身份释放流、再在本锁内复检复
+     * 位。字段组的其余读写仍走原有口径、不纳入本锁：主线程
+     * STOP/CANCEL 对 stopRequested/cancelRequestedGen/
+     * sessionActive 的单点写（主线程串行）、MSG_AUDIO 等对
+     * sessionClientGen 的比对读、发布段在 audioLock 内对
+     * stopRequested 的现读、initEngine 对 sessionActive 的快照
+     * 守卫——均为 @Volatile/原子字段的单点读写，可见性与原子
+     * 性自足；本锁只解决「换代与协程收尾复位跨线程互斥」这一
+     * 对关系。
+     */
+    private val stateLock = Any()
+    private var audioJob: Job? = null
+
+    /**
+     * 推流会话状态（音频先行架构）：录音归客户端，本服务只解码。队列与
+     * 结束/取消标记打包成一个对象随会话整体替换——旧会话的解码协程只
+     * 持有自己那一份，字段被新会话覆盖不串扰它的收尾。
+     */
+    private class PushSession {
+        val queue = ArrayBlockingQueue<ByteArray>(AUDIO_QUEUE_CAPACITY_BLOCKS)
+
+        /** 客户端已发完最后一块（STOP）：解码协程排空队列后走收尾解码 */
+        @Volatile
+        var endOfStream: Boolean = false
+
+        /** 会话被丢弃（CANCEL）：解码协程丢弃队列静默退出，不发 FINAL */
+        @Volatile
+        var cancelled: Boolean = false
+
+        // partial 去重/节流状态（随会话对象走）：此前是服务实例
+        // 字段、靠 START 时在锁内手动复位——旧会话协程与新会话
+        // 协程并存期间（连按排空）共用一对字段，旧协程的迟到
+        // 判定会污染新会话的去重（同文本被误判已发而吞掉、节流
+        // 窗互相干扰）。挪进会话对象后每个协程只读写自己这份，
+        // 新会话天然初值、无需复位。读写点只在 feedAudioBlock
+        // 的 audioLock 段内，与此前同锁纪律
+        var lastRawText: String? = null
+        var lastEmittedText: String? = null
+        var lastEmitUptimeMs = 0L
+    }
+
+    /** 当前推流会话（无会话时为 null）；写入在 audioLock 内，读取可直接读 */
+    @Volatile
+    private var pushSession: PushSession? = null
+
+    /**
+     * 被新会话换下、但旧解码协程仍在排空收尾的流集合：START 换流时
+     * 不立即释放它——立即释放会让旧协程收尾解码的身份复检失败、
+     * FINAL 尾段整段丢失（连按丢句）；改入此集合，旧协程仍可拿它
+     * 喂完余量、出 FINAL，最后在自己的 finally 里按身份移除并补
+     * 释放。必须是集合而非单槽：连按三次时两个旧会话可能同时在
+     * 排空，单槽会被后一次换流覆盖，前一条流再无人释放（泄漏到
+     * 进程结束）。全部读写都在 audioLock 内（换流、身份复检、
+     * finally 补放、onDestroy 兜底），无需额外同步。
+     */
+    private val deferredReleaseStreams = mutableSetOf<OnlineStream>()
+
+    /**
+     * STOP 先于会话建立（引擎初始化中）到达的标记：初始化完成后据此给
+     * 新队列预置 endOfStream 走排空收尾，不让会话闩死在「等音频」上
+     */
+    @Volatile
+    private var stopRequested = false
+
+    /**
+     * CANCEL 先于会话建立到达时记下的服务端代次：初始化协程据此静默
+     * 退出（CANCEL 处理方已复位会话并发 DONE），不重复收尾
+     */
+    @Volatile
+    private var cancelRequestedGen = 0
+
+    // 写入在服务主线程（START 换手）与解码协程收尾（置空），读取在
+    // sendClient 的多条线程路径上：必须 @Volatile 保证跨线程可见
+    @Volatile
+    private var clientMessenger: Messenger? = null
+
+    private val serviceHandler = Handler(
+        Looper.getMainLooper(),
+        Handler.Callback { msg ->
+            when (msg.what) {
+                SpeechIpc.MSG_LOAD -> scope.launch(Dispatchers.IO) {
+                    initEngine(silent = true)
+                }
+
+                SpeechIpc.MSG_PING -> {
+                    // 存活探针：立即回 PONG 并原样带回探针代次，不碰引擎
+                    // 与会话状态。优先回给探针自带的 replyTo（预热预检时
+                    // 还没有会话，clientMessenger 尚未由 START 设置），
+                    // 没有才走会话通道 sendClient
+                    val pingGen = runCatching {
+                        msg.data?.getInt(SpeechIpc.KEY_GEN, 0) ?: 0
+                    }.getOrDefault(0)
+                    val replyTo = msg.replyTo
+                    if (replyTo != null) {
+                        runCatching { replyTo.send(SpeechIpc.message(SpeechIpc.MSG_PONG, gen = pingGen)) }
+                            .onFailure { Log.e("SpeechSvc", "send PONG failed", it) }
+                    } else {
+                        sendClient(SpeechIpc.MSG_PONG, gen = pingGen)
+                    }
+                }
+
+                SpeechIpc.MSG_START -> {
+                    // 通道换手＋代次推进与解码协程 finally 的收尾复位
+                    // 同锁（stateLock，见 startDecodeSession 的
+                    // finally）：旧协程若先过代次复检、后被抢占，新
+                    // START 在此完成换代后，旧协程的复位会误杀新会
+                    // 话（sessionActive 被清、clientMessenger 被置
+                    // 空，新会话整句丢失）。换代只碰会话字段、不碰
+                    // 流与识别器，故不再与 audioLock 内的收尾解码
+                    // （至多 512 次 native decode）和模型加载串行，
+                    // 主线程不必等它们完事才处理 START。锁内只有
+                    // 字段写与 CAS，无 Binder/IO 等阻塞调用
+                    val startGate = synchronized(stateLock) {
+                        // 通道先换手再判幂等：重复 START 也把回信通道
+                        // 更新到最新 replyTo（与此前口径一致）
+                        clientMessenger = msg.replyTo
+                        if (!sessionActive.compareAndSet(false, true)) {
+                            // 重复 START：已有会话在跑，忽略，避免两个解码协程抢同一个 stream
+                            null
+                        } else {
+                            val g = ++sessionGen
+                            val cg = runCatching {
+                                msg.data?.getInt(SpeechIpc.KEY_GEN, 0) ?: 0
+                            }.getOrDefault(0)
+                            sessionClientGen = cg
+                            // 新会话清掉上一会话残留的停止标记：迟到的旧 STOP/CANCEL
+                            // 已在各自处理里按代次过滤，不会走到这里给新会话置位
+                            stopRequested = false
+                            cancelRequestedGen = 0
+                            g to cg
+                        }
+                    }
+                    val (gen, clientGen) = startGate ?: return@Callback true
+                    // 引擎初始化（可能数百 ms）移到 IO 线程，不要阻塞服务主线程
+                    scope.launch {
+                      try {
+                        val ready = initEngine(silent = true)
+                        if (cancelRequestedGen == gen) {
+                            // 初始化期间 CANCEL 已到达：处理方已复位会话并发
+                            // DONE，这里静默退出，不建会话、不再回信
+                            return@launch
+                        }
+                        val engine = if (ready) recognizerRef.get() else null
+                        if (engine == null) {
+                            // 只收尾自己这一代：STOP 已先行到达则回 DONE（客户
+                            // 端在等会话终结而非失败口径）；若已有新一代会话
+                            // 开始，旧的失败收尾不能误杀新会话。代次复检与
+                            // 复位收进 stateLock（与 START 换代、finally 复位
+                            // 同锁，见 MSG_START 处注释）；回信在锁外发
+                            val failWhat = synchronized(stateLock) {
+                                if (gen != sessionGen) {
+                                    null
+                                } else {
+                                    sessionActive.set(false)
+                                    holding.set(false)
+                                    if (stopRequested) SpeechIpc.MSG_DONE
+                                    else SpeechIpc.MSG_ERROR
+                                }
+                            }
+                            if (failWhat != null) {
+                                sendClient(failWhat, gen = clientGen)
+                            }
+                            return@launch
+                        }
+                        if (gen != sessionGen) {
+                            // 初始化期间已有新一代会话开始：旧初始化静默退出
+                            return@launch
+                        }
+                        val session = PushSession()
+                        var newStream: OnlineStream? = null
+                        synchronized(audioLock) {
+                            newStream = engine.createStream()
+                            if (gen != sessionGen) {
+                                // 锁内代次复检：等锁期间（旧会话收尾解码
+                                // 占用）已被新一代顶替——刚建的流就地
+                                // 释放、不发布本会话，静默退出
+                                newStream?.runCatching { release() }
+                                newStream = null
+                            } else {
+                                // 去重/节流状态已随 PushSession 对象走
+                                //（上方刚建的新会话自带初值），此处无
+                                // 需复位：旧会话协程只读写它自己那份
+                                // 换流必须释放旧流：正常路径旧流由上个会话协程按
+                                // 身份校验释放，但中止路径会留下孤儿 native stream，
+                                // 无人释放只能等进程死亡。例外：旧会话正在排空
+                                // 收尾（已 STOP、未取消）时不立即释放——旧协程
+                                // 还要用它解码余量并出 FINAL，立即释放会让其
+                                // 身份复检失败、尾段整段丢失；改入延迟释放集
+                                // 合，由旧协程在 finally 里按身份补放（见
+                                // deferredReleaseStreams）
+                                val oldStream = streamRef.getAndSet(newStream)
+                                if (oldStream != null && oldStream !== newStream) {
+                                    val oldSession = pushSession
+                                    if (oldSession != null &&
+                                        oldSession.endOfStream &&
+                                        !oldSession.cancelled
+                                    ) {
+                                        deferredReleaseStreams.add(oldStream)
+                                    } else {
+                                        oldStream.runCatching { release() }
+                                    }
+                                }
+                                // 停止标记在发布前锁内现读：STOP 在初始
+                                // 化期间（含等锁期间）已到达时，队列预置
+                                // 流结束，解码协程建好后排空已有块（通常
+                                // 为零）即走收尾，不闩死会话。此前在锁外
+                                // 一次性快照，「快照后、发布前」到达的
+                                // STOP 只作用于旧会话、新会话以未结束
+                                // 发布，该代次永远等不到 DONE
+                                session.endOfStream = stopRequested
+                                pushSession = session
+                            }
+                        }
+                        if (newStream == null) {
+                            // 锁内复检未过：已在锁内释放刚建的流
+                            return@launch
+                        }
+                        holding.set(true)
+                        startDecodeSession(session, newStream!!, clientGen, gen)
+                        // 推流就绪信号：队列与解码协程已就位，客户端可以开始
+                        // 推音频（语义已变：不再等服务端开录，录音归客户端）
+                        sendClient(SpeechIpc.MSG_RECORDING_STARTED, gen = clientGen)
+                      } catch (t: Throwable) {
+                        // 初始化段兜底：createStream 等 native 调用在模型
+                        // 半损坏/OOM 时可能抛错，此前异常无人处理会直接杀掉
+                        // :speech 进程且客户端收不到任何失败回信
+                        Log.e("SpeechSvc", "Session init failed", t)
+                        // 代次判据与复位收进 stateLock（同上方 engine==null
+                        // 路径口径）；回信在锁外发
+                        val failWhat = synchronized(stateLock) {
+                            if (cancelRequestedGen == gen || gen != sessionGen) {
+                                null
+                            } else {
+                                sessionActive.set(false)
+                                holding.set(false)
+                                if (stopRequested) SpeechIpc.MSG_DONE
+                                else SpeechIpc.MSG_ERROR
+                            }
+                        }
+                        if (failWhat != null) {
+                            sendClient(failWhat, gen = clientGen)
+                        }
+                      }
+                    }
+                }
+
+                SpeechIpc.MSG_AUDIO -> {
+                    // 音频块入队（主线程只做校验与入队，重活在解码协程）：
+                    // 代次不符是旧会话迟到块、会话不在进行中是 STOP 后的
+                    // 残余块，都直接丢弃
+                    val audioGen = runCatching {
+                        msg.data?.getInt(SpeechIpc.KEY_GEN, 0) ?: 0
+                    }.getOrDefault(0)
+                    if (audioGen != 0 && audioGen != sessionClientGen) {
+                        return@Callback true
+                    }
+                    val session = pushSession ?: return@Callback true
+                    if (!sessionActive.get() || session.cancelled) return@Callback true
+                    val block = runCatching {
+                        msg.data?.getByteArray(SpeechIpc.KEY_AUDIO)
+                    }.getOrNull() ?: return@Callback true
+                    if (!session.queue.offer(block)) {
+                        // 队列满（客户端领先解码约 60s）：丢新块保会话，
+                        // 缺这一块只影响这一小段识别，不让会话闩死
+                        Log.w("SpeechSvc", "Audio queue full; dropping chunk")
+                    }
+                }
+
+                SpeechIpc.MSG_STOP -> {
+                    val stopGen = runCatching {
+                        msg.data?.getInt(SpeechIpc.KEY_GEN, 0) ?: 0
+                    }.getOrDefault(0)
+                    if (stopGen != 0 && stopGen != sessionClientGen) {
+                        // 旧会话迟到的 STOP：不碰当前会话（代次纪律）
+                        return@Callback true
+                    }
+                    // DONE 必须带被停会话的客户端代次：收尾期间新会话可能已
+                    // 开始，代次能让客户端识别这声 DONE 属于旧会话
+                    val stoppedClientGen = sessionClientGen
+                    stopRequested = true
+                    // 会话标志先复位：让下一次 START 不必等收尾完成就能接管
+                    // （初始化在飞时同理——迟到的旧初始化靠代次守卫退出，
+                    // 与旧架构 STOP 先行复位的口径一致）。本会话的排空收尾
+                    // 由 stopRequested/endOfStream 与代次守卫保证，不依赖此标志
+                    val wasActive = sessionActive.getAndSet(false)
+                    holding.set(false)
+                    val session = pushSession
+                    if (session != null) {
+                        // 会话已建立：只置流结束标记，FINAL/DONE 由解码协程
+                        // 排空队列后统一发出。队列余量是松手收尾耗时的
+                        // 主要变量，随松手链时序打点一并记录备查
+                        Log.i(
+                            "SpeechSvc",
+                            "voice-stop: STOP gen=$stoppedClientGen queued=${session.queue.size}"
+                        )
+                        session.endOfStream = true
+                    } else if (!wasActive) {
+                        // 无会话（初始化也没在飞）：直接回 DONE 让客户端收尾
+                        sendClient(SpeechIpc.MSG_DONE, gen = stoppedClientGen)
+                        clientMessenger = null
+                    }
+                    // 余下情况是初始化在飞：stopRequested 已置位，初始化
+                    // 完成后由建会话路径预置 endOfStream 走排空收尾
+                }
+
+                SpeechIpc.MSG_CANCEL -> {
+                    val cancelGen = runCatching {
+                        msg.data?.getInt(SpeechIpc.KEY_GEN, 0) ?: 0
+                    }.getOrDefault(0)
+                    if (cancelGen != 0 && cancelGen != sessionClientGen) {
+                        // 旧会话迟到的 CANCEL：不碰当前会话（代次纪律）
+                        return@Callback true
+                    }
+                    val cancelledClientGen = sessionClientGen
+                    // 记下本代次已取消：初始化在飞时初始化协程据此静默退出
+                    cancelRequestedGen = sessionGen
+                    val session = pushSession
+                    if (session != null) {
+                        session.cancelled = true
+                        // 不再在主线程持 audioLock 释放流：解码协程的
+                        // 收尾解码在锁内做 native 阻塞调用（静音尾巴＋
+                        // 至多 512 次 decode），主线程等锁会把整条消息
+                        // 管线（后续 START/AUDIO/DONE 回信）一并堵住。
+                        // 只置取消标记并以 volatile 写摘掉会话引用，
+                        // 流的释放交给解码协程 finally 的身份校验释放：
+                        // 它见 cancelled 即退出循环走 finally，按
+                        // streamRef/延迟集合的身份释放自己这条流。协程
+                        // 的一切 stream 操作本就在 audioLock 内且先验
+                        // 身份（isStreamUsable），「字段先清、流后放」
+                        // 期间它至多把当前块喂完（毫秒级）即停，不会
+                        // 碰到已释放对象；pushSession 的其他读方（音频
+                        // 入队、STOP 处理）先清只会更早丢弃本会话块，
+                        // 与 cancelled 口径一致
+                        if (pushSession === session) pushSession = null
+                    }
+                    sessionActive.set(false)
+                    holding.set(false)
+                    // 取消只回 DONE（无 FINAL）：客户端据此结算本代次
+                    sendClient(SpeechIpc.MSG_DONE, gen = cancelledClientGen)
+                }
+            }
+            true
+        },
+    )
+
+    override fun onBind(intent: Intent?): IBinder {
+        return Messenger(serviceHandler).binder
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // 先封消息入口再 spawn 守护线程：消息回调与 onDestroy 同在主
+        // 线程串行，置位并清掉待处理消息后，不会再有 START/STOP 进入；
+        // 已在飞的 STOP 收尾协程回执前查 destroying 短路。由此资源
+        // 释放只剩守护线程一条线，不与消息路径并发碰同一批引用
+        destroying = true
+        serviceHandler.removeCallbacksAndMessages(null)
+        sessionActive.set(false)
+        holding.set(false)
+        // 等待+释放整段挪到后台线程：decode 是 audioLock 内的 native 阻塞
+        // 调用，不响应协程取消，必须等在途解码收尾后才能 release stream/
+        // recognizer（否则采集协程的收尾解码踩已释放对象）。旧实现在主
+        // 线程 runBlocking 等最多 2 秒，堵 :speech 进程的主 Looper。
+        // 收尾顺序不变（join 在 release 之前、同一线程串行），只是换线程；
+        // 资源引用全是本实例字段，新服务实例有独立引用集，互不串扰；
+        // 进程若在收尾完成前被系统回收，native 资源随进程死亡由系统处理。
+        val job = audioJob
+        audioJob = null
+        Thread({
+            if (job != null) {
+                runCatching {
+                    runBlocking {
+                        withTimeoutOrNull(DESTROY_JOIN_TIMEOUT_MS) { job.join() }
+                    }
+                }
+            }
+            scope.cancel()
+            synchronized(audioLock) {
+                streamRef.getAndSet(null)?.runCatching { release() }
+                // 延迟释放集合里的流若还没等到旧协程补放（join 超时
+                // 等），在此全量兜底释放
+                deferredReleaseStreams.toList().forEach { it.runCatching { release() } }
+                deferredReleaseStreams.clear()
+                recognizerRef.getAndSet(null)?.runCatching { release() }
+            }
+        }, "speech-destroy-cleanup").apply { isDaemon = true }.start()
+    }
+
+    /**
+     * 流是否仍可安全解码：是当前流，或是被新会话换下、但延迟释放给
+     * 本协程排空收尾的流（见 [deferredReleaseStreams]）。两者都不
+     * 是，说明流已被释放，绝不能再碰 native 对象。调用方均在
+     * audioLock 内（喂块与收尾解码），与集合的写入同锁串行。
+     */
+    private fun isStreamUsable(myStream: OnlineStream): Boolean =
+        streamRef.get() === myStream || myStream in deferredReleaseStreams
+
+    private fun sendClient(
+        what: Int,
+        text: String? = null,
+        gen: Int = sessionClientGen,
+    ) {
+        val messenger = clientMessenger ?: return
+        val msg = SpeechIpc.message(what, text, gen)
+        val ok = runCatching { messenger.send(msg) }
+        if (ok.isFailure) Log.e("SpeechSvc", "sendClient failed what=$what", ok.exceptionOrNull())
+    }
+
+    /**
+     * 识别器在本进程内只建一次：在线更新替换了模型文件后，靠客户
+     * 端下载成功后的解绑重连（:speech 进程随之重建）让新模型生效，
+     * 本服务不再做指纹比对与热重载。
+     */
+    private fun initEngine(silent: Boolean = false): Boolean {
+        if (recognizerRef.get() != null) return true
+        synchronized(audioLock) {
+            val dir = App.speechModelDir
+            if (recognizerRef.get() != null) return true
+            val files = findSpeechModelFiles(dir)
+            if (files == null) {
+                Log.w("SpeechSvc", "No available speech model in $dir")
+                return false
+            }
+
+            return try {
+                val transducer = OnlineTransducerModelConfig(
+                    encoder = files.encoder.absolutePath,
+                    decoder = files.decoder.absolutePath,
+                    joiner = files.joiner.absolutePath,
+                )
+
+                val modelConfig = OnlineModelConfig(
+                    transducer = transducer,
+                    tokens = files.tokens.absolutePath,
+                    numThreads = Runtime.getRuntime().availableProcessors()
+                        .coerceIn(1, 4),
+                    debug = false,
+                    provider = "cpu",
+                    modelType = "",
+                )
+                val config = OnlineRecognizerConfig(
+                    featConfig = FeatureConfig(sampleRate = SpeechIpc.SAMPLE_RATE, featureDim = 80),
+                    modelConfig = modelConfig,
+                    decodingMethod = "greedy_search",
+                    enableEndpoint = false,
+                )
+                recognizerRef.set(OnlineRecognizer(null, config))
+                val encoderPath = files.encoder.absolutePath
+                val engineVariant =
+                    if (files.encoder.nameWithoutExtension.contains("int8", ignoreCase = true)) {
+                        "int8"
+                    } else {
+                        "standard"
+                    }
+                Log.i("SpeechSvc", "Creating OnlineRecognizer: encoder=$encoderPath, variant=$engineVariant")
+                true
+            } catch (t: Throwable) {
+                Log.e("SpeechSvc", "Sherpa recognizer initialization failed", t)
+                Log.e("SpeechSvc", "initEngine failed", t)
+                false
+            }
+        }
+    }
+
+    /**
+     * 推流解码协程：从本会话队列取音频块喂识别流、节流发 partial；队列
+     * 排空且 endOfStream 已置位后做收尾解码（静音尾巴＋inputFinished＋
+     * FINAL，与旧采集协程尾部逐项一致）并按本会话代次发 DONE。
+     * 会话被取消（[PushSession.cancelled]）时丢弃队列静默退出（DONE 已
+     * 由 CANCEL 处理方发出）；被新会话取代时身份校验让 FINAL 自然落空。
+     * 本会话的 stream 在入口固定持有，结束时只按身份释放自己这个，
+     * 不能无条件清 streamRef（新会话可能已经换上了新 stream）。
+     */
+    private fun startDecodeSession(
+        session: PushSession,
+        myStream: OnlineStream,
+        myClientGen: Int,
+        mySessionGen: Int,
+    ) {
+        audioJob = scope.launch(Dispatchers.IO) {
+            val floatChunk = FloatArray(SpeechIpc.CHUNK_SAMPLES)
+            try {
+                while (isActive) {
+                    // destroying 时立即退出：销毁守护线程在 join 本协程，
+                    // 不短路会把它拖满超时；回信短路在下面的收尾段
+                    if (session.cancelled || destroying) break
+                    val block = try {
+                        session.queue.poll(QUEUE_POLL_MS, TimeUnit.MILLISECONDS)
+                    } catch (ie: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        null
+                    }
+                    if (block != null) {
+                        feedAudioBlock(session, block, myStream, myClientGen, floatChunk)
+                        continue
+                    }
+                    if (session.endOfStream) break
+                    if (mySessionGen != sessionGen) {
+                        // 已被新会话取代且队列已空：旧流早已被换走，继续
+                        // 等只会闩住收尾；退出走统一收尾，身份校验会让
+                        // FINAL 落空、DONE 仍按本会话代次发出（客户端按
+                        // 代次过滤，不会误结算新会话）
+                        break
+                    }
+                }
+
+                if (!session.cancelled && !destroying && isActive) {
+                    // 松手链时序打点：解码队列已排空、进入收尾解码
+                    Log.i("SpeechSvc", "voice-stop: drained gen=$myClientGen, finalizing")
+                    // 收尾解码前必须复检身份：STOP 后新会话 START 会在锁内
+                    // getAndSet 换流并 release 旧 stream，本协程若在那之后
+                    // 才拿到锁，myStream 已是被释放的 native 对象，再调
+                    // acceptWaveform/decode 会踩已释放内存（SIGSEGV）。
+                    // 已被换走就放弃收尾解码：旧会话结果丢弃是正确语义
+                    synchronized(audioLock) {
+                        val engine = recognizerRef.get()
+                        if (engine != null && isStreamUsable(myStream)) {
+                            try {
+                                val tail = FloatArray(
+                                    SpeechIpc.SAMPLE_RATE * FINAL_TAIL_PADDING_MS / 1000
+                                )
+                                myStream.acceptWaveform(tail, SpeechIpc.SAMPLE_RATE)
+                                myStream.inputFinished()
+
+                                var loops = 0
+                                while (engine.isReady(myStream) && loops++ < 512) {
+                                    engine.decode(myStream)
+                                }
+                                val finalText = FinalTextNormalizer.normalizeFinal(
+                                    engine.getResult(myStream).text
+                                )
+                                finalText.takeIf { it.isNotEmpty() }?.let {
+                                    sendClient(SpeechIpc.MSG_FINAL, it, gen = myClientGen)
+                                }
+                            } catch (e: Throwable) {
+                                Log.e("SpeechSvc", "Final decode failed", e)
+                            }
+                        }
+                    }
+                    sendClient(SpeechIpc.MSG_DONE, gen = myClientGen)
+                }
+            } catch (t: Throwable) {
+                if (t is CancellationException) throw t
+                // 解码管线自行失败（native 抛错等）：MSG_STOP 不会再带来
+                // 收尾，ERROR 是本会话唯一的终结回信（与旧采集管线异常
+                // 路径同口径：发 ERROR、不再补 DONE）
+                Log.e("SpeechSvc", "Stream decode failed", t)
+                withContext(NonCancellable + Dispatchers.Main) {
+                    toast(getString(R.string.speech_recorder_error))
+                }
+                sendClient(SpeechIpc.MSG_ERROR, gen = myClientGen)
+            } finally {
+                // 流的身份清退先在 audioLock 内做（与换流、延迟释放
+                // 集合的写入同锁）；会话字段的复检与复位随后在
+                // stateLock 内做（见下段）。两段不嵌套、次序固定
+                synchronized(audioLock) {
+                    if (pushSession === session) pushSession = null
+                    // 只释放本会话的 stream；新会话已换上新 stream 时不能误放
+                    if (streamRef.get() === myStream) {
+                        streamRef.set(null)
+                        myStream.runCatching { release() }
+                    } else if (deferredReleaseStreams.remove(myStream)) {
+                        // 换流时被延迟释放的本会话流在此按身份补放
+                        //（见换流处）；remove 返回 false 说明已被别处
+                        // 释放（如 onDestroy 兜底），不重复释放
+                        myStream.runCatching { release() }
+                    }
+                }
+                synchronized(stateLock) {
+                    // 全局复位只许当前代次做：被新会话取代的旧协程不得碰
+                    // 新会话的标志与通道（与旧采集协程收尾的代次守卫同
+                    // 口径）。复检与复位必须与 MSG_START 的换代同锁且
+                    // 在同一临界区内：此前复位在锁外，旧协程过检后被
+                    // 抢占、新 START 完成换代，旧协程随即把新会话的
+                    // sessionActive/clientMessenger 复位掉（整句丢失）。
+                    // 与上方流清退分锁不影响该不变量：换代与复检复位
+                    // 在本锁内互斥；流的清退按身份判定，与字段复位谁
+                    // 先谁后都不会误伤新会话
+                    if (mySessionGen == sessionGen) {
+                        sessionActive.set(false)
+                        holding.set(false)
+                        clientMessenger = null
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 把一块 PCM16LE 音频喂进识别流：按共享块长切片转换、解码、partial
+     * 节流发射——转换与发射口径与旧采集循环逐项一致（partial 仍走 80ms
+     * 节流、normalizeSpacing 规整与 lastRaw/lastEmitted 双重去重）。
+     */
+    private fun feedAudioBlock(
+        session: PushSession,
+        block: ByteArray,
+        myStream: OnlineStream,
+        myClientGen: Int,
+        floatChunk: FloatArray,
+    ) {
+        val sampleCount = block.size / 2
+        if (sampleCount <= 0) return
+        val shorts = ByteBuffer.wrap(block, 0, sampleCount * 2)
+            .order(ByteOrder.LITTLE_ENDIAN).asShortBuffer()
+        var offset = 0
+        while (offset < sampleCount) {
+            val n = minOf(SpeechIpc.CHUNK_SAMPLES, sampleCount - offset)
+            for (i in 0 until n) {
+                floatChunk[i] = shorts.get(offset + i) / 32768f
+            }
+            synchronized(audioLock) {
+                val engine = recognizerRef.get()
+                // 与收尾段同款身份复检：stream 已被新会话换走并释放时
+                // 本片直接丢弃，不碰已释放的 native 对象；被换下但
+                // 延迟释放给本协程排空的流仍可喂（余量要解码完才
+                // 能出完整的 FINAL）
+                if (engine != null && isStreamUsable(myStream)) {
+                    myStream.acceptWaveform(
+                        if (n == floatChunk.size) floatChunk
+                        else floatChunk.copyOf(n),
+                        SpeechIpc.SAMPLE_RATE,
+                    )
+                    var loops = 0
+                    while (engine.isReady(myStream) && loops++ < 64) {
+                        engine.decode(myStream)
+                    }
+
+                    val rawText = engine.getResult(myStream).text.trim()
+                    if (rawText.isNotEmpty() && rawText != session.lastRawText) {
+                        session.lastRawText = rawText
+                    }
+                    // 发射判定与变化检测解耦：此前被节流压住的版本因
+                    // lastRawText 已先行更新、后续同文本不再触发判定
+                    // 而永不补发，停顿期间字幕缺尾字。现在只要规整后
+                    // 的文本与上次已发不同且节流窗已过就发射——说话
+                    // 间隙持续喂入的静音块会在节流窗过后的第一个块
+                    // 把待发文本补出去；同文本仍只发一次（已发去重）
+                    if (rawText.isNotEmpty()) {
+                        val partial = FinalTextNormalizer.normalizeSpacing(rawText)
+                        if (partial.isNotEmpty() && partial != session.lastEmittedText) {
+                            val now = SystemClock.uptimeMillis()
+                            if (now - session.lastEmitUptimeMs >= PARTIAL_EMIT_MIN_INTERVAL_MS) {
+                                session.lastEmittedText = partial
+                                session.lastEmitUptimeMs = now
+                                sendClient(SpeechIpc.MSG_PARTIAL, partial, gen = myClientGen)
+                            }
+                        }
+                    }
+                }
+            }
+            offset += n
+        }
+    }
+
+    private fun toast(text: String) {
+        Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
+    }
+
+    companion object {
+        private const val FINAL_TAIL_PADDING_MS = 800
+        private const val PARTIAL_EMIT_MIN_INTERVAL_MS = 80L
+
+        /** 推流队列上限：40ms/块 × 1500 ≈ 60s，足够覆盖引擎冷加载期间客户端的领先量 */
+        private const val AUDIO_QUEUE_CAPACITY_BLOCKS = 1500
+
+        /** 解码协程等块的轮询片：够短以及时响应结束/取消/取代，够长不空转 */
+        private const val QUEUE_POLL_MS = 50L
+
+        /** onDestroy 等待在途解码收尾的上限：正常收尾远小于此值，仅防极端情况卡死销毁 */
+        private const val DESTROY_JOIN_TIMEOUT_MS = 2000L
+    }
+}

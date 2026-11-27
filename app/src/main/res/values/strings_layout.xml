@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  紧凑布局（14/18 键）的新增字符串。
+  与 strings.xml 分离：本批新增文案只放这里，不改 strings.xml。
+-->
+<resources>
+    <string name="tag_layout_t14">14键</string>
+    <string name="tag_layout_t18">18键</string>
+</resources>

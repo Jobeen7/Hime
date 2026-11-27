@@ -1,0 +1,228 @@
+package com.jobeen.hime.base.update
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
+import androidx.core.content.FileProvider
+import com.jobeen.hime.base.util.DigestUtil
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
+import okhttp3.Call
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import timber.log.Timber
+import java.io.File
+import java.util.concurrent.TimeUnit
+
+/**
+ * App 自更新：从 GitHub Release 直链下载正式版 APK 并调起系统安装，
+ * 不再跳转浏览器到 Release 页。
+ *
+ * 下载落 cacheDir/update/（FileProvider 已授权该路径）；下载后校验
+ * 文件大小与 GitHub 登记摘要，防止下错/下坏的文件被送进安装器。
+ */
+object AppUpdateManager {
+
+    // 这些客户端只访问写死的 HTTPS 地址：禁止 https↔http 重定向，
+    // 避免全局放开明文后被降级（明文仅供 WebDAV 在用户显式开启后使用）
+    // 总时长上限（B-L10）：readTimeout 只约束两次读之间的间隔，慢速
+    // 涓流能让整次下载无限拖长；30 分钟封顶仍容得下慢速网络下几十 MB
+    // 的 APK，涓流挂起不再无界。
+    private val client = OkHttpClient.Builder()
+        .followSslRedirects(false)
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(120, TimeUnit.SECONDS)
+        .callTimeout(30, TimeUnit.MINUTES)
+        .build()
+
+    /** 供单测断言总时长上限存在（B-L10 回归守门）。 */
+    internal val clientCallTimeoutMs: Long get() = client.callTimeoutMillis.toLong()
+
+    @Volatile
+    private var activeCall: Call? = null
+
+    /**
+     * 进程内下载互斥（B-M4）：同一时间只允许一路 downloadApk 在跑。
+     * 此前只有 @Volatile 的 activeCall：两路并发时后一路覆盖前一路，
+     * 先结束者的 finally 再把 activeCall 置空，后一路仍在下载时
+     * cancelDownload() 成空操作。tryLock 抢不到即直接返回 null
+     * （调用方按失败处理，UI 层已有 downloading 守门，正常路径
+     * 不会并发到这里）。
+     */
+    private val downloadMutex = Mutex()
+
+    fun updateDir(context: Context): File =
+        File(context.cacheDir, "update").apply { mkdirs() }
+
+    fun targetFile(context: Context, apkName: String): File =
+        // 资产名来自远端 Release 元数据，只取 basename 拼接，防路径穿越写出更新目录
+        File(updateDir(context), File(apkName).name.ifBlank { "hime-update.apk" })
+
+    fun cancelDownload() {
+        activeCall?.cancel()
+    }
+
+    /**
+     * 下载 APK 到目标文件。[onProgress] 回调 (已下载字节, 总字节)，
+     * 总字节未知时为发布资产声明的 [expectedSize]。
+     * 成功返回文件；失败/取消返回 null（取消会抛 CancellationException 由协程处理，
+     * 这里统一清理半成品后返回 null，调用方按协程取消状态区分）。
+     */
+    suspend fun downloadApk(
+        context: Context,
+        url: String,
+        apkName: String,
+        expectedSize: Long,
+        expectedSha256: String = "",
+        onProgress: (downloaded: Long, total: Long) -> Unit,
+    ): File? = withContext(Dispatchers.IO) {
+        // 下载地址来自远端 Release 元数据：只接受 HTTPS（全局已放开明文，不能依赖系统拦截）
+        if (!url.startsWith("https://", ignoreCase = true)) {
+            Timber.w("App update URL rejected: not https")
+            return@withContext null
+        }
+        val target = targetFile(context, apkName)
+        val partial = File(target.parentFile, target.name + ".part")
+        var call: Call? = null
+        var locked = false
+        try {
+            // 已有下载在跑：直接拒绝，不覆盖在途下载的 activeCall（B-M4）
+            if (!downloadMutex.tryLock()) {
+                Timber.w("App update download already running, ignoring duplicate call")
+                return@withContext null
+            }
+            locked = true
+            val request = Request.Builder()
+                .url(url)
+                .header("User-Agent", "Hime-Updater")
+                .get()
+                .build()
+            call = client.newCall(request)
+            activeCall = call
+            call.execute().use { response ->
+                if (!response.isSuccessful) {
+                    Timber.w("App update download HTTP %d", response.code)
+                    return@withContext null
+                }
+                val body = response.body ?: return@withContext null
+                val contentLength = body.contentLength()
+                val total = contentLength.takeIf { it > 0 } ?: expectedSize
+                var downloaded = 0L
+                val digest = if (expectedSha256.isNotBlank()) {
+                    DigestUtil.newSha256Digest()
+                } else {
+                    null
+                }
+                body.byteStream().use { input ->
+                    partial.outputStream().use { out ->
+                        val buffer = ByteArray(256 * 1024)
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            val read = input.read(buffer)
+                            if (read < 0) break
+                            out.write(buffer, 0, read)
+                            digest?.update(buffer, 0, read)
+                            downloaded += read
+                            onProgress(downloaded, total)
+                        }
+                    }
+                }
+                // 大小对不上（截断/多传）视为下载失败，不进入安装。
+                // 两道关（B-M5）：Content-Length 是服务端实收口径，
+                // expectedSize 是资产元数据口径；任一道对不上即拒。
+                // 此前只验 expectedSize，元数据缺失（apkSize=0）且
+                // 登记 SHA 为空时，截断包无任何长度关卡即进安装器。
+                if (!sizeCheckPassed(downloaded, contentLength, expectedSize)) {
+                    Timber.w(
+                        "App update size mismatch: got %d, contentLength=%d expectedSize=%d",
+                        downloaded, contentLength, expectedSize,
+                    )
+                    partial.delete()
+                    return@withContext null
+                }
+                // 完整性校验：GitHub 提供了资产 SHA-256 时必须逐字节一致，
+                // 只验大小挡不住同长度的内容替换/损坏
+                if (digest != null) {
+                    val actual = DigestUtil.hexDigest(digest)
+                    if (!actual.equals(expectedSha256, ignoreCase = true)) {
+                        Timber.w("App update SHA-256 mismatch")
+                        partial.delete()
+                        return@withContext null
+                    }
+                }
+                // 先删旧目标再 rename 的时序窗口：rename 失败时不能把「已删旧
+                // 包 + 只有 .part」当成功返回——走 copyTo 兜底并显式校验目标
+                if (target.exists()) target.delete()
+                if (!partial.renameTo(target)) {
+                    partial.copyTo(target, overwrite = true)
+                    partial.delete()
+                }
+                if (!target.exists() || target.length() != downloaded) {
+                    Timber.w("App update finalize failed: target missing or size changed")
+                    return@withContext null
+                }
+                target
+            }
+        } catch (e: CancellationException) {
+            partial.delete()
+            throw e
+        } catch (e: Exception) {
+            Timber.w(e, "App update download failed")
+            partial.delete()
+            null
+        } finally {
+            // 只清自己的 call（B-M4 的另一半：无条件置空会清掉后一路
+            // 的 call）；互斥锁随本次下载结束释放（未抢到锁时不解）。
+            if (call != null && activeCall === call) activeCall = null
+            if (locked) downloadMutex.unlock()
+        }
+    }
+
+    /**
+     * 下载大小校验（纯函数，供单测）：实收字节必须同时对上服务端
+     * 声明的 Content-Length（>0 时）与资产元数据的 expectedSize
+     * （>0 时）；任一口径缺失（<=0）时只验另一道，不因此放行
+     * （B-M5：expectedSize==0 时 Content-Length 仍是有效关卡）。
+     */
+    internal fun sizeCheckPassed(downloaded: Long, contentLength: Long, expectedSize: Long): Boolean {
+        if (contentLength > 0 && downloaded != contentLength) return false
+        if (expectedSize > 0 && downloaded != expectedSize) return false
+        return true
+    }
+
+    // 安装前不再本地读包验签（Q12 已拆）：下载环节已做大小＋登记
+    // 摘要校验，系统安装器对签名不一致的覆盖安装本身就拒绝，这道
+    // 前置比对纯属重复劳动、还多一个误拒点
+
+    /** 是否还缺「安装未知应用」授权（API 26 起按应用单独授权，低版本无此门） */
+    fun needsInstallPermission(context: Context): Boolean =
+        Build.VERSION.SDK_INT >= 26 && !context.packageManager.canRequestPackageInstalls()
+
+    /** 打开本应用的「安装未知应用」系统设置页 */
+    fun openInstallPermissionSettings(context: Context) {
+        val intent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:${context.packageName}"),
+        ).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+    }
+
+    /** 调起系统安装器安装已下载的 APK */
+    fun installApk(context: Context, file: File) {
+        val uri = FileProvider.getUriForFile(
+            context, "${context.packageName}.fileprovider", file,
+        )
+        val intent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(uri, "application/vnd.android.package-archive")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+        context.startActivity(intent)
+    }
+}

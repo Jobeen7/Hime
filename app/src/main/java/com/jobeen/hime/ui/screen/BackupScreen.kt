@@ -1,0 +1,278 @@
+package com.jobeen.hime.ui.screen
+
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.MaterialTheme
+import com.jobeen.hime.ui.theme.LocalMonetCardColor
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.jobeen.hime.R
+
+/**
+ * 中断还原横幅主文案是否提回滚（D-L1，WO36）：回滚入口禁用时
+ * （快照不可用——损坏 journal 或快照丢失，回滚钮已禁用）主文案
+ * 不再提回滚，只说重新导入备份文件；快照在位时主文案保留“或回滚
+ * 到还原前的状态”。回滚钮的启用条件与此同值（snapshotAvailable，
+ * 见下文按钮 enabled），文案与按钮永不同步错位。
+ */
+internal fun interruptedRestoreMessageMentionsRollback(
+    info: com.jobeen.hime.data.backup.BackupManager.InterruptedRestoreInfo,
+): Boolean = info.snapshotAvailable
+
+/** 备份与还原页的 UI 状态与动作：文件读写与加解密在 BackupActivity 中完成 */
+class BackupUiState {
+    var busyText: String? by mutableStateOf(null)
+    var showCreatePasswordDialog: Boolean by mutableStateOf(false)
+    var showRestorePasswordDialog: Boolean by mutableStateOf(false)
+    /** 启动对账检出的中断还原（D-S2）：非空时本页顶部显示提示横幅。 */
+    var interruptedRestore: com.jobeen.hime.data.backup.BackupManager.InterruptedRestoreInfo? by mutableStateOf(null)
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BackupScreen(
+    state: BackupUiState,
+    onBack: () -> Unit,
+    onCreateBackup: (password: String) -> Unit,
+    onPickRestoreFile: () -> Unit,
+    onRestoreWithPassword: (password: String) -> Unit,
+    onRollbackInterruptedRestore: () -> Unit = {},
+    onDismissInterruptedRestore: () -> Unit = {},
+) {
+    val barFontSize = 18.sp
+    val locale = LocalConfiguration.current.locales[0]
+    SettingsPageScaffold(
+        title = stringResource(R.string.backup_title),
+        onBack = onBack,
+    ) {
+            // 中断还原提示（D-S2）：上次还原被进程杀死中断，journal 仍在。
+            state.interruptedRestore?.let { info ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = MaterialTheme.shapes.large,
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.errorContainer,
+                    ),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(16.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.backup_restore_interrupted_title),
+                            style = MaterialTheme.typography.titleMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        Text(
+                            text = stringResource(
+                                if (interruptedRestoreMessageMentionsRollback(info)) {
+                                    R.string.backup_restore_interrupted_message
+                                } else {
+                                    R.string.backup_restore_interrupted_message_no_rollback
+                                },
+                                java.text.SimpleDateFormat(
+                                    "yyyy-MM-dd HH:mm",
+                                    locale,
+                                ).format(java.util.Date(info.startedAt)),
+                            ),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onErrorContainer,
+                        )
+                        if (!info.snapshotAvailable) {
+                            Text(
+                                text = stringResource(
+                                    if (info.journalCorrupt) {
+                                        R.string.backup_restore_interrupted_journal_corrupt
+                                    } else {
+                                        R.string.backup_restore_interrupted_no_snapshot
+                                    },
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onErrorContainer,
+                            )
+                        }
+                        androidx.compose.foundation.layout.Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Button(
+                                onClick = onPickRestoreFile,
+                                enabled = state.busyText == null,
+                            ) {
+                                Text(stringResource(R.string.backup_restore_interrupted_reimport))
+                            }
+                            OutlinedButton(
+                                onClick = onRollbackInterruptedRestore,
+                                enabled = state.busyText == null && info.snapshotAvailable,
+                            ) {
+                                Text(stringResource(R.string.backup_restore_interrupted_rollback))
+                            }
+                            OutlinedButton(
+                                onClick = onDismissInterruptedRestore,
+                                enabled = state.busyText == null,
+                            ) {
+                                Text(stringResource(R.string.backup_restore_interrupted_dismiss))
+                            }
+                        }
+                    }
+                }
+
+                Spacer(Modifier.height(20.dp))
+            }
+
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = MaterialTheme.shapes.large,
+                colors = CardDefaults.cardColors(
+                    containerColor = LocalMonetCardColor.current,
+                ),
+            ) {
+                Text(
+                    text = stringResource(R.string.backup_intro),
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(16.dp),
+                )
+            }
+
+            Spacer(Modifier.height(20.dp))
+
+            Button(
+                onClick = { state.showCreatePasswordDialog = true },
+                enabled = state.busyText == null,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.backup_create))
+            }
+
+            Spacer(Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = onPickRestoreFile,
+                enabled = state.busyText == null,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(stringResource(R.string.backup_restore_from_file))
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            Text(
+                text = stringResource(R.string.backup_restore_warning),
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+
+            state.busyText?.let {
+                Spacer(Modifier.height(20.dp))
+                Text(text = it, style = MaterialTheme.typography.bodyMedium)
+            }
+    }
+
+    if (state.showCreatePasswordDialog) {
+        var pw by androidx.compose.runtime.remember { mutableStateOf("") }
+        var pw2 by androidx.compose.runtime.remember { mutableStateOf("") }
+        var error by androidx.compose.runtime.remember { mutableStateOf<String?>(null) }
+        val tooShort = stringResource(R.string.backup_password_too_short)
+        val mismatch = stringResource(R.string.backup_password_mismatch)
+        SettingsDialog(
+            onDismissRequest = { state.showCreatePasswordDialog = false },
+            title = stringResource(R.string.backup_create),
+            body = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(
+                        shape = MaterialTheme.shapes.medium,
+                        value = pw,
+                        onValueChange = { pw = it; error = null },
+                        label = { Text(stringResource(R.string.backup_password)) },
+                        supportingText = { Text(stringResource(R.string.backup_password_hint)) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        shape = MaterialTheme.shapes.medium,
+                        value = pw2,
+                        onValueChange = { pw2 = it; error = null },
+                        label = { Text(stringResource(R.string.backup_password_confirm)) },
+                        visualTransformation = PasswordVisualTransformation(),
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    error?.let {
+                        Text(it, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+            },
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.backup_cancel),
+                    onClick = { state.showCreatePasswordDialog = false },
+                ),
+                SettingsDialogAction(
+                    text = stringResource(R.string.backup_confirm_create),
+                    onClick = {
+                        when {
+                            pw.length < 8 -> error = tooShort
+                            pw != pw2 -> error = mismatch
+                            else -> {
+                                state.showCreatePasswordDialog = false
+                                onCreateBackup(pw)
+                            }
+                        }
+                    },
+                ),
+            ),
+        )
+    }
+
+    if (state.showRestorePasswordDialog) {
+        var pw by androidx.compose.runtime.remember { mutableStateOf("") }
+        SettingsDialog(
+            onDismissRequest = { state.showRestorePasswordDialog = false },
+            title = stringResource(R.string.backup_restore_from_file),
+            body = {
+                OutlinedTextField(
+                    shape = MaterialTheme.shapes.medium,
+                    value = pw,
+                    onValueChange = { pw = it },
+                    label = { Text(stringResource(R.string.backup_password)) },
+                    visualTransformation = PasswordVisualTransformation(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            },
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.backup_cancel),
+                    onClick = { state.showRestorePasswordDialog = false },
+                ),
+                SettingsDialogAction(
+                    text = stringResource(R.string.backup_confirm_restore),
+                    onClick = {
+                        state.showRestorePasswordDialog = false
+                        onRestoreWithPassword(pw)
+                    },
+                    enabled = pw.isNotEmpty(),
+                ),
+            ),
+        )
+    }
+}

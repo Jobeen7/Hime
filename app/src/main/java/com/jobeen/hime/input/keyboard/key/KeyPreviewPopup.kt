@@ -1,0 +1,113 @@
+package com.jobeen.hime.input.keyboard.key
+
+import android.content.Context
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.util.TypedValue
+import android.view.Gravity
+import android.view.View
+import android.widget.PopupWindow
+import android.widget.TextView
+import com.jobeen.hime.data.keyboard.theme.FontRole
+import com.jobeen.hime.data.keyboard.theme.GlobalFonts
+import splitties.dimensions.dp
+
+class KeyPreviewPopup(private val context: Context) {
+
+    private var popupWindow: PopupWindow? = null
+
+    // 复用 contentView，避免长按预览高频创建 View 导致 GC 抖动
+    private val popupSize = context.dp(52)
+    private val bgDrawable = GradientDrawable().apply {
+        cornerRadius = context.dp(8f)
+    }
+    private val contentView = TextView(context).apply {
+        setTextSize(TypedValue.COMPLEX_UNIT_SP, 30f)
+        gravity = Gravity.CENTER
+        typeface = Typeface.DEFAULT
+        setIncludeFontPadding(false)
+        background = bgDrawable
+    }
+    private val loc = IntArray(2)
+
+    /**
+     * 按键短按气泡：尺寸与溢出检测可由逐键 hintStyle 覆盖
+     * （未传时走默认 52dp 方形与顶层 bubbleOverflowCheck）；
+     * 窗口对象仍只建一次复用，尺寸变化时经 update 生效。
+     */
+    fun show(
+        anchor: View,
+        text: String,
+        textColor: Int,
+        bgColor: Int,
+        bubbleWidthPx: Int? = null,
+        bubbleHeightPx: Int? = null,
+        checkOverflow: Boolean? = null,
+    ) {
+        contentView.setText(text)
+        contentView.setTextColor(textColor)
+        bgDrawable.setColor(bgColor)
+        // 字族跟随（2026-10-27 新增分流）：弹窗视图复用，每次
+        // 弹出时按当前皮肤重取一次（缓存查找，无皮肤时回默认）。
+        contentView.typeface = GlobalFonts.typefaceFor(context, FontRole.POPUP, Typeface.NORMAL) ?: Typeface.DEFAULT
+
+        anchor.getLocationInWindow(loc)
+        val anchorCenterX = loc[0] + anchor.width / 2
+        val anchorTop = loc[1]
+        val width = bubbleWidthPx?.takeIf { it > 0 } ?: popupSize
+        val height = bubbleHeightPx?.takeIf { it > 0 } ?: popupSize
+
+        // 气泡溢出检测（默认开，与长按弹出气泡同口径）：
+        // 逐键 hintStyle 值优先于顶层 bubbleOverflowCheck；
+        // 开启且窗口尺寸已知时走调位解析；关闭或尺寸未知时
+        // 保持旧行为（不夹取，原样显示）。
+        val gap = context.dp(6)
+        val rootView = anchor.rootView
+        val checkEnabled = checkOverflow ?: true
+        val (popupX, popupY) = if (checkEnabled && rootView != null &&
+            rootView.width > 0 && rootView.height > 0
+        ) {
+            val pos = PopupOverflow.resolve(
+                anchorCenterX, anchorTop, anchor.height,
+                width, height,
+                rootView.width, rootView.height, gap,
+            )
+            pos.x to pos.y
+        } else {
+            anchorCenterX - width / 2 to anchorTop - height - gap
+        }
+
+        // PopupWindow 对象只建一次复用（此前每次按键新建一个窗口对象并走一遍
+        // 完整的窗口增删装配，是按键抖动来源之一）：已显示时只更新位置
+        val popup = popupWindow ?: PopupWindow(
+            contentView,
+            width,
+            height,
+            false,
+        ).apply {
+            isOutsideTouchable = false
+            isTouchable = false
+            elevation = context.dp(8f)
+        }.also { popupWindow = it }
+        if (popup.isShowing) {
+            popup.update(popupX, popupY, width, height)
+        } else {
+            // 复用窗口的创建尺寸恒为首次尺寸：逐键尺寸变化时
+            // 先改宽高再显示，否则会沿用旧尺寸。
+            popup.width = width
+            popup.height = height
+            popup.showAtLocation(
+                anchor,
+                Gravity.TOP or Gravity.START,
+                popupX,
+                popupY,
+            )
+        }
+    }
+
+    fun dismiss() {
+        // 只隐藏不销毁：窗口对象留作复用（与 KeyboardPopup 的复用范式一致）
+        popupWindow?.dismiss()
+    }
+}

@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.skin.symbol
+
+import com.jobeen.hime.skin.model.KeyboardTypes
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** 板提交后自动返回决策（审计 G）：板锁已删，两块板提交恒返回。 */
+class BoardAutoReturnTest {
+
+    @Test
+    fun boardsAlwaysReturn() {
+        assertTrue(
+            BoardAutoReturn.shouldReturnAfterCommit(KeyboardTypes.SYMBOLIC),
+        )
+        assertTrue(
+            BoardAutoReturn.shouldReturnAfterCommit(KeyboardTypes.EMOJIS),
+        )
+    }
+
+    @Test
+    fun nonBoardTypesNeverReturn() {
+        assertFalse(
+            BoardAutoReturn.shouldReturnAfterCommit(KeyboardTypes.PINYIN),
+        )
+        assertFalse(
+            BoardAutoReturn.shouldReturnAfterCommit(KeyboardTypes.NUMERIC),
+        )
+    }
+}

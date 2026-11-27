@@ -1,0 +1,628 @@
+package com.jobeen.hime.input
+
+import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.text.Editable
+import android.text.Selection
+import android.text.Spanned
+import android.view.KeyEvent
+import android.view.inputmethod.CompletionInfo
+import android.view.inputmethod.CorrectionInfo
+import android.view.inputmethod.ExtractedText
+import android.view.inputmethod.ExtractedTextRequest
+import android.view.inputmethod.InputConnection
+import android.view.inputmethod.InputContentInfo
+import java.text.BreakIterator
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.collections.ArrayDeque
+
+/**
+ * 桥接模式下使用的虚拟输入连接：所有提交/删除/语音输出都写入内部 Editable，
+ * 而不是直接提交到真实编辑器。AddPhraseLayerView 读取 [text]/[cursor] 进行绘制。
+ */
+class ImeInputConnection(private val context: Context? = null) : InputConnection {
+    companion object {
+        const val MAX_LENGTH = 1000
+
+        /** undo 快照总字符上限（与条数上限双钳，防快照全文拷贝无界累积） */
+        const val MAX_UNDO_TOTAL_CHARS = 200_000
+
+        /**
+         * 码点数 → UTF-16 单元数换算（纯函数）：以 [selStart]/[selEnd]
+         * 为原点，前方按 [beforeCp] 个码点、后方按 [afterCp] 个码点行走，
+         * 返回两侧实际跨过的 UTF-16 单元数。代理对（emoji 等）一个码点
+         * 占 2 个单元，与 deleteSurroundingText 的字符口径对齐。
+         *
+         * 先用 codePointCount 数清两端可用码点数并钳制请求量，再调
+         * offsetByCodePoints 行走——后者越界会抛 IndexOutOfBounds，
+         * 钳制后必然落回文本内；选区端点本身也先钳回 [0, length]。
+         */
+        internal fun codePointsToUtf16Counts(
+            text: CharSequence,
+            selStart: Int,
+            selEnd: Int,
+            beforeCp: Int,
+            afterCp: Int,
+        ): Pair<Int, Int> {
+            val length = text.length
+            val start = selStart.coerceIn(0, length)
+            val end = selEnd.coerceIn(start, length)
+            val availBefore = Character.codePointCount(text, 0, start)
+            val walkBefore = beforeCp.coerceIn(0, availBefore)
+            val newStart = Character.offsetByCodePoints(text, start, -walkBefore)
+            val availAfter = Character.codePointCount(text, end, length)
+            val walkAfter = afterCp.coerceIn(0, availAfter)
+            val newEnd = Character.offsetByCodePoints(text, end, walkAfter)
+            return (start - newStart) to (newEnd - end)
+        }
+    }
+
+    private val editable: Editable = Editable.Factory.getInstance().newEditable("")
+    private val composingSpan = Any()
+    var onChange: (() -> Unit)? = null
+    private val changeListeners = mutableListOf<() -> Unit>()
+    private val handler = Handler(Looper.getMainLooper())
+
+    private data class Snapshot(val text: String, val cursor: Int)
+    private val undoStack = ArrayDeque<Snapshot>()
+    private val redoStack = ArrayDeque<Snapshot>()
+    private var selectionAnchor: Int? = null
+    private var selectionCursor: Int? = null
+
+    // undo 栈总字符数增量维护（此前每次入栈都 sumOf 全栈遍历）
+    private var undoTotalChars = 0
+
+    private fun recordHistory() {
+        val snap = Snapshot(editable.toString(), cursor)
+        if (undoStack.lastOrNull() == snap) return
+        undoStack.addLast(snap)
+        undoTotalChars += snap.text.length
+        // 双上限：条数 + 总字符数（每份快照都是全文拷贝，只钳条数时
+        // 总量随单份长度线性膨胀）
+        while (undoStack.size > 200 || (undoTotalChars > MAX_UNDO_TOTAL_CHARS && undoStack.size > 1)) {
+            undoTotalChars -= undoStack.removeFirst().text.length
+        }
+        redoStack.clear()
+    }
+
+    private fun restoreSnapshot(s: Snapshot) {
+        editable.removeSpan(composingSpan)
+        editable.replace(0, editable.length, s.text)
+        Selection.setSelection(editable, s.cursor.coerceIn(0, editable.length))
+        selectionAnchor = null
+        selectionCursor = null
+        fireChange()
+    }
+
+    fun undo(): Boolean {
+        if (undoStack.isEmpty()) return false
+        redoStack.addLast(Snapshot(editable.toString(), cursor))
+        val snap = undoStack.removeLast()
+        undoTotalChars -= snap.text.length
+        restoreSnapshot(snap)
+        return true
+    }
+
+    fun redo(): Boolean {
+        if (redoStack.isEmpty()) return false
+        val snap = Snapshot(editable.toString(), cursor)
+        undoStack.addLast(snap)
+        undoTotalChars += snap.text.length
+        restoreSnapshot(redoStack.removeLast())
+        return true
+    }
+
+    private fun composingRange(): Pair<Int, Int>? {
+        val s = editable.getSpanStart(composingSpan)
+        val e = editable.getSpanEnd(composingSpan)
+        if (s < 0 || e < 0) return null
+        return s to e
+    }
+
+    private fun fitInsert(selStart: Int, selEnd: Int, text: CharSequence?): CharSequence {
+        val incoming = text ?: ""
+        val room = MAX_LENGTH - (editable.length - (selEnd - selStart))
+        return if (room <= 0) "" else incoming.subSequence(0, min(incoming.length, room))
+    }
+
+    private fun replaceAndSpan(
+        text: CharSequence?,
+        useComposing: Boolean,
+        newCursorPosition: Int = 1,
+    ) {
+        val incoming = text ?: ""
+        val (s, e) = composingRange() ?: (selStart() to selEnd())
+        editable.removeSpan(composingSpan)
+        val fitted = fitInsert(s, e, incoming)
+        editable.replace(s, e, fitted)
+        val spanEnd = s + fitted.length
+        if (useComposing && fitted.isNotEmpty()) {
+            editable.setSpan(
+                composingSpan,
+                s,
+                spanEnd,
+                Spanned.SPAN_INCLUSIVE_INCLUSIVE,
+            )
+        }
+        // 光标按 newCursorPosition 落位（I-L1，AOSP 口径）：>0 时相对
+        // 插入文本末尾（1 = 紧贴末尾，与旧实现一致），<=0 时相对插入
+        // 文本开头（0 = 紧贴开头）；钳回文本内。旧实现恒落末尾，
+        // 忽略该参数，成对符号等调用方拿不到括号中间的光标。
+        val pos = cursorAfterCommit(s, fitted.length, newCursorPosition, editable.length)
+        Selection.setSelection(editable, pos)
+        selectionAnchor = null
+        selectionCursor = null
+        fireChange()
+    }
+
+    val text: String
+        get() = editable.toString()
+
+    val cursor: Int
+        get() {
+            val s = Selection.getSelectionStart(editable)
+            return if (s < 0) editable.length else s
+        }
+
+    val selection: Pair<Int, Int>
+        get() = selStart() to selEnd()
+
+    /** 当前未上屏（composing）文本区间，无则返回 null */
+    val composingRange: Pair<Int, Int>?
+        get() {
+            val s = editable.getSpanStart(composingSpan)
+            val e = editable.getSpanEnd(composingSpan)
+            if (s < 0 || e <= s) return null
+            return s to e
+        }
+
+    fun clear() {
+        editable.removeSpan(composingSpan)
+        editable.clear()
+        undoStack.clear()
+        redoStack.clear()
+        // 计数与栈同清：不清零会跨会话（每次进入桥接编辑都调 clear）
+        // 单调残留，逼近上限后 recordHistory 把撤销栈裁到只剩 1 条，
+        // 多步撤销长期劣化为单步
+        undoTotalChars = 0
+        selectionAnchor = null
+        selectionCursor = null
+        fireChange()
+    }
+
+    private fun fireChange() {
+        handler.post {
+            onChange?.invoke()
+            changeListeners.toList().forEach { it() }
+        }
+    }
+
+    fun addOnChangeListener(listener: () -> Unit) {
+        if (!changeListeners.contains(listener)) changeListeners += listener
+    }
+
+    fun removeOnChangeListener(listener: () -> Unit) {
+        changeListeners -= listener
+    }
+
+    /**
+     * 选区区间左端。Shift+方向键扩展出的反向选区里 Selection 的 start 在
+     * end 之后，这里一律归一化为 min，保证 replace/delete 等按 [start, end)
+     * 区间操作不越界抛 IOOBE；选区方向由 [selectionAnchor]/[selectionCursor]
+     * 单独记录，不靠 start/end 的顺序表达。
+     */
+    private fun selStart(): Int {
+        val s = Selection.getSelectionStart(editable)
+        val e = Selection.getSelectionEnd(editable)
+        return if (s < 0 || e < 0) editable.length else min(s, e)
+    }
+
+    /** 选区区间右端，口径见 [selStart]。 */
+    private fun selEnd(): Int {
+        val s = Selection.getSelectionStart(editable)
+        val e = Selection.getSelectionEnd(editable)
+        return if (s < 0 || e < 0) editable.length else max(s, e)
+    }
+
+    override fun getTextBeforeCursor(n: Int, flags: Int): CharSequence? {
+        val s = selStart()
+        val start = (s - n).coerceAtLeast(0)
+        return editable.subSequence(start, s)
+    }
+
+    override fun getTextAfterCursor(n: Int, flags: Int): CharSequence? {
+        val e = selEnd()
+        val end = e + n.coerceAtMost(editable.length - e)
+        return editable.subSequence(e, end)
+    }
+
+    override fun getSelectedText(flags: Int): CharSequence? {
+        val s = selStart()
+        val e = selEnd()
+        if (s == e) return ""
+        return editable.subSequence(min(s, e), max(s, e))
+    }
+
+    override fun getCursorCapsMode(reqModes: Int): Int = 0
+
+    override fun getExtractedText(
+        request: ExtractedTextRequest?,
+        flags: Int,
+    ): ExtractedText? {
+        // 恒 null 偏离契约（I-L1）：调用方（ClearedTextLedger
+        // .isAtFieldHead、成对提交的光标回退兜底）读不到选区，位置
+        // 判定退化。返回真实全文与选区；request 为空时返回 null。
+        if (request == null) return null
+        return ExtractedText().apply {
+            text = editable.toString()
+            startOffset = 0
+            selectionStart = selStart()
+            selectionEnd = selEnd()
+            this.flags = 0
+            partialStartOffset = 0
+            partialEndOffset = editable.length
+        }
+    }
+
+    override fun deleteSurroundingText(inLength: Int, outLength: Int): Boolean {
+        // 系统契约里长度为负无意义且不予执行：直接返回 false——钳为 0
+        // 再走完流程会谎报成功，且负值会让区间端点反转，无选区分支里
+        // start > end 时 Editable.delete 直接抛 IndexOutOfBounds
+        if (inLength < 0 || outLength < 0) return false
+        val inLen = inLength
+        val outLen = outLength
+        val s = selStart()
+        val e = selEnd()
+        // 先算有效删除范围，确有删减才记历史：旧实现无条件先记，光标
+        // 在文首按退格这类空删会白入 undo 栈、还顺手清掉 redo 栈，
+        // 用户随后想重做刚撤销的编辑就没了。范围口径与下方实际删除
+        // 分支严格同构（选区时两侧环绕、无选区时单一区间），钳制后
+        // 的长度先压到文本长度内再算端点，防大参数下端点溢出
+        val beforeStart = max(0, s - min(inLen, editable.length))
+        val afterEnd = min(editable.length, e + min(outLen, editable.length))
+        val willDelete = if (s != e) {
+            afterEnd > e || beforeStart < s
+        } else {
+            afterEnd > beforeStart
+        }
+        // 空操作直接返回：不动组字 span、不发变更通知——旧实现照样
+        // removeSpan 会把组字区悄悄结束掉、多一次无谓重绘
+        if (!willDelete) return true
+        recordHistory()
+        editable.removeSpan(composingSpan)
+        if (s != e) {
+            // 有选区时只删选区两侧的环绕文本、选区本身保留：旧实现
+            // 把 [s-in, e+out) 整段删掉，deleteSurroundingText(1, 0)
+            // 这类「删光标前 1 字」的调用会连选区带前面一字一起吃掉，
+            // 与调用方意图不符（删选区应由 commitText("")/明确的
+            // 选区删除路径完成）
+            val afterStart = min(editable.length, e + outLen)
+            if (afterStart > e) editable.delete(e, afterStart)
+            val beforeStart = max(0, s - inLen)
+            if (s > beforeStart) editable.delete(beforeStart, s)
+            Selection.setSelection(
+                editable,
+                beforeStart.coerceAtMost(editable.length),
+                (e - (s - beforeStart)).coerceAtMost(editable.length),
+            )
+        } else {
+            val start = max(0, s - inLen)
+            val end = min(editable.length, e + outLen)
+            editable.delete(start, end)
+            Selection.setSelection(editable, start.coerceAtMost(editable.length))
+        }
+        selectionAnchor = null
+        selectionCursor = null
+        fireChange()
+        return true
+    }
+
+    override fun deleteSurroundingTextInCodePoints(
+        inLength: Int,
+        outLength: Int,
+    ): Boolean {
+        // 接口语义是码点数：先以当前选区两端为原点把码点数换算成
+        // UTF-16 单元数，再委托既有 deleteSurroundingText——旧实现把
+        // 码点数直接当字符数转发，选区两侧有代理对时会少删或劈字；
+        // 换算后 span/组字清理与选区保留口径全部沿用既有实现不变
+        val (before, after) = codePointsToUtf16Counts(
+            editable, selStart(), selEnd(), inLength, outLength,
+        )
+        return deleteSurroundingText(before, after)
+    }
+
+    override fun setComposingText(text: CharSequence?, newCursorPosition: Int): Boolean {
+        // 组字中间态不入 undo 栈：桥接编辑时每键一次全文快照纯属浪费，
+        // 撤销的粒度应该是已提交/已删除的文本（commit/delete 仍记录）
+        replaceAndSpan(text, useComposing = true, newCursorPosition = newCursorPosition)
+        return true
+    }
+
+    override fun setComposingRegion(start: Int, end: Int): Boolean {
+        editable.removeSpan(composingSpan)
+        // 越界钳制（I-L1）：非法区间直接 setSpan 会抛
+        // IndexOutOfBoundsException；钳后空区间即只清 span。
+        val (s, e) = clampComposingRegion(start, end, editable.length)
+        if (e > s) {
+            editable.setSpan(
+                composingSpan,
+                s,
+                e,
+                Spanned.SPAN_INCLUSIVE_INCLUSIVE,
+            )
+        }
+        fireChange()
+        return true
+    }
+
+    override fun finishComposingText(): Boolean {
+        editable.removeSpan(composingSpan)
+        fireChange()
+        return true
+    }
+
+    override fun commitText(text: CharSequence?, newCursorPosition: Int): Boolean {
+        recordHistory()
+        replaceAndSpan(text, useComposing = false, newCursorPosition = newCursorPosition)
+        return true
+    }
+
+    override fun commitCompletion(text: CompletionInfo?): Boolean = false
+
+    override fun commitCorrection(correctionInfo: CorrectionInfo?): Boolean = false
+
+    override fun setSelection(start: Int, end: Int): Boolean {
+        Selection.setSelection(
+            editable,
+            start.coerceIn(0, editable.length),
+            end.coerceIn(0, editable.length),
+        )
+        selectionAnchor = null
+        selectionCursor = null
+        fireChange()
+        return true
+    }
+
+    override fun performEditorAction(editorAction: Int): Boolean = false
+
+    override fun performContextMenuAction(id: Int): Boolean {
+        val start = min(selStart(), selEnd())
+        val end = max(selStart(), selEnd())
+        when (id) {
+            android.R.id.selectAll -> return setSelection(0, editable.length)
+            android.R.id.copy -> {
+                if (start == end) return false
+                clipboard()?.setPrimaryClip(ClipData.newPlainText("text", editable.subSequence(start, end)))
+                return true
+            }
+            android.R.id.cut -> {
+                if (start == end) return false
+                clipboard()?.setPrimaryClip(ClipData.newPlainText("text", editable.subSequence(start, end)))
+                recordHistory()
+                editable.delete(start, end)
+                editable.removeSpan(composingSpan)
+                Selection.setSelection(editable, start)
+                fireChange()
+                return true
+            }
+            android.R.id.paste -> {
+                // 空剪贴板守卫（I-L1）：primaryClip 非空但条目数为 0
+                // 时 getItemAt(0) 抛 IndexOutOfBoundsException。
+                val primaryClip = clipboard()?.primaryClip
+                if (pasteItemIndex(primaryClip?.itemCount ?: 0) < 0) return false
+                val clip = primaryClip?.getItemAt(0)?.coerceToText(context ?: return false)
+                if (clip != null) {
+                    recordHistory()
+                    replaceAndSpan(clip, useComposing = false)
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    override fun beginBatchEdit(): Boolean = true
+
+    override fun endBatchEdit(): Boolean = true
+
+    override fun sendKeyEvent(event: KeyEvent?): Boolean {
+        event ?: return false
+        if (event.action != KeyEvent.ACTION_DOWN) return true
+        if (event.keyCode == KeyEvent.KEYCODE_Z && event.isCtrlPressed) {
+            if (event.isShiftPressed) redo() else undo()
+            return true
+        }
+        val extending = event.isShiftPressed
+        val cursor = selectionCursor ?: if (extending) selEnd() else selStart()
+        if (extending && selectionAnchor == null) selectionAnchor = selStart()
+        val target = when (event.keyCode) {
+            KeyEvent.KEYCODE_DPAD_LEFT -> if (!extending && selStart() != selEnd()) {
+                selStart()
+            } else {
+                // 按字素簇步进：码点步进会让光标停在组合序列内部
+                // （基字与附加符之间、ZWJ 序列中间、国旗两面之间），
+                // 与退格同口径走 BreakIterator 边界
+                graphemeBoundaryBefore(cursor)
+            }
+            KeyEvent.KEYCODE_DPAD_RIGHT -> if (!extending && selStart() != selEnd()) {
+                selEnd()
+            } else {
+                graphemeBoundaryAfter(cursor)
+            }
+            KeyEvent.KEYCODE_MOVE_HOME -> 0
+            KeyEvent.KEYCODE_MOVE_END -> editable.length
+            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_DOWN -> moveVertically(
+                cursor, event.keyCode == KeyEvent.KEYCODE_DPAD_UP
+            )
+            KeyEvent.KEYCODE_DEL -> {
+                if (selStart() != selEnd()) {
+                    // 有选区时保持既有口径不变：走 deleteSurroundingText
+                    // 的选区语义（只删环绕、选区保留），字素簇化只改
+                    // 无选区的单删路径，不触碰选区路径的行为
+                    deleteSurroundingTextInCodePoints(1, 0)
+                } else {
+                    // 按字素簇删：按 1 码点删会把国旗删掉一半（区域
+                    // 指示符成对）、ZWJ 序列拆散、组合附加符与基字
+                    // 分家。先求光标前一簇的码点数，再走既有码点
+                    // 删除路径（换算与 span 清理口径全部不变）
+                    val start = selStart()
+                    val clusterStart = graphemeBoundaryBefore(start)
+                    val cpCount = Character.codePointCount(editable, clusterStart, start)
+                    deleteSurroundingTextInCodePoints(cpCount, 0)
+                }
+                return true
+            }
+            else -> return false
+        }
+        if (extending) {
+            Selection.setSelection(editable, selectionAnchor ?: cursor, target)
+            selectionCursor = target
+        } else {
+            Selection.setSelection(editable, target)
+            selectionAnchor = null
+            selectionCursor = null
+        }
+        fireChange()
+        return true
+    }
+
+    override fun clearMetaKeyStates(states: Int): Boolean = false
+
+    override fun reportFullscreenMode(state: Boolean): Boolean = false
+
+    override fun performPrivateCommand(action: String?, data: Bundle?): Boolean = false
+
+    override fun requestCursorUpdates(cursorUpdateMode: Int): Boolean = false
+
+    override fun getHandler(): Handler? = null
+
+    override fun closeConnection() {}
+
+    /**
+     * 图片内容接收端：恒返回 false，但不是无理由的平拒。
+     * - 本连接是桥接模式下的虚拟连接，内容只写内部 Editable 文本，
+     *   绘制层也不渲染图片位，故不存在可落图片的位置；接受图片等于
+     *   谎报成功后丢弃，或把图片转发真实编辑器、破坏“文本走虚拟、
+     *   真实编辑器隔离”的桥接不变量，二者都不可取。
+     * - 因此不调用 inputContentInfo.requestPermission：不读内容就
+     *   不取授权，不给发送方留下一个无人释放的临时授权。
+     * - 本连接只写内部 Editable 文本，不负责向真实编辑器发图片
+     *   （图片提交无生产调用方，见 I-L3）；本方法只负责桥接态的
+     *   诚实拒绝。行为与此前一致（恒 false），改动仅为说明原因。
+     */
+    override fun commitContent(
+        inputContentInfo: InputContentInfo,
+        flags: Int,
+        opts: Bundle?,
+    ): Boolean = false
+
+    private fun clipboard(): ClipboardManager? =
+        context?.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+
+    private fun moveVertically(position: Int, up: Boolean): Int {
+        val lineStart = editable.toString().lastIndexOf('\n', position - 1) + 1
+        val column = position - lineStart
+        val targetStart = if (up) {
+            if (lineStart == 0) return 0
+            editable.toString().lastIndexOf('\n', lineStart - 2) + 1
+        } else {
+            val next = editable.toString().indexOf('\n', position)
+            if (next < 0) return editable.length
+            next + 1
+        }
+        val targetEnd = editable.toString().indexOf('\n', targetStart)
+            .takeIf { it >= 0 } ?: editable.length
+        // 列偏移是 UTF-16 单元口径：目标行同列前有代理对时会正好落
+        // 在一对代理项中间，先对齐回该码点起点；码点对齐后仍可能停
+        // 在字素簇内部（基字与组合符之间、国旗两指示符之间），光标
+        // 停簇内会让随后上屏拆簇、退格只删半簇，再下取整到簇起点。
+        // 必须先判 isBoundary：恰在簇界时 graphemeBoundaryBefore 会
+        // 过冲到上一簇起点，裸调等于平白退一簇
+        val p = snapToCodePointBoundary((targetStart + column).coerceAtMost(targetEnd))
+        return if (isGraphemeBoundary(p)) p else graphemeBoundaryBefore(p)
+    }
+
+    /** [pos] 是否恰在字素簇边界上（BreakIterator.isBoundary 口径）。 */
+    private fun isGraphemeBoundary(pos: Int): Boolean {
+        if (pos <= 0 || pos >= editable.length) return true
+        val it = BreakIterator.getCharacterInstance()
+        it.setText(editable.toString())
+        return it.isBoundary(pos)
+    }
+
+    /**
+     * [pos] 之前最近的字素簇边界：BreakIterator（Android 上由 ICU
+     * 实现，遵循 UAX #29）口径下，区域指示符对（国旗）、ZWJ emoji
+     * 序列、组合附加符与基字各为一簇；pos 恰在簇界时返回上一簇的
+     * 起点，落在簇内时返回本簇起点——退格删一簇、步进跨一簇共用。
+     */
+    private fun graphemeBoundaryBefore(pos: Int): Int {
+        if (pos <= 0) return 0
+        val it = BreakIterator.getCharacterInstance()
+        it.setText(editable.toString())
+        val b = it.preceding(pos)
+        return if (b == BreakIterator.DONE) 0 else b
+    }
+
+    /** [pos] 之后最近的字素簇边界，口径见 [graphemeBoundaryBefore]。 */
+    private fun graphemeBoundaryAfter(pos: Int): Int {
+        if (pos >= editable.length) return editable.length
+        val it = BreakIterator.getCharacterInstance()
+        it.setText(editable.toString())
+        val b = it.following(pos)
+        return if (b == BreakIterator.DONE) editable.length else b
+    }
+
+    /** 把 UTF-16 下标对齐到码点边界：落在代理对中间时退到该码点起点 */
+    private fun snapToCodePointBoundary(index: Int): Int {
+        if (index in 1 until editable.length &&
+            Character.isLowSurrogate(editable[index]) &&
+            Character.isHighSurrogate(editable[index - 1])
+        ) {
+            return index - 1
+        }
+        return index
+    }
+}
+
+/**
+ * 组字区间的越界钳制（纯函数，可单测；I-L1）：起止下标先钳回
+ * [0, length]，再保证 end >= start——钳后空区间（s == e）即
+ * “只清 span、不建新区”，setSpan 永不越界抛错。
+ */
+internal fun clampComposingRegion(start: Int, end: Int, length: Int): Pair<Int, Int> {
+    val s = start.coerceIn(0, length)
+    val e = end.coerceIn(s, length)
+    return s to e
+}
+
+/**
+ * 提交／组字后的光标落位（纯函数，可单测；I-L1，AOSP 口径）：
+ * newCursorPosition > 0 时相对插入文本末尾（1 = 紧贴末尾），
+ * <= 0 时相对插入文本开头（0 = 紧贴开头、-1 = 开头前一格）；
+ * 结果钳回 [0, textLength]。
+ */
+internal fun cursorAfterCommit(
+    start: Int,
+    insertedLength: Int,
+    newCursorPosition: Int,
+    textLength: Int,
+): Int {
+    val raw = if (newCursorPosition > 0) {
+        start + insertedLength + newCursorPosition - 1
+    } else {
+        start + newCursorPosition
+    }
+    return raw.coerceIn(0, textLength)
+}
+
+/**
+ * 粘贴的首条目下标（纯函数，可单测；I-L1）：剪贴板有条目时取
+ * 第 0 条，否则返回 -1（调用方直接返回 false，不调 getItemAt）。
+ */
+internal fun pasteItemIndex(itemCount: Int): Int = if (itemCount > 0) 0 else -1

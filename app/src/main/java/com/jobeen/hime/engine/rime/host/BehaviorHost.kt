@@ -1,0 +1,432 @@
+package com.jobeen.hime.engine.rime.host
+
+import com.jobeen.hime.base.util.PinYinUtil
+import com.jobeen.hime.engine.IBehaviorHost
+import com.jobeen.hime.engine.behavior.IBehavior
+import com.jobeen.hime.engine.data.CandidatePinYin
+import com.jobeen.hime.engine.data.UserSegmentSymbol
+import com.jobeen.hime.engine.rime.behavior.Backspace
+import com.jobeen.hime.engine.rime.behavior.InputKey
+import com.jobeen.hime.engine.rime.behavior.InputString
+import com.jobeen.hime.engine.rime.behavior.Reset
+import com.jobeen.hime.engine.rime.behavior.RimeBehavior
+import com.jobeen.hime.engine.rime.behavior.Segmentation
+import com.jobeen.hime.engine.rime.behavior.SelectPinYin
+import com.jobeen.hime.engine.rime.behavior.Selection
+import com.jobeen.hime.engine.rime.core.IRimeJob
+import com.jobeen.hime.engine.rime.core.KeyMapping
+import com.jobeen.hime.engine.rime.core.RimeApi
+import com.jobeen.hime.skin.layout.CompactGrouping
+import timber.log.Timber
+
+class BehaviorHost(val rimeJob: IRimeJob) : IBehaviorHost {
+    private val emptyInput = ""
+    private val symbols = listOf(".", ",", ";")
+
+    // 三个队列会被两个线程并发访问：flowed/resetState 来自按键分发线程，
+    // build/possiblePinYin 在引擎线程的 sendJob 里执行。ArrayDeque 本身非线程安全，
+    // 并发 add/removeLast/遍历会出现元素丢失、迭代异常甚至内部数组损坏，
+    // 因此全部队列访问统一由 queueLock 串行化（入口方法加锁，私有方法只在锁内调用）。
+    private val queueLock = Any()
+
+    // 已选择的拼音队列
+    private val selectedPinYinQueue = ArrayDeque<CandidatePinYin>()
+
+    // 输入内容的队列
+    private val inputStringQueue = ArrayDeque<String>()
+
+    // 键盘核心行为队列
+    private val behaviorQueue = ArrayDeque<IBehavior>()
+
+    /**
+     * 等同于上游 SidePanelKeyboard#updateRimeInput。
+     * 将 buildRimeInput 构造的输入投递给 Rime 引擎。
+     */
+    private fun updateRimeInput(): Boolean {
+        rimeJob.sendJob { pushBuiltInput() }
+        return true
+    }
+
+    /**
+     * WO52 1.5：点选拼音的输入投递——先调 native t9SetPinyin 把该
+     * 拼音钉为当前段首音节（会话内重算候选）；native 校验失败时
+     * 回落到 [updateRimeInput]（Kotlin 重建输入），行为与旧路一致。
+     */
+    private fun updateRimeInputForPinYin(pinYin: CandidatePinYin): Boolean {
+        rimeJob.sendJob {
+            if (!t9SetPinyin(pinYin.pinYin)) pushBuiltInput()
+        }
+        return true
+    }
+
+    /**
+     * 在当前已进入的 rime job 内同步把 [build] 构造的输入投递给 Rime
+     * （不另发 sendJob）：[updateRimeInput] 的 job 内版本，供判断与处理
+     * 必须落在同一个 job 内的调用方（见 [backspaceInJob]）复用投递逻辑。
+     */
+    private suspend fun RimeApi.pushBuiltInput() {
+        val input = build()
+        // 只记长度不记原文：组字内容是用户输入，打进日志等于把打字内容落盘
+        Timber.d("rimeJob.sendJob setInput: len=%d", input.length)
+        if (input.startsWith("/")) {
+            setInput(input)
+            return
+        }
+        val parts = inputParts(input)
+        parts.forEachIndexed { index, item ->
+            val emit = index + 1 == parts.size
+            when (true) {
+                (item in symbols) -> {
+                    if (index == 0) setInput(emptyInput, false)
+                    simulateKeySequence(sequence = item)
+                }
+
+                (index == 0) -> setInput(input = item, emit)
+                else -> appendInput(input = item, emit)
+            }
+        }
+    }
+
+    /**
+     * 在调用方已进入的 rime job 内同步执行一次退格：队列侧仍走
+     * [recontrolBackspace] 在同一把锁内维护第二套状态，与 [flowed] 的
+     * Backspace 分支口径一致；区别只是不另发 sendJob——队列内消化时在
+     * 本 job 内重建输入，转交 Rime 时也在本 job 内直接发 BackSpace。
+     * 转交用 isVirtual=false 的内部合成按键：native 判定未处理时其
+     * KeyMessage 会被 RimeEngine 的未处理按键透传门控拦下，不叠加补发
+     * 宿主 DEL（调用方只在组字非空时走到这里，再删宿主文本就是误删）。
+     */
+    suspend fun backspaceInJob(api: RimeApi) {
+        val recontrolled = synchronized(queueLock) { recontrolBackspace() }
+        if (recontrolled) {
+            api.pushBuiltInput()
+        } else {
+            api.processKey(KeyMapping.Key_BackSpace, 0U, false)
+        }
+    }
+
+    private fun inputParts(input: String): List<String> {
+        if (input.isEmpty()) return listOf(input)
+        val parts = mutableListOf<String>()
+        val text = StringBuilder()
+        for (char in input) {
+            val value = char.toString()
+            if (value in symbols) {
+                if (text.isNotEmpty()) {
+                    parts += text.toString()
+                    text.clear()
+                }
+                parts += value
+            } else {
+                text.append(char)
+            }
+        }
+        if (text.isNotEmpty()) parts += text.toString()
+        return parts
+    }
+
+    override fun flowed(behavior: IBehavior): Boolean =
+        synchronized(queueLock) { flowedLocked(behavior) }
+
+    private fun flowedLocked(behavior: IBehavior): Boolean {
+        if (behavior is RimeBehavior) {
+            behavior.withRimeJob(rimeJob)
+        }
+        when (behavior) {
+            // 文本字符输入，对应上游 KeyAction(NORMAL)：
+            // 登记到 inputStringQueue 与 behaviorQueue，并把原按键交给 Rime 处理。
+            is InputString -> {
+                inputStringQueue.add(behavior.sequence)
+                behaviorQueue.add(behavior)
+            }
+
+            // 非字符按键（功能键等），直接交给 Rime 处理，不需要刷新队列状态。
+            is InputKey -> {
+                behavior.invoke()
+                return true
+            }
+
+            // 分隔符输入，对应上游 SEGMENT：
+            // recontrolSegment 返回 true 时表示无需插入分隔符，直接结束；
+            // 否则登记到队列，并通过 updateRimeInput 把分隔符推给 Rime。
+            // 注：Segmentation.invoke() 为空实现，因此必须显式 updateRimeInput。
+            is Segmentation -> {
+                if (recontrolSegment()) return true
+                inputStringQueue.add(segmentKey)
+                behaviorQueue.add(behavior)
+                return updateRimeInput()
+            }
+
+            // 选择候选拼音，对应上游 SELECT_PINYIN：
+            // 先走 native t9SetPinyin（WO52 1.5：会话内把该拼音钉为
+            // 当前段首音节、重算候选）；native 校验失败（列表过期等）
+            // 时回落到既有 Kotlin 重建输入（build() → setInput），行为
+            // 与旧路一致。SelectPinYin.invoke() 仍为空（上游口径：
+            // 队列登记＋输入投递即全部工作）。
+            is SelectPinYin -> {
+                selectedPinYinQueue.add(behavior.pinYin)
+                behaviorQueue.add(behavior)
+                return updateRimeInputForPinYin(behavior.pinYin)
+            }
+
+            // 退格键，对应上游 SymAction(BackSpace)：
+            // recontrolBackspace 返回 true 时表示在队列内消化掉 BackSpace，
+            // 需 updateRimeInput；
+            // 否则把 BackSpace 真正发给 Rime 处理（不刷新队列状态）。
+            is Backspace -> {
+                if (recontrolBackspace()) {
+                    return updateRimeInput()
+                }
+                behavior.invoke()
+                return true
+            }
+
+            // 重置输入：让 Rime clearComposition，并清空所有队列。
+            is Reset -> {
+                behavior.invoke()
+                resetState()
+                return true
+            }
+
+            // 选择候选词，对应上游 SELECT_CANDIDATE：登记到队列并交给 Rime 选择。
+            is Selection -> {
+                behaviorQueue.add(behavior)
+                behavior.invoke()
+                return true
+            }
+        }
+        return updateRimeInput()
+    }
+
+    /**
+     * 等同于上游 SidePanelKeyboard#recontrolBackspace。
+     * 返回 true 表示已在队列内消化掉 BackSpace（不转交 Rime）；false 表示转交 Rime 处理。
+     */
+    private fun recontrolBackspace(): Boolean {
+        if (behaviorQueue.isEmpty()) {
+            // E-M6 补漏：一条 InputString 行为可含多个码点（多字序列键），
+            // 行为条目先耗尽不等于输入已删空；队列仍有内容时继续删一
+            // 个码点，仍返回 false 照常转交 Rime——队列与 native 各删
+            // 一字，保持同步。两队皆空时无事可做，同样转交 Rime。
+            if (inputStringQueue.isNotEmpty()) trimLastInputCodePoint()
+            return false
+        }
+        return when (behaviorQueue.removeLast()) {
+            is SelectPinYin -> {
+                if (selectedPinYinQueue.isNotEmpty()) {
+                    selectedPinYinQueue.removeLast()
+                    true
+                } else {
+                    false
+                }
+            }
+
+            is Selection -> false
+
+            else -> {
+                // native 的 BackSpace 只删一个字：队列侧同样只删末条末尾
+                // 一个码点，而不是整条丢弃（E-M6）。多字序列键（如皮肤
+                // 自定义序列）一次退格丢整条后，下次重建输入会把 native
+                // 组字里多余的字静默截掉；单字条目删后为空即整条消失，
+                // 与旧行为一致。
+                trimLastInputCodePoint()
+                false
+            }
+        }
+    }
+
+    /**
+     * 删 inputStringQueue 末条末尾一个码点（代理对按一字算）：末条被删空
+     * 即整条移除；空条目跳过继续向前找。队列为空时无事可做。只在
+     * queueLock 内调用（见 recontrolBackspace）。
+     */
+    private fun trimLastInputCodePoint() {
+        while (inputStringQueue.isNotEmpty()) {
+            val last = inputStringQueue.removeLast()
+            if (last.isEmpty()) continue
+            val drop = if (last.length >= 2 &&
+                Character.isLowSurrogate(last.last()) &&
+                Character.isHighSurrogate(last[last.length - 2])
+            ) 2 else 1
+            val trimmed = last.dropLast(drop)
+            if (trimmed.isNotEmpty()) inputStringQueue.addLast(trimmed)
+            return
+        }
+    }
+
+    /**
+     * 等同于上游 SidePanelKeyboard#recontrolSegment。
+     * 返回 true 表示拒绝该 Segmentation；false 表示允许插入分隔符。
+     */
+    private fun recontrolSegment(): Boolean {
+        if (inputStringQueue.isEmpty()) return true
+        if (behaviorQueue.last() is Segmentation) return true
+        var selectedSize = 0
+        selectedPinYinQueue.forEach { selectedSize += it.pinYin.length }
+        return selectedSize == inputStringQueue.size
+    }
+
+    override fun resetState() {
+        synchronized(queueLock) {
+            selectedPinYinQueue.clear()
+            inputStringQueue.clear()
+            behaviorQueue.clear()
+        }
+    }
+
+    /**
+     * 等同于上游 SidePanelKeyboard#buildPossibleCombinations。
+     * 依据 Rime 当前输入（currentInput，对应上游 getRimeInput）和已确认位置
+     * （confirmedLen，对应上游 getRimeInputConfirmPosition === RimeApi.getInputConfirmedPosition）
+     * 构造可能候选拼音。手动选择拼音时插入的分隔符会修正 confirmedLen。
+     */
+    fun possiblePinYin(
+        candidatePinYinType: String, currentInput: String, confirmedLen: Int
+    ): List<CandidatePinYin> =
+        synchronized(queueLock) { possiblePinYinLocked(candidatePinYinType, currentInput, confirmedLen) }
+
+    private fun possiblePinYinLocked(
+        candidatePinYinType: String, currentInput: String, confirmedLen: Int
+    ): List<CandidatePinYin> {
+        val (sequence, position) = sequenceAndPosition(currentInput, confirmedLen) ?: return emptyList()
+        return toCandidatePinYins(
+            sequence, position,
+            PinYinUtil.possibleCombinations(candidatePinYinType, sequence),
+        )
+    }
+
+    /**
+     * 紧凑键盘（14/18 键）侧栏拼音：与 [possiblePinYin] 同构，只换展开
+     * 函数——T14/T18 键按首字母进组字（compactAlphabetKey），队列里
+     * 是首字母串，[PinYinUtil.possibleCompactCombinations] 按当前
+     * 分组（group.code＝组首字母大写）展开；native t9PinyinList 是
+     * 9 键分组，不参与（引擎侧快照里 compactGrouping 非空时 t9ListRaw
+     * 为 null）。分词修正／坐标／raw 配对与 T9 同口径。
+     */
+    fun possibleCompactPinYin(
+        grouping: CompactGrouping, currentInput: String, confirmedLen: Int
+    ): List<CandidatePinYin> =
+        synchronized(queueLock) { possibleCompactPinYinLocked(grouping, currentInput, confirmedLen) }
+
+    private fun possibleCompactPinYinLocked(
+        grouping: CompactGrouping, currentInput: String, confirmedLen: Int
+    ): List<CandidatePinYin> {
+        val (sequence, position) = sequenceAndPosition(currentInput, confirmedLen) ?: return emptyList()
+        return toCandidatePinYins(
+            sequence, position,
+            PinYinUtil.possibleCompactCombinations(grouping, sequence),
+        )
+    }
+
+    /**
+     * 共享前半段：手动选择拼音插入分隔符后修正已确认长度，再定位
+     * 下一个空闲输入位置并取该段输入串。返回 null 表示无可展开段。
+     */
+    private fun sequenceAndPosition(currentInput: String, confirmedLen: Int): Pair<String, Int>? {
+        if (inputStringQueue.isEmpty()) return null
+        // 因为手动选择拼音插入分隔符的缘故，此处需要先修正已确认的内容长度
+        var len = confirmedLen
+        var index = 0
+        if (len > 0) {
+            currentInput.forEachIndexed { i, char ->
+                if (i >= confirmedLen) return@forEachIndexed
+                val raw = inputStringQueue.getOrNull(index).toString()
+                if (char == segmentKeyChar && segmentKey != raw) {
+                    len -= 1
+                    index += 1
+                }
+                index += 1
+            }
+        }
+        val position = nextSequencePosition(len)
+        if (position < 0) return null
+        val sequence = inputStringQueue.joinToString("").substring(position)
+        return sequence to position
+    }
+
+    /** 共享后半段：展开出的拼音串配对队列坐标与 raw（分词标记跟随）。 */
+    private fun toCandidatePinYins(
+        sequence: String, position: Int, pinYins: Array<String>
+    ): List<CandidatePinYin> {
+        return pinYins.map { pinYin ->
+            var raw = sequence.substring(0, pinYin.length)
+            // 如果候选拼音以分词标记结束，必须把分词标记加入 raw
+            if (segmentKeyChar == sequence.getOrNull(pinYin.length)) {
+                raw += segmentKey
+            }
+            CandidatePinYin(pinYin, raw, position)
+        }
+    }
+
+    /**
+     * 等同于上游 SidePanelKeyboard#nextSequencePosition。
+     * 从修正后的 confirmedLen 开始跳过所有已选中的拼音区间，找到下一个空闲输入位置。
+     */
+    private fun nextSequencePosition(confirmedLen: Int): Int {
+        val inputSize = inputStringQueue.size
+        val ranges = selectedPinYinQueue.map { it.position until (it.position + it.raw.length) }
+            .sortedBy { it.first }
+        // 合法性校验：confirmedLen 不能落在任何已选中的拼音区间内部
+        for (r in ranges) {
+            if (confirmedLen > r.first && confirmedLen < r.last + 1) return -1
+        }
+        // 从 confirmedLen 开始寻找 next free position
+        var pos = confirmedLen.coerceIn(0, inputSize)
+        while (pos < inputSize) {
+            var jumped = false
+            for (r in ranges) {
+                if (pos in r) {
+                    pos = r.last + 1
+                    jumped = true
+                    break
+                }
+            }
+            if (!jumped) return pos
+        }
+        return pos
+    }
+
+    /**
+     * 等同于上游 SidePanelKeyboard#buildRimeInput。
+     * 根据 inputStringQueue 与 selectedPinYinQueue 构造要投递给 Rime 的输入串。
+     * 每个选中的拼音会替换原 raw，并在其后追加 segmentKeyChar 作为分隔符。
+     */
+    fun build(): String = synchronized(queueLock) { buildLocked() }
+
+    private fun buildLocked(): String {
+        val input = inputStringQueue.joinToString("")
+        if (selectedPinYinQueue.isEmpty()) return input
+        val first = selectedPinYinQueue.first()
+        val last = selectedPinYinQueue.last()
+        val start = first.position
+        val end = last.position + last.raw.length
+        if (start < 0 || end > input.length) return input
+        val result = StringBuilder().append(input.substring(0, start))
+        var cursor = start
+        for (entry in selectedPinYinQueue) {
+            if (entry.position > cursor) {
+                result.append(input.substring(cursor, entry.position))
+            }
+            val rawEnd = entry.position + entry.raw.length
+            if (rawEnd <= input.length && input.regionMatches(
+                    entry.position, entry.raw, 0, entry.raw.length
+                )
+            ) {
+                result.append(entry.pinYin)
+                result.append(segmentKeyChar)
+            } else {
+                result.append(input.substring(entry.position, rawEnd))
+            }
+            cursor = rawEnd
+        }
+        return result.append(input.substring(end)).toString()
+    }
+
+    companion object {
+        // 分隔符（选择拼音时插入的分隔符），字符串形式
+        const val segmentKey = UserSegmentSymbol.toString()
+
+        // 与 segmentKey 同义，字符形式，便于逐字符比对
+        var segmentKeyChar: Char = segmentKey.toCharArray().first()
+    }
+}

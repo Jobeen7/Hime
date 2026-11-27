@@ -1,0 +1,489 @@
+package com.jobeen.hime.input.panel.component
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.Color
+import android.view.Gravity
+import android.view.View
+import android.view.ViewGroup
+import android.view.animation.OvershootInterpolator
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.TextView
+import androidx.core.view.isVisible
+import com.jobeen.hime.R
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import splitties.dimensions.dp
+import splitties.views.dsl.core.matchParent
+import splitties.views.dsl.core.wrapContent
+
+@SuppressLint("ViewConstructor")
+class ConfirmOverlay(
+    context: Context,
+    colors: KeyboardColors.ColorScheme,
+) : ComponentView(context, colors) {
+
+    private var onConfirm: (() -> Unit)? = null
+    private var onCancel: (() -> Unit)? = null
+
+    private val pillR = dp(10f)
+    private val textSize = TEXT_SIZE_SP
+    // 2026-11-18 贴边：12dp→0dp，卡片右边缘贴住屏边（缝隙 20dp→8dp，只剩卡内边距）。
+    private val marginH = dp(0)
+    private val marginV = dp(0)
+
+    companion object {
+        /** 动作菜单与确认按钮共用的字号。 */
+        internal const val TEXT_SIZE_SP = 13f
+
+        /** 动作菜单项横向内边距（2026-11-18 改窄：12dp 留白太宽，改为 8dp）。 */
+        internal const val ACTION_ITEM_PADDING_H_DP = 8f
+
+        /** 动作菜单项上下内边距（2026-11-18 放大：紧凑值 2dp 太小，改为 4dp）。 */
+        internal const val ACTION_ITEM_PADDING_V_DP = 4f
+
+        /** 动作菜单项间距（2026-11-18 放大：紧凑值 3dp 太小，改为 5dp）。 */
+        internal const val ACTION_ITEM_GAP_DP = 5f
+
+        /** 卡片上内边距（紧凑值 8dp；贴边只改下边，顶边不动）。 */
+        internal const val CARD_PADDING_TOP_DP = 8f
+
+        /** 卡片下内边距（2026-11-18 贴边：8dp→0dp，删除钮底边贴住卡片底边）。 */
+        internal const val CARD_PADDING_BOTTOM_DP = 0f
+
+        /** 卡片横向内边距（2026-11-18 改窄：12dp 留白太宽，改为 8dp）。 */
+        internal const val CARD_PADDING_H_DP = 8f
+
+        /** 动作列表滚动区顶边距（actionsScroll topMargin 4dp）。 */
+        internal const val ACTIONS_SCROLL_TOP_MARGIN_DP = 4f
+
+        /** Roboto 含字体内边距行高系数（复查报告算术口径，字号倍率 1.0）。 */
+        internal const val ROBOTO_LINE_HEIGHT_WITH_PADDING = 1.32714844f
+
+        /**
+         * 动作菜单卡片自然高（dp，P-中1 预算口径，字号倍率 1.0）：
+         * 项数×（行高＋上下内边距）＋（项数−1）×间距＋卡片上内边距
+         * ＋卡片下内边距＋滚动区顶边距。6 项＝188.5dp：竖屏默认 24%
+         * （可用 199.68dp）一页放得下、余 11.2dp；横屏默认 44%
+         * （可用 168.96dp）放不下、短 19.6dp，靠 showCard 钳制滚动
+         * 保底（2026-11-18 放大：项内边距 2→4dp 加 24dp、项间距
+         * 3→5dp 加 10dp，共加 34dp；字号 13sp、卡片上边距 8dp、
+         * 滚动区顶边距 4dp、无最小宽全不动；横向内边距 12→8dp
+         * （2026-11-18 改窄，文字两边留白太宽）；下边距 0dp
+         * （2026-11-18 贴边，删除钮底边贴住卡片底边）。
+         * 5 项＝158.3dp，横屏余 10.7dp；4 项＝128.0dp，横屏余 41.0dp）。
+         * 放得下时 showCard 把卡片拉满可用高、各项均分（竖列放满一页）；
+         * 7 项以上／大字号仍超高时靠 showCard 钳制在卡内滚动保底
+         * （见 [actions]）。布局常量与本函数同源，改一处即改预算，不会漂移。
+         */
+        internal fun actionsMenuNaturalHeightDp(itemCount: Int): Float {
+            if (itemCount <= 0) return CARD_PADDING_TOP_DP + CARD_PADDING_BOTTOM_DP + ACTIONS_SCROLL_TOP_MARGIN_DP
+            val itemH =
+                TEXT_SIZE_SP * ROBOTO_LINE_HEIGHT_WITH_PADDING + 2 * ACTION_ITEM_PADDING_V_DP
+            return itemCount * itemH + (itemCount - 1) * ACTION_ITEM_GAP_DP +
+                CARD_PADDING_TOP_DP + CARD_PADDING_BOTTOM_DP + ACTIONS_SCROLL_TOP_MARGIN_DP
+        }
+    }
+
+    private val messageView = TextView(context).apply {
+        setTextColor(colors.panel.toolbarText)
+        setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, this@ConfirmOverlay.textSize)
+        gravity = Gravity.CENTER
+        setPadding(dp(16), dp(12), dp(16), dp(12))
+        isSingleLine = false
+        maxLines = 4 // 限制最大行数，避免过长
+    }
+
+    private val confirmBtn = TextView(context).apply {
+        text = context.getString(R.string.clipboard_confirm)
+        setTextColor(colors.accentKeyText)
+        textSize = this@ConfirmOverlay.textSize
+        gravity = Gravity.CENTER
+        background = PillBg(colors.accentKeyBackground, colors.accentKeyBorderStroke, pillR)
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        setOnClickListener {
+            onConfirm?.invoke()
+            dismiss()
+        }
+    }
+
+    private val cancelBtn = TextView(context).apply {
+        text = context.getString(R.string.clipboard_cancel)
+        setTextColor(colors.panel.toolbarText)
+        textSize = this@ConfirmOverlay.textSize
+        gravity = Gravity.CENTER
+        background = PillBg(colors.keyBackground, colors.keyBorderStroke, pillR)
+        setPadding(dp(12), dp(6), dp(12), dp(6))
+        setOnClickListener {
+            onCancel?.invoke()
+            dismiss()
+        }
+    }
+
+    private val btnContainer = LinearLayout(context).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER
+        addView(confirmBtn, LinearLayout.LayoutParams(0, wrapContent, 1f))
+        addView(cancelBtn, LinearLayout.LayoutParams(0, wrapContent, 1f).apply {
+            marginStart = dp(8)
+        })
+    }
+
+    // 动作菜单模式的按钮列（纵向逐项排布），与确认模式共用同一张卡片
+    private val actionsContainer = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_HORIZONTAL
+    }
+
+    // 动作列表的外层滚动区：卡片自然总高超过浮层可用高时（横屏、
+    // 大字体、项数多），靠 showCard 把它的高度定到可用范围、内部
+    // 滚动保住末项可达，而不是被浮层裁掉
+    private val actionsScroll = ScrollView(context).apply {
+        visibility = View.GONE
+        isVerticalScrollBarEnabled = false
+        addView(
+            actionsContainer,
+            FrameLayout.LayoutParams(matchParent, wrapContent),
+        )
+    }
+
+    private val card = LinearLayout(context).apply {
+        orientation = LinearLayout.VERTICAL
+        gravity = Gravity.CENTER_HORIZONTAL
+        background = PillBg(colors.panel.background, colors.keyBorderStroke, pillR)
+        // 2026-11-18 贴边：下内边距 0dp（删除钮底边贴住卡片底边），上内边距保持 8dp。
+        setPadding(dp(CARD_PADDING_H_DP).toInt(), dp(CARD_PADDING_TOP_DP).toInt(), dp(CARD_PADDING_H_DP).toInt(), dp(CARD_PADDING_BOTTOM_DP).toInt())
+        isClickable = true
+        setOnClickListener { }
+
+        // 限制卡片的最大宽度（例如屏幕宽度减去左右边距），防止文字过长时撑满全屏不换行
+        // 这里可以通过布局参数或者在测量时限制，最稳妥的是给 messageView 设置 maxWidth
+        addView(messageView, LinearLayout.LayoutParams(wrapContent, wrapContent).apply {
+            // 如果需要限制文本的最大宽度，可以动态计算或给 card 设置固定的最大宽度
+        })
+
+        addView(btnContainer, LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+            topMargin = dp(4)
+        })
+
+        addView(actionsScroll, LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+            topMargin = dp(ACTIONS_SCROLL_TOP_MARGIN_DP).toInt()
+        })
+    }
+
+    init {
+        setBackgroundColor(Color.TRANSPARENT)
+        clipChildren = false
+        addView(card, LayoutParams(wrapContent, wrapContent))
+        setOnClickListener { dismiss() }
+    }
+
+    /**
+     * @param cardX  卡片左边相对此 Overlay 左边界的水平偏移（像素）。
+     *               [Float.NaN] 表示默认放在右下角。
+     * @param cardY  卡片顶边相对此 Overlay 上边界的垂直偏移（像素）。
+     *               [Float.NaN] 表示默认放在右下角。
+     */
+    fun confirm(
+        message: String,
+        onConfirm: () -> Unit,
+        onCancel: (() -> Unit)? = null,
+        cardX: Float = Float.NaN,
+        cardY: Float = Float.NaN,
+        centerHorizontal: Boolean = false,
+        centerVertical: Boolean = false,
+    ) {
+        this.onConfirm = onConfirm
+        this.onCancel = onCancel
+        messageView.text = message
+        messageView.visibility = View.VISIBLE
+        btnContainer.visibility = View.VISIBLE
+        actionsScroll.visibility = View.GONE
+        showCard(cardX, cardY, centerHorizontal, centerVertical)
+    }
+
+    /**
+     * 动作菜单模式：单列排布动作按钮，点击任一项执行并关闭。
+     * 定位参数与 [confirm] 相同。
+     *
+     * 不显示标题行：5 项菜单带标题时总高会超过面板可用高度，
+     * 纵向布局按上限截断后最后一项会被挤出卡外不可见（剪贴板
+     * 菜单的「删除」就这样消失过）；去掉标题后单列放得下。
+     *
+     * 高度（一页放满选项：竖列放满，见 [actionsMenuNaturalHeightDp]）：
+     * 剪贴板 6 项菜单自然高 188.5dp，竖屏默认 24%（可用 199.68dp）
+     * 拉满一页（只加 11.2dp）、各项均分、不滚动；横屏默认 44%
+     * （可用 168.96dp）放不下、短 19.6dp，靠 showCard 钳制在卡内
+     * 滚动保底。常用语 4 项 128.0dp，竖屏拉满到 199.68dp、横屏拉满
+     * 到 168.96dp。7 项以上／大字号仍超高时靠 showCard 钳制在卡内
+     * 滚动保底。
+     * [message] 参数保留仅为与 [confirm] 签名对称，本模式不展示。
+     */
+    /**
+     * 动作菜单项：[destructive] 为真时文字标红（WO52 5.3 Delete 项）。
+     * 键盘配色无 error 角色，用 Material 标准红 0xFFD32F2F。
+     */
+    data class ActionItem(
+        val label: String,
+        val destructive: Boolean = false,
+        val action: () -> Unit,
+    )
+
+    fun actions(
+        message: String,
+        items: List<Pair<String, () -> Unit>>,
+        cardX: Float = Float.NaN,
+        cardY: Float = Float.NaN,
+        centerHorizontal: Boolean = false,
+        centerVertical: Boolean = false,
+    ) {
+        actions(
+            message,
+            items.map { (label, action) -> ActionItem(label, action = action) },
+            cardX, cardY, centerHorizontal, centerVertical,
+        )
+    }
+
+    @JvmName("actionsWithItems")
+    fun actions(
+        message: String,
+        items: List<ActionItem>,
+        cardX: Float = Float.NaN,
+        cardY: Float = Float.NaN,
+        centerHorizontal: Boolean = false,
+        centerVertical: Boolean = false,
+    ) {
+        // 动作菜单不显示标题（见上方注释）：隐藏标题行省出高度，
+        // confirm 模式会把标题行恢复显示
+        messageView.visibility = View.GONE
+        btnContainer.visibility = View.GONE
+        actionsScroll.visibility = View.VISIBLE
+        actionsScroll.scrollTo(0, 0)
+        actionsContainer.removeAllViews()
+        actionButtons.clear()
+        items.forEachIndexed { index, item ->
+            val btn = TextView(context).apply {
+                text = item.label
+                setTextColor(
+                    if (item.destructive) 0xFFD32F2F.toInt()
+                    else colors.panel.toolbarText
+                )
+                setTextSize(android.util.TypedValue.COMPLEX_UNIT_SP, this@ConfirmOverlay.textSize)
+                gravity = Gravity.CENTER
+                background = PillBg(colors.keyBackground, colors.keyBorderStroke, pillR)
+                // 放大的排布（2026-11-18：紧凑版 2dp／3dp 太小）：纵向内边距
+                // 4dp、项间距 5dp，6 项自然高 188.5dp，竖屏默认 24%
+                // （199.68dp）拉满一页（只加 11.2dp）、各项均分、不滚动；
+                // 横屏默认 44%（168.96dp）短 19.6dp、靠 showCard 钳制滚动
+                // 保底；字号 13sp、横向内边距 8dp、卡片上边距 8dp、
+                // 下边距 0dp（贴边）、无最小宽。
+                setPadding(dp(ACTION_ITEM_PADDING_H_DP).toInt(), dp(ACTION_ITEM_PADDING_V_DP).toInt(), dp(ACTION_ITEM_PADDING_H_DP).toInt(), dp(ACTION_ITEM_PADDING_V_DP).toInt())
+                setOnClickListener {
+                    item.action()
+                    dismiss()
+                }
+            }
+            actionsContainer.addView(
+                btn,
+                LinearLayout.LayoutParams(matchParent, wrapContent).apply {
+                    if (index > 0) topMargin = dp(ACTION_ITEM_GAP_DP).toInt()
+                }
+            )
+            actionButtons += btn
+        }
+        showCard(cardX, cardY, centerHorizontal, centerVertical)
+    }
+
+    // 主题刷新时动作按钮也要跟着换色，集中登记
+    private val actionButtons = mutableListOf<TextView>()
+
+    // 本次弹出的定位触发源（布局监听 + post 兜底，见 showCard）：
+    // 存字段供 dismiss/下次弹出时先行清理，避免残留者用旧坐标抢定位
+    private var layoutListener: View.OnLayoutChangeListener? = null
+    private var positionRunnable: Runnable? = null
+    private var cardPositioned = false
+
+    private fun clearPositionTriggers() {
+        layoutListener?.let { card.removeOnLayoutChangeListener(it) }
+        layoutListener = null
+        positionRunnable?.let { card.removeCallbacks(it) }
+        positionRunnable = null
+    }
+
+    override fun onDetachedFromWindow() {
+        // 定位触发源（布局监听 + 一次性定位投递）随窗口分离一并清理，
+        // 与 dismiss 的清理口径一致；下次弹出时 showCard 会重新登记
+        clearPositionTriggers()
+        super.onDetachedFromWindow()
+    }
+
+    private fun showCard(
+        cardX: Float,
+        cardY: Float,
+        centerHorizontal: Boolean,
+        centerVertical: Boolean,
+    ) {
+        clearPositionTriggers()
+        cardPositioned = false
+        bringToFront()
+        card.alpha = 0f
+        card.scaleX = 0f
+        card.scaleY = 0f
+        visibility = VISIBLE
+
+        // 定位与显形只执行一次，两个触发源任一先到：布局变化监听是
+        // 常态路径；post 兜底同尺寸卡二次弹出——无布局边界变化时
+        // 监听永不触发、卡片会 alpha=0 隐形而浮层还在拦点击
+        fun positionCard() {
+            if (cardPositioned) return
+            // 尚未布局（post 抢在首帧布局前）：不消耗这次机会，
+            // 等布局监听在布局完成后执行
+            if (card.height == 0 || measuredHeight == 0) return
+            cardPositioned = true
+            layoutListener?.let { card.removeOnLayoutChangeListener(it) }
+            layoutListener = null
+
+            val maxWidth = (measuredWidth - marginH * 2).coerceAtLeast(dp(200))
+            messageView.maxWidth = maxWidth
+
+            // 动作菜单高度：一页放满选项（竖列放满，不是横向放满）。
+            // 放得下时（均分钮高 ≥ 自然钮高）滚动区定高到「可用高 − 卡片
+            // 其余部分」，各项均分铺满一页、不滚动，卡片高＝可用高；
+            // 放不下时把滚动区定为「可用高 − 卡片其余部分」，菜单内部
+            // 可滚、末项可达；高度足够则恢复 wrapContent（上次的定高
+            // 不能残留）。钮高有自然高下限、永不压字。cardH 是钳制后
+            // 的预期卡高，定位钳制直接用它，不等改高引发的第二轮布局。
+            // 宽不拉伸、随内容走。
+            var cardH = card.height
+            if (actionsScroll.isVisible) {
+                val availH = measuredHeight - marginV * 2
+                val restH = card.height - actionsScroll.height
+                val naturalH = restH + actionsContainer.height
+                val lp = actionsScroll.layoutParams as LinearLayout.LayoutParams
+                // 一页放满选项：卡片高随可用高、各项均分。
+                // 按钮自然高（px，避免拉满时压字）与项间距。
+                val n = actionButtons.size
+                val naturalBtnHpx =
+                    dp(TEXT_SIZE_SP * ROBOTO_LINE_HEIGHT_WITH_PADDING + 2 * ACTION_ITEM_PADDING_V_DP).toInt()
+                val gapPx = dp(ACTION_ITEM_GAP_DP).toInt()
+                val targetScrollH = (availH - restH).coerceAtLeast(0)
+                val fillBtnHpx =
+                    if (n > 0) (targetScrollH - (n - 1) * gapPx) / n else 0
+                if (n > 0 && fillBtnHpx >= naturalBtnHpx) {
+                    // 拉满：滚动区定高到可用高，各项均分铺满一页、不滚动。
+                    if (lp.height != targetScrollH) {
+                        lp.height = targetScrollH
+                        actionsScroll.layoutParams = lp
+                    }
+                    actionButtons.forEach { btn ->
+                        val blp = btn.layoutParams as LinearLayout.LayoutParams
+                        if (blp.height != fillBtnHpx) {
+                            blp.height = fillBtnHpx
+                            btn.layoutParams = blp
+                        }
+                    }
+                    cardH = availH
+                } else if (naturalH > availH) {
+                    val target = (availH - restH).coerceAtLeast(0)
+                    if (lp.height != target) {
+                        lp.height = target
+                        actionsScroll.layoutParams = lp
+                    }
+                    cardH = restH + target
+                } else {
+                    if (lp.height != ViewGroup.LayoutParams.WRAP_CONTENT) {
+                        lp.height = ViewGroup.LayoutParams.WRAP_CONTENT
+                        actionsScroll.layoutParams = lp
+                    }
+                    cardH = naturalH
+                }
+            }
+
+            card.pivotX = card.width / 2f
+            card.pivotY = cardH / 2f
+
+            val cx =
+                if (cardX.isNaN()) measuredWidth - card.measuredWidth - marginH else cardX.toInt()
+            val cy =
+                if (cardY.isNaN()) measuredHeight - cardH - marginV else cardY.toInt()
+            val maxX = (measuredWidth - card.measuredWidth - marginH).coerceAtLeast(marginH)
+            val maxY = (measuredHeight - cardH - marginV).coerceAtLeast(marginV)
+            val finalCx =
+                if (centerHorizontal) (measuredWidth - card.measuredWidth) / 2 else cx
+            val finalCy =
+                if (centerVertical) (measuredHeight - cardH) / 2 else cy
+            card.translationX = finalCx.coerceIn(marginH, maxX).toFloat()
+            card.translationY = finalCy.coerceIn(marginV, maxY).toFloat()
+
+            card.scaleX = 0f
+            card.scaleY = 0f
+            card.alpha = 1f
+            invalidate()
+            card.animate()
+                .scaleX(1f).scaleY(1f)
+                .setDuration(200)
+                .setInterpolator(OvershootInterpolator(2f))
+                .start()
+        }
+
+        val listener = object : View.OnLayoutChangeListener {
+            override fun onLayoutChange(
+                v: View?, left: Int, top: Int, right: Int, bottom: Int,
+                oldLeft: Int, oldTop: Int, oldRight: Int, oldBottom: Int
+            ) {
+                positionCard()
+            }
+        }
+        layoutListener = listener
+        card.addOnLayoutChangeListener(listener)
+        val posted = Runnable { positionCard() }
+        positionRunnable = posted
+        card.post(posted)
+    }
+
+    fun dismiss() {
+        clearPositionTriggers()
+        if (visibility != VISIBLE) return
+        card.animate().cancel()
+        animate().cancel()
+        visibility = GONE
+        card.scaleX = 1f
+        card.scaleY = 1f
+        card.alpha = 1f
+        card.translationX = 0f
+        card.translationY = 0f
+    }
+
+    override fun refreshTheme(newColors: KeyboardColors.ColorScheme) {
+        // 不调用 super：父类会把整块背景设为 panel.background，导致刷新主题后罩住全屏。
+        // ConfirmOverlay 仅居中显示小卡片，背景必须保持透明。
+        colors = newColors
+        messageView.setTextColor(newColors.panel.toolbarText)
+        confirmBtn.setTextColor(newColors.accentKeyText)
+        confirmBtn.background =
+            PillBg(newColors.accentKeyBackground, newColors.accentKeyBorderStroke, pillR)
+        cancelBtn.setTextColor(newColors.panel.toolbarText)
+        cancelBtn.background =
+            PillBg(newColors.keyBackground, newColors.keyBorderStroke, pillR)
+        actionButtons.forEach { btn ->
+            btn.setTextColor(newColors.panel.toolbarText)
+            btn.background =
+                PillBg(newColors.keyBackground, newColors.keyBorderStroke, pillR)
+        }
+        card.background =
+            PillBg(newColors.panel.background, newColors.keyBorderStroke, pillR)
+    }
+}
+
+private class PillBg(
+    fillColor: Int,
+    strokeColor: Int,
+    radius: Float,
+) : android.graphics.drawable.GradientDrawable() {
+    init {
+        setColor(fillColor)
+        setStroke(1, strokeColor)
+        cornerRadius = radius
+    }
+}

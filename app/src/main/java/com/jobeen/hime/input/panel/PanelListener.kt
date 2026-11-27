@@ -1,0 +1,60 @@
+package com.jobeen.hime.input.panel
+
+import com.jobeen.hime.data.manager.ClipboardManager
+import com.jobeen.hime.data.manager.PhraseManager
+import com.jobeen.hime.engine.data.EngineMessage
+import com.jobeen.hime.input.keyboard.key.KeyboardAction
+import com.jobeen.hime.input.panel.component.TextEditView
+
+interface PanelListener {
+    fun onCandidateSelected(candidate: EngineMessage.Candidate) {}
+
+    fun onToolbarAction(action: PanelAction) {}
+
+    fun onSidePanelAction(action: KeyboardAction) {}
+
+    fun onTextEditingAction(action: TextEditView.Action) {}
+
+    fun onClipboardItemClick(entry: ClipboardManager.Entry) {}
+
+    fun onPhraseClick(phrase: PhraseManager.Phrase) {}
+
+    fun onClipboardClear() {}
+
+    fun onClipboardItemDelete(entry: ClipboardManager.Entry) {}
+
+    fun onCopyTextCommit(text: String) {}
+
+    /**
+     * 命令面板跑完的结果回填：经字面上屏通道（LiteralCommitAction，
+     * 不经标点转换）替换输入框选中文字；剪贴板来源时在光标处上屏。
+     * 缺省空实现。
+     */
+    fun onCommandResultCommit(text: String) {}
+
+    fun onCandidateGridDragComplete(candidates: List<EngineMessage.Candidate>) {}
+
+    /** 候选网格滚动到底且引擎侧还有更多候选时，请求分页补取下一页 */
+    fun onRequestMoreCandidates() {}
+
+    /**
+     * 候选翻页（WO52 1.1）：#rimeNextPage/#rimePreviousPage 与翻页钮
+     * 的统一入口；backward=true 为上一页。缺省空实现。
+     */
+    fun onPageCandidates(backward: Boolean) {}
+
+    /**
+     * 关闭联想（H2-2 候选栏取消按钮）：面板点取消钮时调用；
+     * 引擎侧取消在途联想并清联想可见态，防迟到联想把已关的
+     * 栏重新顶出来。缺省空实现。
+     */
+    fun onDismissPredictions() {}
+
+    fun onCandidateForget(candidate: EngineMessage.Candidate) {}
+
+    fun onEnterAddPhraseMode() {}
+
+    fun onAddPhraseSave(text: String) {}
+
+    fun onAddPhraseCancel() {}
+}

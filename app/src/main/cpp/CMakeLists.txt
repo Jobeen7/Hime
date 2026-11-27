@@ -1,0 +1,188 @@
+# SPDX-FileCopyrightText: 2026 Hime contributors
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+cmake_minimum_required(VERSION 3.18.0)
+
+project(rime_jni VERSION 3.0.0)
+
+# for reproducible build
+add_link_options("LINKER:--hash-style=gnu,--build-id=none")
+
+# Hime: hot user-dict import/export needs a tiny accessor on librime's
+# UserDictionary (see patches/librime-user-dictionary-db-accessor.patch).
+# deps/ is untracked, so apply the vendored patch automatically when missing.
+# Multi-ABI builds configure this same source dir in parallel: guard the
+# check-and-apply sequence with a file lock, otherwise two configures can
+# both see the patch missing and run patch(1) concurrently (one then fails
+# with "previously applied" and aborts the whole configure).
+file(LOCK "${CMAKE_CURRENT_SOURCE_DIR}/.hime-vendored-patch.lock" GUARD FILE TIMEOUT 180)
+set(_hime_ud_header "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime/src/rime/dict/user_dictionary.h")
+set(_hime_ud_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/librime-user-dictionary-db-accessor.patch")
+if(EXISTS "${_hime_ud_header}" AND EXISTS "${_hime_ud_patch}")
+  file(READ "${_hime_ud_header}" _hime_ud_content)
+  if(NOT _hime_ud_content MATCHES "an<Db> db\\(\\) const")
+    message(STATUS "Hime: applying vendored librime patch (UserDictionary db() accessor)")
+    execute_process(
+      COMMAND patch -p1 --forward --silent -i "${_hime_ud_patch}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime"
+      RESULT_VARIABLE _hime_patch_result)
+    if(NOT _hime_patch_result EQUAL 0)
+      message(FATAL_ERROR "Hime: failed to apply librime user_dictionary patch")
+    endif()
+  endif()
+endif()
+unset(_hime_ud_header)
+unset(_hime_ud_patch)
+unset(_hime_ud_content)
+unset(_hime_patch_result)
+
+# Hime: allow disabling librime user-dict self-learning per input field
+# (password / IME_FLAG_NO_PERSONALIZED_LEARNING), via the
+# "__no_personalized_learning" runtime option checked in Memory::OnCommit.
+# See patches/librime-no-personalized-learning.patch.
+set(_hime_nl_file "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime/src/rime/gear/memory.cc")
+set(_hime_nl_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/librime-no-personalized-learning.patch")
+if(EXISTS "${_hime_nl_file}" AND EXISTS "${_hime_nl_patch}")
+  file(READ "${_hime_nl_file}" _hime_nl_content)
+  if(NOT _hime_nl_content MATCHES "__no_personalized_learning")
+    message(STATUS "Hime: applying vendored librime patch (no-personalized-learning option)")
+    execute_process(
+      COMMAND patch -p1 --forward --silent -i "${_hime_nl_patch}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime"
+      RESULT_VARIABLE _hime_nl_patch_result)
+    if(NOT _hime_nl_patch_result EQUAL 0)
+      message(FATAL_ERROR "Hime: failed to apply librime no-personalized-learning patch")
+    endif()
+  endif()
+endif()
+unset(_hime_nl_file)
+unset(_hime_nl_patch)
+unset(_hime_nl_content)
+unset(_hime_nl_patch_result)
+
+set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
+
+# general options
+option(BUILD_SHARED_LIBS "" OFF)
+option(BUILD_TESTING "" OFF)
+
+# boost
+set(BOOST_VERSION 1.89.0)
+set(BOOST_INCLUDE_LIBRARIES
+    algorithm
+    crc
+    dll
+    interprocess
+    range
+    regex
+    scope_exit
+    signals2
+    utility
+    vmd
+    uuid)
+add_subdirectory(deps/boost EXCLUDE_FROM_ALL)
+
+option(WITH_GFLAGS "Use gflags" OFF)
+option(WITH_GTEST "Use googletest" OFF)
+option(WITH_UNWIND "Enable libunwind support" OFF)
+# glog examples don't link under the Android NDK (host libunwind picked up);
+# they're not needed for the app anyway.
+set(BUILD_EXAMPLES OFF)
+add_subdirectory(deps/librime/deps/glog)
+target_compile_options(
+  glog_internal PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
+option(YAML_CPP_BUILD_TOOLS "" OFF)
+option(YAML_CPP_BUILD_TESTS "" OFF)
+option(YAML_CPP_INSTALL "" OFF)
+add_subdirectory(deps/librime/deps/yaml-cpp)
+
+# enable compress for leveldb
+option(SNAPPY_BUILD_TESTS "" OFF)
+option(SNAPPY_BUILD_BENCHMARKS "" OFF)
+option(SNAPPY_INSTALL "" OFF)
+add_subdirectory(deps/snappy)
+
+set(HAVE_SNAPPY TRUE)
+option(LEVELDB_BUILD_TESTS "" OFF)
+option(LEVELDB_BUILD_BENCHMARKS "" OFF)
+option(LEVELDB_INSTALL "" OFF)
+add_subdirectory(deps/librime/deps/leveldb)
+
+add_subdirectory(deps/librime/deps/marisa-trie)
+target_compile_options(
+  marisa PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
+set(LIBMARISA marisa)
+option(USE_SYSTEM_MARISA "" ON)
+add_subdirectory(deps/OpenCC)
+file(GLOB LIBOPENCC_HEADERS deps/OpenCC/src/*.hpp
+     "${CMAKE_BINARY_DIR}/deps/OpenCC/src/opencc_config.h")
+file(COPY ${LIBOPENCC_HEADERS} DESTINATION "${CMAKE_BINARY_DIR}/include/opencc")
+
+set(X11Keysym "${CMAKE_SOURCE_DIR}/deps/librime/include")
+include_directories("${X11Keysym}")
+
+# 如果你把插件目录也移到了 deps 下，这里需要更新为 deps/xxx
+set(RIME_PLUGINS librime-lua librime-octagram librime-predict)
+
+# symlink plugins
+foreach(plugin ${RIME_PLUGINS})
+  # 搜索源路径改为 deps/
+  set(PLUGIN_SOURCE_DIR "${CMAKE_SOURCE_DIR}/deps/${plugin}")
+  set(PLUGIN_TARGET_DIR "${CMAKE_SOURCE_DIR}/deps/librime/plugins/${plugin}")
+
+  if(NOT EXISTS "${PLUGIN_TARGET_DIR}")
+    file(CREATE_LINK "${PLUGIN_SOURCE_DIR}"
+         "${PLUGIN_TARGET_DIR}" COPY_ON_ERROR SYMBOLIC)
+  endif()
+endforeach()
+
+# librime-lua
+# 同样将 deps 路径指向 deps/librime-lua-deps
+set(LUA_DEPS_SOURCE "${CMAKE_SOURCE_DIR}/deps/librime-lua-deps")
+set(LUA_DEPS_TARGET "${CMAKE_SOURCE_DIR}/deps/librime/plugins/librime-lua/thirdparty")
+
+if(NOT EXISTS "${LUA_DEPS_TARGET}")
+  file(CREATE_LINK "${LUA_DEPS_SOURCE}"
+       "${LUA_DEPS_TARGET}"
+       COPY_ON_ERROR SYMBOLIC)
+endif()
+
+option(BUILD_TEST "" OFF)
+option(BUILD_STATIC "" ON)
+
+# Hime: lock the vendored librime version (WO38 E1-10/5). The version lives
+# only inside the untracked nested checkout deps/librime/CMakeLists.txt
+# (set(rime_version ...)) — no Gradle version catalog / build.gradle.kts
+# pin exists, and that nested tree is not tracked by the Hime repo.
+# Fail configure when the vendored tree drifts from the pinned version,
+# so a librime bump is always an explicit change of HIME_RIME_VERSION
+# below (plus the two vendored patches above), never a silent checkout.
+set(HIME_RIME_VERSION "1.17.0")
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime/CMakeLists.txt" _hime_librime_cmake)
+string(REGEX MATCH "set\\(rime_version ([0-9]+\\.[0-9]+\\.[0-9]+)\\)" _hime_rime_ver_match "${_hime_librime_cmake}")
+if(NOT CMAKE_MATCH_1 STREQUAL HIME_RIME_VERSION)
+  message(FATAL_ERROR "Hime: vendored librime version mismatch: expected ${HIME_RIME_VERSION}, found '${CMAKE_MATCH_1}' in deps/librime/CMakeLists.txt — update HIME_RIME_VERSION deliberately or restore the vendored tree")
+endif()
+add_subdirectory(deps/librime)
+target_compile_options(
+  rime-static PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=." "-Wno-error=deprecated-declarations")
+
+target_compile_options(
+  rime-lua-objs PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
+target_compile_options(
+  rime-octagram-objs PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
+target_compile_options(
+  rime-predict-objs PRIVATE "-ffile-prefix-map=${CMAKE_CURRENT_SOURCE_DIR}=.")
+
+# T9 会话访问器插件（WO52 1.5，自研）：追踪源码，静态库链进 rime_jni。
+# 须在 librime_jni 之前加（后者链接 rime-t9 目标）。
+add_subdirectory(librime-t9)
+
+add_subdirectory(librime_jni)
+
+add_subdirectory(libmarisa_jni)

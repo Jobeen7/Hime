@@ -1,0 +1,13 @@
+package com.jobeen.hime.data
+
+import android.content.Context
+import com.jobeen.hime.R
+
+/** 根据键盘布局类型返回标签文案（九宫格 / 14键 / 15键 / 18键 / 全键盘）。 */
+fun schemaLayoutTag(context: Context, layout: String): String = when (layout) {
+    "T9" -> context.getString(R.string.tag_layout_t9)
+    "T14" -> context.getString(R.string.tag_layout_t14)
+    "T15" -> context.getString(R.string.tag_layout_t15)
+    "T18" -> context.getString(R.string.tag_layout_t18)
+    else -> context.getString(R.string.tag_layout_full)
+}

@@ -1,0 +1,116 @@
+package com.jobeen.hime.input.keyboard.window
+
+import android.view.inputmethod.EditorInfo
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.engine.data.CandidatePinYin
+import com.jobeen.hime.engine.data.EngineMessage
+import com.jobeen.hime.input.ImeInputMethodService
+import com.jobeen.hime.input.KeyActionListener
+import com.jobeen.hime.input.keyboard.impl.IKeyboard
+import com.jobeen.hime.input.keyboard.key.KeyActionListener as KeyboardKeyActionListener
+import com.jobeen.hime.input.panel.IPanel
+import com.jobeen.hime.input.panel.PanelListener
+
+class KeyboardWindow(
+    service: ImeInputMethodService,
+    keyboardStateManager: KeyboardStateManager,
+    panelActionListener: PanelListener? = null,
+) {
+
+    var currentEditorInfo: EditorInfo? = null
+
+    val view: KeyboardWindowView = KeyboardWindowView(
+        context = service,
+        keyboardStateManager = keyboardStateManager,
+        panelListener = panelActionListener,
+    )
+
+    val colors: KeyboardColors.ColorScheme get() = KeyboardColors.resolve(view.context)
+
+    val panel: IPanel get() = view.panel
+
+    private val messageHandler = MessageHandler(service).also { it.attach(this) }
+
+    init {
+        keyboardStateManager.callback = object : KeyboardStateManager.Callback {
+            override fun onShowKeyboard(keyboard: IKeyboard) {
+                view.onShowKeyboard(keyboard)
+            }
+
+            override fun onHideKeyboard(keyboard: IKeyboard) {
+                view.onHideKeyboard(keyboard)
+            }
+
+            override fun onKeyboardChanged(keyboard: IKeyboard) {
+                view.onKeyboardChanged(keyboard)
+            }
+        }
+    }
+
+    fun setKeyActionListener(listener: KeyboardKeyActionListener) {
+        view.keyActionListener = listener
+    }
+
+    fun setCandidates(
+        list: List<EngineMessage.Candidate>,
+        hasMore: Boolean = false,
+        revision: Long = 0L,
+        highlightedIndex: Int = 0,
+        pageNo: Int = 0,
+        isLastPage: Boolean = false,
+        pagingMode: com.jobeen.hime.engine.CandidatePagingMode =
+            com.jobeen.hime.engine.CandidatePagingMode.SWIPE,
+    ) {
+        view.setCandidates(list, hasMore, revision, highlightedIndex, pageNo, isLastPage, pagingMode)
+    }
+
+    /** 剪贴板搜索态截获上屏文本，转发给面板决定是否消费。 */
+    fun interceptCommit(text: String): Boolean = panel.interceptCommit(text)
+
+    fun appendCandidates(list: List<EngineMessage.Candidate>, total: Int, revision: Long = 0L) {
+        view.appendCandidates(list, total, revision)
+    }
+
+    fun onPossibleCandidatePinYin(pinyins: List<CandidatePinYin>) {
+        view.onPossibleCandidatePinYin(pinyins)
+    }
+
+    fun updateDynamicPreedit(items: List<EngineMessage.DynamicPreedit.DynamicPreeditItem>) {
+        view.updateDynamicPreedit(items)
+    }
+
+    fun onSelectionUpdate(start: Int, end: Int) {
+        view.panel.onSelectionUpdate(start, end)
+    }
+
+    suspend fun handleEngineMessage(message: EngineMessage) {
+        messageHandler.handle(message)
+    }
+
+    fun onStartInputView(info: EditorInfo, restarting: Boolean, fieldChanged: Boolean = false) {
+        if (!restarting) {
+            view.refreshColorsIfChanged()
+        }
+        currentEditorInfo = info
+        view.onStartInput(info, fieldChanged)
+        view.refreshLayout()
+    }
+
+    fun onFinishInputView(finishingInput: Boolean) {
+        panel.onFinishInputView(finishingInput)
+        view.onFinishInputView()
+    }
+
+    fun onWindowShown() = view.onAttach()
+
+    fun onWindowHidden() = view.onDetach()
+
+    fun onConfigChanged(key: String) = view.onConfigChanged(key)
+
+    fun toggleVoiceLocked() = view.toggleVoiceLocked()
+
+    fun onInputChanged(text: String, virtualInputConnection: Boolean = false) =
+        view.onInputChanged(currentEditorInfo, text, virtualInputConnection)
+
+    fun showToast(message: CharSequence) = view.showImeToast(message)
+}

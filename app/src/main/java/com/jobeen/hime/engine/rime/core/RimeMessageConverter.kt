@@ -1,0 +1,438 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.engine.rime.core
+
+import com.jobeen.hime.engine.data.EngineMessage
+import com.jobeen.hime.engine.data.SystemSegmentSymbol
+import com.jobeen.hime.engine.data.UserSegmentSymbol
+import timber.log.Timber
+
+/**
+ * 将 [RimeMessage] 翻译为用户可消费的 [EngineMessage]。
+ * 不同输入方案（全拼 / 双拼）对音节注释的切分方式不同，通过
+ * [BaseRimeMessageConverter] 由各方案实现定制。
+ */
+interface RimeMessageConverter {
+    fun convert(message: RimeMessage<*>): EngineMessage
+}
+
+
+/**
+ * 音节注释切分器：把一个音节的拼写（spelling）分成“已输入/声母”与“剩余/韵母”两部分。
+ *
+ * @param raw 该音节已键入的原始码
+ * @param spelling 该音节的拼写（全拼为拼音，双拼为解析后的拼音）
+ * @return 第一项为声母（或被键入部分），第二项为韵母（或剩余部分）
+ */
+interface SyllableSpellingSplitter {
+    fun split(raw: String, spelling: String): Pair<String, String>
+}
+
+/** 全拼：按“已键入的拼音长度”固定位置切分。 */
+object PinYinSpellingSplitter : SyllableSpellingSplitter {
+    override fun split(raw: String, spelling: String): Pair<String, String> {
+        val len = raw.length
+        return spelling.take(len) to spelling.drop(len)
+    }
+}
+
+// 拼音声母表（按最长匹配优先排序）
+private val PINYIN_INITIALS = arrayOf(
+    "zh", "ch", "sh",
+    "b", "p", "m", "f", "d", "t", "n", "l", "g", "k", "h",
+    "j", "q", "x", "r", "z", "c", "s", "y", "w",
+)
+
+/** 双拼：两码确定整字（整段为 [normalPart]）；一码则按声母匹配，声母高亮、韵母置灰。 */
+object ShuangPinSpellingSplitter : SyllableSpellingSplitter {
+    override fun split(raw: String, spelling: String): Pair<String, String> {
+        if (raw.length >= 2) {
+            // 双码已确定整个字 -> 全部按已输入高亮
+            return spelling to ""
+        }
+        // 单码：匹配声母，命中部分高亮，剩余韵母置灰
+        val initial = PINYIN_INITIALS.firstOrNull { spelling.startsWith(it) } ?: ""
+        return initial to spelling.removePrefix(initial)
+    }
+}
+
+abstract class BaseRimeMessageConverter : RimeMessageConverter {
+
+    protected abstract val splitter: SyllableSpellingSplitter
+
+    override fun convert(message: RimeMessage<*>): EngineMessage = when (message) {
+        is RimeMessage.CommitTextMessage -> {
+            EngineMessage.Commit(message.data.text.orEmpty(), direct = message.direct)
+        }
+
+        is RimeMessage.CompositionMessage -> {
+            CandidateCompositionState.onComposition(message.data)
+            KeycapFilterState.onComposition(
+                compositionHasUnresolvedDigitSegment(message.data)
+            )
+            val preedit = message.data.preedit.orEmpty()
+            val cursor = mapPreeditCursor(preedit, message.data.cursorPos)
+            EngineMessage.Composition(preedit, cursor)
+        }
+
+        is RimeMessage.CandidateListMessage -> {
+            val converted = message.data.candidates.mapIndexed { i, c ->
+                EngineMessage.Candidate(
+                    index = i,
+                    text = c.text,
+                    comment = c.comment,
+                    type = c.type,
+                )
+            }
+            // 键帽过滤必须在编号之后做：index 是 bulk 窗口内下标
+            // （bulk 取词自当前 native 页起，见 B-P-1/P-2；全局下标
+            // 由 RimeEngine 的 native 分页定帧时加页内偏移还原），
+            // 选词按全局下标定位；先滤再编号会让其后每个候选的下标
+            // 错位一位、点选打错词。与 restoreCandidates 里已删词
+            // 过滤同口径：只摘条目、保留其余条目的原下标
+            val candidates = KeycapFilterState.applyTo(converted)
+            EngineMessage.Candidates(
+                list = candidates,
+                highlighted = message.data.highlighted,
+                page = 0,
+                total = message.data.total,
+                pageSize = message.data.pageSize,
+                composition = CandidateCompositionState.snapshot(),
+            )
+        }
+
+        is RimeMessage.StatusMessage -> {
+            CandidateCompositionState.onSchemaId(message.data.schemaId)
+            EngineMessage.Status(
+                isComposing = message.data.isComposing
+            )
+        }
+
+        is RimeMessage.CandidateMenuMessage -> {
+            EngineMessage.CandidateMenu(
+                isLastPage = message.data.isLastPage,
+                pageSize = message.data.pageSize,
+                pageNumber = message.data.pageNumber,
+                selectKeys = message.data.selectKeys,
+                selectLabels = message.data.selectLabels.asIterable().toList(),
+                highlightedCandidateIndex = message.data.highlightedCandidateIndex,
+                candidates = message.data.candidates.mapIndexed { index, item ->
+                    EngineMessage.CandidateMenu.Candidate(
+                        index = index,
+                        text = item.text,
+                        comment = item.comment,
+                        label = item.label,
+                        type = item.type,
+                    )
+                })
+        }
+
+        is RimeMessage.InlinePreeditMessage -> {
+            EngineMessage.InlinePreedit(message.data)
+        }
+
+        is RimeMessage.DynamicPreeditMessage -> {
+            CandidateCompositionState.onComposition(message.data.composition)
+            KeycapFilterState.onComposition(
+                compositionHasUnresolvedDigitSegment(message.data.composition)
+            )
+            buildDynamicPreedit(message.data.composition)
+        }
+
+        is RimeMessage.SchemaMessage -> {
+            CandidateCompositionState.onSchemaId(message.data.id)
+            KeycapFilterState.onSchemaLayout(message.data.layout)
+            EngineMessage.Schema(
+                message.data.id,
+                message.data.name,
+                message.data.layout,
+                message.data.punctuation,
+                message.data.kind
+            )
+        }
+
+        is RimeMessage.DeployMessage -> {
+            val deployState = when (message.data) {
+                RimeMessage.DeployMessage.State.Start -> EngineMessage.Depoly.State.Start
+                RimeMessage.DeployMessage.State.Success -> EngineMessage.Depoly.State.Success
+                RimeMessage.DeployMessage.State.Failure -> EngineMessage.Depoly.State.Failure
+                RimeMessage.DeployMessage.State.Finish -> EngineMessage.Depoly.State.Finish
+            }
+            EngineMessage.Depoly(deployState)
+        }
+
+        is RimeMessage.OptionMessage -> {
+            EngineMessage.Unknown
+        }
+
+        else -> {
+            // 只记消息类型不记内容：data 可能携带组字/候选原文
+            Timber.d("EngineMessage.Unknown type=%s", message.javaClass.simpleName)
+            EngineMessage.Unknown
+        }
+    }
+
+    private fun buildDynamicPreedit(composition: CompositionProto): EngineMessage {
+        val items = mutableListOf<EngineMessage.DynamicPreedit.DynamicPreeditItem>()
+        val preedits = composition.syllables
+        // 分隔符必须用空串：joinToString 默认 ", " 使拼出串恒含逗号与空格，
+        // 多音节时 all{isDigit()} 恒假，「整串」分支只剩单音节（及空表真空真）
+        // 可命中——多段纯数字/空拼写输入会误落逐音节路径（潜伏 bug）
+        val spelling = composition.syllables.joinToString("") { it.spelling }
+        if (preedits.isEmpty() || spelling.all { it.isDigit() }) {
+            if (composition.preedit.isNullOrBlank()) {
+                return EngineMessage.DynamicPreedit(items)
+            }
+            items.add(
+                EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                    text = composition.preedit,
+                    type = EngineMessage.DynamicPreedit.DynamicPreeditType.Normal
+                )
+            )
+            return EngineMessage.DynamicPreedit(items)
+        }
+
+        var confirmedProto: SyllableProto? = null
+        preedits.forEachIndexed { index, proto ->
+            if (confirmedProto != null) {
+                val cp = confirmedProto
+                if (cp.textSyllableStart >= 0 && cp.textSyllableEnd >= 0 && cp.textSyllableStart <= index && index <= cp.textSyllableEnd) {
+                    return@forEachIndexed
+                }
+            }
+            val segmented = proto.rawInput.endsWith(UserSegmentSymbol.toString())
+            val raw = proto.rawInput.trimEnd(UserSegmentSymbol)
+            val (normalPart, secondaryPart) = splitter.split(raw, proto.spelling)
+            if (proto.text.isNotEmpty()) {
+                confirmedProto = proto
+                items.add(
+                    EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                        text = proto.text,
+                        type = EngineMessage.DynamicPreedit.DynamicPreeditType.Normal
+                    )
+                )
+                return@forEachIndexed
+            }
+            var selected = false
+            if (normalPart.isNotEmpty()) {
+                items.add(
+                    EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                        text = normalPart,
+                        type = EngineMessage.DynamicPreedit.DynamicPreeditType.Normal
+                    )
+                )
+                selected = true
+            }
+            if (secondaryPart.isNotEmpty()) {
+                items.add(
+                    EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                        text = secondaryPart,
+                        type = EngineMessage.DynamicPreedit.DynamicPreeditType.Secondary
+                    )
+                )
+                selected = true
+            }
+            if (!selected) {
+                items.add(
+                    EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                        text = proto.rawInput,
+                        type = EngineMessage.DynamicPreedit.DynamicPreeditType.Normal
+                    )
+                )
+            }
+            items.add(
+                EngineMessage.DynamicPreedit.DynamicPreeditItem(
+                    text = if (segmented) UserSegmentSymbol.toString() else SystemSegmentSymbol.toString(),
+                    type = EngineMessage.DynamicPreedit.DynamicPreeditType.Normal
+                )
+            )
+        }
+        return EngineMessage.DynamicPreedit(items)
+    }
+
+    /**
+     * 组字中是否存在「未解析数字段」：某段的原始码含数字、却既没被选中
+     * 成词（text 为空）、也没解析出拼音字母（spelling 无字母）——该段在
+     * 组字里只能以原始数字形态出现（如 qu'77 的尾段 77、ji'5 的尾段 5）。
+     * 已确认候选覆盖的段与其内部的段不算未解析（与 [buildDynamicPreedit]
+     * 的 confirmed 段跳过同口径）。
+     */
+    private fun compositionHasUnresolvedDigitSegment(composition: CompositionProto): Boolean {
+        var confirmedProto: SyllableProto? = null
+        composition.syllables.forEachIndexed { index, proto ->
+            val cp = confirmedProto
+            if (cp != null &&
+                cp.textSyllableStart >= 0 && cp.textSyllableEnd >= 0 &&
+                cp.textSyllableStart <= index && index <= cp.textSyllableEnd
+            ) {
+                return@forEachIndexed
+            }
+            if (proto.text.isNotEmpty()) {
+                confirmedProto = proto
+                return@forEachIndexed
+            }
+            val raw = proto.rawInput.trimEnd(UserSegmentSymbol)
+            if (raw.any { it.isDigit() } && proto.spelling.none { it.isLetter() }) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+/**
+ * 候选批次的组字快照暂存（性能第 1 条）：转换器（写入方）与
+ * restoreCandidates（读取方，经 EngineMessage.Candidates.composition）
+ * 共用同一份，替代还原协程经 awaitJob 回 jobs 取组字码／音节／方案 id。
+ *
+ * 写入点与 KeycapFilterState 同口径：组字经 Composition /
+ * DynamicPreedit 两路同源消息（handleComposition 在候选消息之前连续
+ * 发出、转换串行进行，故首屏转换时读到的必是同轮状态）；方案 id
+ * 取自 Schema 消息，Status 增量携带新 id 时同步（与 Rime.handleRimeMessage
+ * 的 updateSchemaCached 同口径：空串不覆盖）。初值取 awaitJob 的
+ * 缺省同值（空组字；方案 ".default"，与 Rime.schemaCached 初值同源）：
+ * 首批候选之前无组字／方案消息时，读到即缺省，不阻塞候选落地。
+ *
+ * 线程：写入与读取（转换时快照）都在 reduce 串行路径；@Volatile 只
+ * 保证可见性。极窄窗口内（actions 通道满 512 时组字消息被丢弃而候选
+ * 幸存）可能读到上一轮组字，与旧 awaitJob 读到新组字的竞态同级，
+ * 落地前均有 requestId 门控兜底；DynamicPreedit 与 Composition 双路
+ * 写入使单路丢弃不致 stale。
+ */
+internal object CandidateCompositionState {
+
+    @Volatile
+    private var preedit: String = ""
+
+    @Volatile
+    private var spellings: List<String> = emptyList()
+
+    @Volatile
+    private var firstRawInput: String = ""
+
+    @Volatile
+    private var schemaId: String = ".default"
+
+    /** 组字消息到达时全量覆盖：本轮组字的组字码＋各音节拼写＋首音节原始输入。 */
+    fun onComposition(composition: CompositionProto) {
+        preedit = composition.preedit.orEmpty()
+        spellings = composition.syllables.map { it.spelling }
+        firstRawInput = composition.syllables.firstOrNull()?.rawInput.orEmpty()
+    }
+
+    /** 方案消息到达时覆盖方案 id：空串不覆盖（Status 稀疏增量恒为空）。 */
+    fun onSchemaId(id: String) {
+        if (id.isNotBlank()) schemaId = id
+    }
+
+    /** 候选消息转换时取本批快照：组字与方案 id 同批下发。 */
+    fun snapshot(): EngineMessage.CompositionSnapshot =
+        EngineMessage.CompositionSnapshot(preedit, spellings, firstRawInput, schemaId)
+}
+
+/**
+ * 键帽表情过滤的共享触发状态：当前方案布局＋最近一轮组字是否存在
+ * 「未解析数字段」。
+ *
+ * 第十六批时这两份状态是转换器的私有字段，只供首屏候选转换读取；
+ * 分页追加页的候选在 RimeEngine 内直构、不经转换器，拿不到该状态，
+ * 第十七批提为共享对象，转换器（写入方）与 RimeEngine 追加页路径
+ * （读取方）共用同一份。刷新点与第十六批逐点一致：
+ * - 布局：Schema 消息到达时全量覆盖（取值与方案 yaml 的 layout 同源）；
+ * - 未解析标记：Composition / DynamicPreedit 两路同源消息到达时按
+ *   本轮组字全量重算后覆盖。两路消息都由同一 handleComposition 在
+ *   候选消息之前连续发出、转换串行进行，故首屏转换时读到的必是
+ *   同轮状态；引擎直达转换器的消息流不丢消息（分发点 tryEmit 失败
+ *   会挂起补发），状态不会因 UI 侧易变消息丢弃而过期。组字清空时
+ *   空 syllables 的重算结果为 false，标记自然复位，没有单独的
+ *   清理口。
+ *
+ * 初值取安全方向：布局为空串（非 T9）、标记为 false，任何刷新到达
+ * 之前过滤恒不触发（宁可漏滤一次，不可误滤正常候选）。
+ *
+ * 线程：写入在消息转换所在的 reduce 串行路径；追加页在引擎 job
+ * 线程读取。两字段 @Volatile 只保证可见性——追加页 job 在通过
+ * 批次校验后才读，校验后、读取前新一轮组字若已先行刷新状态，
+ * 极窄窗口内可能读到下一轮状态；后果仅限那张即将被新首屏整表
+ * 替换的旧页（多摘或漏摘键帽，无下标错位、无持久污染），随新
+ * 一轮候选到达自愈（细节见 impl17-cand 报告的搬家保证逐项）。
+ */
+internal object KeycapFilterState {
+
+    /** T9 布局标识：方案 layout 字段的值，与 T9Keyboard.NAME 同源。 */
+    private const val T9_LAYOUT = "T9"
+
+    @Volatile
+    private var currentLayout: String = ""
+
+    @Volatile
+    private var hasUnresolvedDigitSegment: Boolean = false
+
+    /** Schema 消息刷新点：记录当前方案布局。 */
+    fun onSchemaLayout(layout: String) {
+        currentLayout = layout
+    }
+
+    /** 组字消息刷新点：记录本轮组字是否存在未解析数字段（全量重算值）。 */
+    fun onComposition(hasUnresolvedDigitSegment: Boolean) {
+        this.hasUnresolvedDigitSegment = hasUnresolvedDigitSegment
+    }
+
+    /** 触发条件：T9 方案且当前组字含未解析数字段。 */
+    fun shouldFilter(): Boolean =
+        currentLayout == T9_LAYOUT && hasUnresolvedDigitSegment
+
+    /**
+     * 触发成立时摘除键帽序列条目、保留其余条目的引擎全局下标
+     * （index/total/highlighted 均不动），否则原样返回。首屏转换与
+     * 分页追加页共用此口径。
+     */
+    fun applyTo(candidates: List<EngineMessage.Candidate>): List<EngineMessage.Candidate> =
+        if (shouldFilter()) {
+            candidates.filterNot { isKeycapSequence(it.text) }
+        } else {
+            candidates
+        }
+}
+
+/**
+ * 预编辑光标映射（纯函数，WO38 E1-10/2）：Rime 原生 caret 是 preedit
+ * 串内的字符下标（preedit 为组字码，ASCII；下标与字符下标同一口
+ * 径），原地直通。钳制只防越界脏值：有效输入（0..preedit.length）
+ * 一字不动，与旧内联直通行为逐值一致；负值／超长值收敛到串内，
+ * 不再把非法光标透传给下游（下游按光标取 preedit 子串／判定删码
+ * 右侧时越界即错位）。
+ */
+internal fun mapPreeditCursor(preedit: String, cursorPos: Int): Int =
+    cursorPos.coerceIn(0, preedit.length)
+
+/**
+ * 键帽序列判定：单个基字符（0-9、#、*）＋可选的 U+FE0F（变体选择符）
+ * ＋ U+20E3（组合包围键帽符），如 "7️⃣"。这类文本由 emoji 简化器把
+ * 「七」等数字字转换而来（wanxiang_emoji 词表），字面就是按键数字
+ * 本身；在组字还带着未解析数字段时出现只会与原始数字相互混淆。
+ */
+internal fun isKeycapSequence(text: String): Boolean {
+    if (text.length !in 2..3) return false
+    if (text[text.length - 1] != '\u20E3') return false
+    val base = text[0]
+    if (base !in '0'..'9' && base != '#' && base != '*') return false
+    return text.length == 2 || text[1] == '\uFE0F'
+}
+
+/** 全拼/双拼通用转换器单例：根据方案 kind 设置音节注释切分器。 */
+object EngineMessageConverter : BaseRimeMessageConverter() {
+    private var activeSplitter: SyllableSpellingSplitter = PinYinSpellingSplitter
+
+    override val splitter: SyllableSpellingSplitter
+        get() = activeSplitter
+
+    /** kind 属于双拼方案时使用声母/韵母切分，否则保持全拼固定长度切分。 */
+    fun applySchemaKind(kind: String) {
+        activeSplitter = if (kind.contains("DoublePinyin", ignoreCase = true)) {
+            ShuangPinSpellingSplitter
+        } else {
+            PinYinSpellingSplitter
+        }
+    }
+}

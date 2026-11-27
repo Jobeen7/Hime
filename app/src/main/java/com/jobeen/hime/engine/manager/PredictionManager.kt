@@ -1,0 +1,191 @@
+package com.jobeen.hime.engine.manager
+
+import android.content.Context
+import com.jobeen.hime.base.marisa.Prediction
+import com.jobeen.hime.base.ngram.GramDb
+import com.jobeen.hime.base.ngram.UserCollocationStore
+import com.jobeen.hime.base.priority.CandidateFeature
+import com.jobeen.hime.base.priority.PriorityCalculator
+import com.jobeen.hime.base.priority.WeightConfig
+import com.jobeen.hime.base.util.TextUtil
+import com.jobeen.hime.data.manager.CandidatePreferCache
+import com.jobeen.hime.engine.data.EngineMessage.Candidate
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import timber.log.Timber
+import java.io.File
+
+class PredictionManager(private val context: Context) {
+
+    // 两字段在 rime job 线程写（loadModels/destroy）、Default 线程读
+    // （makePredictions/重排打分），无锁交接靠 @Volatile 保证可见性
+    @Volatile
+    private var prediction: Prediction? = null
+
+    @Volatile
+    private var gramDb: GramDb? = null
+
+    /**
+     * 用户搭配学习（仅打字上屏）：与通用预测模型独立的个人搭配表，
+     * 懒加载；存储异常在存储层内部吞掉，不影响预测主流程。
+     */
+    private val collocationStoreDelegate = lazy {
+        UserCollocationStore(File(context.filesDir, "user_collocations.tsv"))
+    }
+    val collocationStore: UserCollocationStore by collocationStoreDelegate
+
+    /** 学一对相邻搭配（非打字上屏路径不要调用）。 */
+    fun learnCollocation(prev: String, next: String) {
+        collocationStore.learn(prev, next)
+    }
+
+    private val calculator = PriorityCalculator()
+
+    // 引入 Mutex 锁，防止并发重复加载导致冲突
+    private val mutex = Mutex()
+
+    /**
+     * destroy() 已调用：此后 loadModels 不得再赋值新模型（E-L5）。
+     * 先于 tryLock 置位——在途 loadModels 靠收尾复检看到它。
+     */
+    @Volatile
+    private var destroyed = false
+
+    suspend fun loadModels(modelDir: File, sharedDataDir: File, language: String?) =
+        mutex.withLock {
+            if (destroyed) return@withLock
+            destroyLocked()
+
+            //预测模型
+            val predictGram = File(modelDir, "predict.marisa")
+            if (predictGram.isFile) {
+                prediction = Prediction(predictGram).apply { load() }
+            }
+            if (!language.isNullOrEmpty()) {
+                val gram = File(sharedDataDir, "$language.gram")
+                if (gram.isFile) {
+                    // B-S3 跨包补漏：GramDb 构造时校验损坏模型会抛
+                    // IllegalArgumentException；此处接住并降级为无语法模型
+                    // （gramDb 保持 null，预测继续），不让一次坏模型打断部署。
+                    gramDb = runCatching { GramDb(gram.absolutePath) }
+                        .onFailure {
+                            Timber.w(it, "corrupted gram model, continuing without it")
+                        }
+                        .getOrNull()
+                }
+            }
+            // 收尾复检（E-L5）：destroy() 可能在本轮加载期间置位（tryLock
+            // 未拿到锁）；已销毁时本轮新赋值的模型须随即销毁，不滞留在
+            // 已销毁的引擎里。destroyLocked 也清 gramDb 字段——GramDb
+            // 本身是内存映射文件、无显式释放接口，由 GC 回收映射，
+            // 故“只置空”即全部可做的释放，无泄漏口可补。
+            if (destroyed) destroyLocked()
+        }
+
+    fun destroy() {
+        // 先置销毁标志、再抢锁（E-L5）：拿不到锁说明正有 loadModels 在跑，
+        // 跳过销毁不再安全——旧注释称“旧模型即将被替换”并不成立，
+        // loadModels 完成后会把新模型写回已销毁引擎的字段；标志让在途
+        // loadModels 在收尾复检时自行销毁新模型。仍用 tryLock、不在
+        // finalizer 线程 runBlocking 等锁。
+        destroyed = true
+        if (mutex.tryLock()) {
+            try {
+                destroyLocked()
+            } finally {
+                mutex.unlock()
+            }
+        }
+    }
+
+    // 内部私有的安全销毁方法
+    private fun destroyLocked() {
+        prediction?.destroy()
+        prediction = null
+        gramDb = null
+        flushCollocations()
+    }
+
+    /**
+     * 键盘收起／销毁时落盘用户搭配学习：有未写盘的学习才写，
+     * 无脏数据时零开销。存储未初始化时不触发懒加载。
+     */
+    fun flushCollocations() {
+        if (collocationStoreDelegate.isInitialized()) collocationStore.flush()
+    }
+
+    /** 用户搭配候选：按个人计数排序，排在通用模型候选之前。 */
+    private fun userCandidates(lastSegment: String?): List<Candidate> {
+        if (lastSegment == null) return emptyList()
+        val words = collocationStore.continuations(lastSegment)
+        return words.mapIndexed { index, (word, _) ->
+            Candidate(
+                index = index,
+                text = word,
+                type = Candidate.TYPE_IME_PREDICTION,
+                // 与模型分同尺度比较无意义：合并时用户候选整体置前，
+                // 此分只用于用户候选内部保序（已按计数降序）
+                score = (words.size - index).toDouble()
+            )
+        }
+    }
+
+    suspend fun makePredictions(inputContext: String, lastSegment: String? = null): List<Candidate> {
+        val user = userCandidates(lastSegment)
+        val model = modelPredictions(inputContext)
+        if (user.isEmpty()) return model
+        if (model.isEmpty()) return user.take(25)
+        val seen = user.mapTo(HashSet()) { it.text }
+        val merged = user + model.filter { it.text !in seen }
+        return merged.take(25).mapIndexed { i, c -> c.copy(index = i) }
+    }
+
+    private suspend fun modelPredictions(inputContext: String): List<Candidate> {
+        val pred = prediction ?: return emptyList()
+        // gramDb 只快照一次：prepareContext 与逐候选 query 必须落在
+        // 同一个实例上。两处读字段之间夹着 predictNextWords 的挂起
+        // 点，期间 loadModels 换模型会整体替换字段，旧实例的上下文
+        // 节点位（裸 trie 下标、不带实例身份）拿到新 trie 上用，
+        // valid 检查只防越界崩溃、防不住走错节点打错分。
+        // 快照允许为 null：无语法模型时本就以 0 分出预测，不因此
+        // 整体放弃本轮（GramDb 构造后只读、旧实例被字段弃置后由
+        // 本地引用续命用完，不存在 use-after-free）
+        val db = gramDb
+        val possiables = TextUtil.contextSubstrings(inputContext)
+        val cfg = WeightConfig()
+        // 语法模型的上下文只随 inputContext 变：整轮预测算一次，
+        // 逐候选复用，不再每个候选都重编码上下文并重走 trie
+        val preparedCtx = db?.prepareContext(inputContext)
+
+        for (contextStr in possiables) {
+            if (contextStr.isEmpty()) continue
+            // 查询段持锁：防止与 loadModels/destroy 并发导致 native use-after-free
+            val words = mutex.withLock { pred.predictNextWords(contextStr) }
+            if (words.isNotEmpty()) {
+                val prefers = CandidatePreferCache.snapshot(context)
+                val candidates = words.mapIndexed { index, it ->
+                    val gramScore = preparedCtx?.let { ctx -> db?.query(ctx, it.word) } ?: 0.0
+                    val preferCount = prefers[it.word] ?: 0
+                    val textLen = it.word.codePointCount(0, it.word.length)
+                    val score = calculator.calculate(
+                        CandidateFeature(
+                            frequency = preferCount.toLong(),
+                            wordLength = textLen,
+                            candidateCount = 1,
+                            baseScore = gramScore
+                        ), cfg
+                    )
+                    Candidate(
+                        index = index,
+                        text = it.word,
+                        type = Candidate.TYPE_IME_PREDICTION,
+                        score = score
+                    )
+                }.sortedByDescending { it.score }
+
+                return candidates.take(25)
+            }
+        }
+        return emptyList()
+    }
+}

@@ -1,0 +1,327 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.ui.screen
+
+import com.jobeen.hime.R
+import com.jobeen.hime.base.util.TextUtil
+
+/**
+ * 主设置页分组：固定顺序即主页呈现顺序；搜索后空组自动隐藏。
+ * 只做导航／呈现层模型：不含点击动作、不含偏好键、不碰键盘服务。
+ */
+enum class MainSettingGroup(val key: String) {
+    INPUT_CANDIDATE("input_candidate"),
+    KEYBOARD("keyboard"),
+    APPEARANCE("appearance"),
+    CONVENIENCE("convenience"),
+    DATA_BACKUP("data_backup"),
+    ADVANCED_ABOUT("advanced_about"),
+}
+
+/** 主设置页一行：标题＋副标题＋所属组；点击动作由调用方按键映射，不进模型。副标题可空：无副标题的行传 null，渲染时跳过副标题。 */
+data class MainSettingEntry(
+    val key: String,
+    val title: String,
+    val subtitle: String?,
+    val group: MainSettingGroup,
+)
+
+/**
+ * 按组归拢：组顺序固定为空组剔除。
+ * 主页只渲染非空组卡片；子页只渲染本组过滤后的行。
+ */
+fun groupMainSettings(
+    entries: List<MainSettingEntry>,
+): List<Pair<MainSettingGroup, List<MainSettingEntry>>> {
+    return MainSettingGroup.entries.mapNotNull { group ->
+        val rows = entries.filter { it.group == group }
+        if (rows.isEmpty()) null else group to rows
+    }
+}
+
+/**
+ * 单页组直达判定：组内仅 1 页时返回该页，否则返回 null（走组页）。
+ * 组行点按用此判定：单页组直接进页，不经过只剩自己一行的组页；
+ * 多页组仍进组页。当前单页组：外观组（appearance）、关于组（about）。
+ * 搜索结果开页本就不经组页（直接调行点击映射），不受此判定影响。
+ */
+fun directPageForGroup(
+    entries: List<MainSettingEntry>,
+    group: MainSettingGroup,
+): MainSettingEntry? {
+    val rows = entries.filter { it.group == group }
+    return if (rows.size == 1) rows[0] else null
+}
+
+// ---- 设置目录整树（通用渲染器＋搜索页用） ----
+
+/**
+ * 目录页：主页入口页。标题／副标题以字符串资源记，
+ * 调用方（可组合函数内）解析后供搜索与渲染用。
+ */
+data class CatalogPage(
+    val key: String,
+    val titleRes: Int,
+    val subtitleRes: Int?,
+    val group: MainSettingGroup,
+)
+
+/**
+ * 目录行：页内静态偏好行。动态标题的行（字体角色、已选词典、
+ * 带版本号的更新行）不进索引：标题不稳定，搜不到也定不了位。
+ * sectionRes＝行所在分段（键盘分类、候选分组等），用于结果路径；
+ * focusTitleRes＝点结果后定位的标题：缺省为行标题本身；键盘行
+ * 定位到所在分类行（分类页内行不在主页层，定分类行才是可达目标）。
+ */
+data class CatalogRow(
+    val titleRes: Int,
+    val pageKey: String,
+    val sectionRes: Int? = null,
+    val focusTitleRes: Int? = null,
+)
+
+/** 入口页：与主页行一一对应，键与主页行键一致。 */
+fun catalogPages(): List<CatalogPage> = listOf(
+    CatalogPage("schema", R.string.schema_settings, R.string.row_sub_schema_settings, MainSettingGroup.INPUT_CANDIDATE),
+    CatalogPage("scheme_update", R.string.schema_update_title, R.string.row_sub_scheme_update, MainSettingGroup.INPUT_CANDIDATE),
+    CatalogPage("rime", R.string.rime_title, R.string.row_sub_rime, MainSettingGroup.INPUT_CANDIDATE),
+    CatalogPage("candidates", R.string.prediction_candidates, R.string.row_sub_candidates, MainSettingGroup.INPUT_CANDIDATE),
+    CatalogPage("skin", R.string.keyboard_theme, R.string.row_sub_skin, MainSettingGroup.KEYBOARD),
+    CatalogPage("keyboard", R.string.keyboard_settings, R.string.row_sub_keyboard, MainSettingGroup.KEYBOARD),
+    CatalogPage("keyboardMenu", R.string.keyboard_menu_title, R.string.row_sub_keyboard_menu, MainSettingGroup.KEYBOARD),
+    CatalogPage("toolbar", R.string.toolbar_title, R.string.toolbar_settings_desc, MainSettingGroup.KEYBOARD),
+    CatalogPage("symbol_bar", R.string.symbol_bar_title, R.string.row_sub_symbol_bar, MainSettingGroup.KEYBOARD),
+    CatalogPage("appearance", R.string.appearance_title, R.string.row_sub_appearance, MainSettingGroup.APPEARANCE),
+    CatalogPage("clipboard", R.string.clipboard_manager, R.string.row_sub_clipboard, MainSettingGroup.CONVENIENCE),
+    CatalogPage("phrase", R.string.phrase_title, R.string.row_sub_phrase, MainSettingGroup.CONVENIENCE),
+    CatalogPage("ai", R.string.ai_title, R.string.row_sub_ai, MainSettingGroup.CONVENIENCE),
+    CatalogPage("voice", R.string.voice_settings, R.string.row_sub_voice, MainSettingGroup.CONVENIENCE),
+    CatalogPage("stats", R.string.input_stats_title, R.string.row_sub_stats, MainSettingGroup.CONVENIENCE),
+    CatalogPage("userdict", R.string.user_dict, R.string.row_sub_userdict, MainSettingGroup.DATA_BACKUP),
+    CatalogPage("backup", R.string.backup_restore, R.string.row_sub_backup, MainSettingGroup.DATA_BACKUP),
+    CatalogPage("files", R.string.schema_files, R.string.row_sub_files, MainSettingGroup.DATA_BACKUP),
+    CatalogPage("about", R.string.about_us, R.string.row_sub_about, MainSettingGroup.ADVANCED_ABOUT),
+)
+
+/** 页内静态行：仅含行标题稳定的页；工具页（备份、方案文件等）只出页结果。 */
+fun catalogRows(): List<CatalogRow> = listOf(
+    // 键盘：按分类；定位目标＝分类行。
+    CatalogRow(R.string.key_sound, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_sound_volume, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_custom_sound, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_custom_sound_pick, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_custom_sound_clear, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_sound_preview, "keyboard", R.string.kb_cat_sound, R.string.kb_cat_sound),
+    CatalogRow(R.string.key_vibration, "keyboard", R.string.kb_cat_haptics, R.string.kb_cat_haptics),
+    CatalogRow(R.string.key_vibration_follow_system, "keyboard", R.string.kb_cat_haptics, R.string.kb_cat_haptics),
+    CatalogRow(R.string.key_vibration_amplitude, "keyboard", R.string.kb_cat_haptics, R.string.kb_cat_haptics),
+    CatalogRow(R.string.key_vibration_duration, "keyboard", R.string.kb_cat_haptics, R.string.kb_cat_haptics),
+    CatalogRow(R.string.key_release_vibration, "keyboard", R.string.kb_cat_haptics, R.string.kb_cat_haptics),
+    CatalogRow(R.string.swipe_trigger_distance, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.gesture_swipe_velocity, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.gesture_long_press_timeout, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.gesture_repeat_interval, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.gesture_double_tap_timeout, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.gesture_slide_step, "keyboard", R.string.kb_cat_gesture, R.string.kb_cat_gesture),
+    CatalogRow(R.string.mnemonic_hints, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.decoration_effects, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.key_ripple_effect, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.key_border_show, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.expand_border, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.display_hide_symbol, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.display_hide_hint, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.key_corner_radius, "keyboard", R.string.kb_cat_display, R.string.kb_cat_display),
+    CatalogRow(R.string.key_x_gap, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.key_y_gap, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.keyboard_height, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.keyboard_height_landscape, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.horizontal_padding, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.bottom_padding, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.ignore_system_insets, "keyboard", R.string.keyboard_layout, R.string.keyboard_layout),
+    CatalogRow(R.string.symbol_pairing, "keyboard", R.string.kb_cat_behavior, R.string.kb_cat_behavior),
+    // 候选：内容组／窗口组。
+    CatalogRow(R.string.model_prediction_enable, "candidates", R.string.candidate_content),
+    CatalogRow(R.string.model_rerank_enable, "candidates", R.string.candidate_content),
+    CatalogRow(R.string.rare_characters_enable, "candidates", R.string.candidate_content),
+    CatalogRow(R.string.candidate_show_index, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_show_comment, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_border, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_line_limit, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_max_lines, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_auto_shrink, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_full_display, "candidates", R.string.candidate_window),
+    CatalogRow(R.string.candidate_inline_suggestion, "candidates", R.string.candidate_window),
+    // 剪切板：监听／历史／规则。
+    CatalogRow(R.string.clipboard_listening, "clipboard", R.string.clipboard_listening),
+    CatalogRow(R.string.clipboard_max_entries, "clipboard", R.string.clipboard_history),
+    CatalogRow(R.string.clipboard_retention_days, "clipboard", R.string.clipboard_history),
+    CatalogRow(R.string.clipboard_dedup, "clipboard", R.string.clipboard_rules),
+    CatalogRow(R.string.clipboard_return_after_paste, "clipboard", R.string.clipboard_rules),
+    // 语音：模型组／插件组。
+    // U-M3：定位标题须是页内真实渲染的行标题——“识别模型”在语音页
+    // 不存在（模型行标题是“本地语音模型”），旧值永不到达、3 秒超时后
+    // 静默放弃；改指定真实行标题，搜索结果标题本身仍为“识别模型”。
+    CatalogRow(
+        R.string.voice_recognition_model, "voice", R.string.voice_model_group,
+        R.string.voice_local_model,
+    ),
+    CatalogRow(R.string.cloud_voice_plugins, "voice", R.string.cloud_voice_plugins),
+    // 词典：造词／手动备份／定期同步／高级。
+    CatalogRow(R.string.word_creation_title, "userdict", R.string.word_creation_title),
+    CatalogRow(R.string.user_dict_export, "userdict", R.string.user_dict_manual_backup),
+    CatalogRow(R.string.user_dict_import, "userdict", R.string.user_dict_manual_backup),
+    CatalogRow(R.string.user_dict_periodic_sync, "userdict", R.string.user_dict_periodic_sync),
+    CatalogRow(R.string.user_dict_periodic_interval, "userdict", R.string.user_dict_periodic_sync),
+    CatalogRow(R.string.user_dict_allow_http, "userdict", R.string.user_dict_advanced),
+    CatalogRow(R.string.user_dict_upload, "userdict", R.string.user_dict_advanced),
+    CatalogRow(R.string.user_dict_download, "userdict", R.string.user_dict_advanced),
+    CatalogRow(R.string.user_dict_upload_schemes, "userdict", R.string.user_dict_advanced),
+    CatalogRow(R.string.user_dict_download_schemes, "userdict", R.string.user_dict_advanced),
+    CatalogRow(R.string.user_dict_deleted_words, "userdict", R.string.user_dict_advanced),
+    // 关于：无分段。
+    CatalogRow(R.string.about_diag_export, "about"),
+    CatalogRow(R.string.about_reset, "about"),
+    CatalogRow(R.string.licenses_index, "about"),
+    // 外观：应用外观。
+    CatalogRow(R.string.app_appearance, "appearance", R.string.app_appearance),
+)
+
+/**
+ * 消费行定位请求的页键（U-M4）：这些页的屏用 [SettingsPageScaffold]，
+ * 首次组合即消费 [PendingFocus]。其余页（方案管理、
+ * 系统文件页、输入统计）不用脚手架，标题写给它们会
+ * 残留到下一个脚手架页——搜索跳转只给消费页写标题。
+ */
+val FOCUS_CONSUMING_PAGE_KEYS: Set<String> = setOf(
+    "about", "ai", "appearance", "backup", "candidates", "clipboard",
+    "keyboard", "keyboardMenu", "phrase", "rime", "scheme_update", "symbol_bar",
+    "toolbar", "userdict", "voice", "word_creation",
+)
+
+/** 解析后的页：搜索与渲染直接用字符串，不再碰资源。副标题可空（无副标题的页为 null）。 */
+data class ResolvedPage(
+    val key: String,
+    val title: String,
+    val subtitle: String?,
+    val groupTitle: String,
+)
+
+/** 解析后的行：focusTitle 缺省为行标题本身。 */
+data class ResolvedRow(
+    val title: String,
+    val pageKey: String,
+    val pageTitle: String,
+    val groupTitle: String,
+    val sectionTitle: String?,
+    val focusTitle: String?,
+)
+
+/** 搜索结果：标题＋面包屑路径＋目标页键＋定位标题（页结果无定位）。 */
+data class SearchResult(
+    val title: String,
+    val path: String,
+    val pageKey: String,
+    val focusTitle: String?,
+)
+
+/**
+ * 面包屑路径：组 › 页 › 分段；页名与组名相同时省页段，
+ * 段名与页名／组名相同时省段（单页组不写重复名）。
+ */
+fun buildSearchPath(
+    groupTitle: String,
+    pageTitle: String,
+    sectionTitle: String?,
+): String {
+    val segments = mutableListOf(groupTitle)
+    if (pageTitle != groupTitle) segments += pageTitle
+    if (sectionTitle != null && sectionTitle != groupTitle && sectionTitle != pageTitle) {
+        segments += sectionTitle
+    }
+    return segments.joinToString(" › ")
+}
+
+/**
+ * 错别字容错：字段内任一与查询等长 ±1 的窗口与查询的编辑距离 ≤1 即命中，
+ * 覆盖替错一字／多打一字／少打一字。查询短于 2 字不做容错（单字错一字
+ * 等于任意字，噪声太大）；单字字段只走精确匹配。
+ */
+internal fun fuzzyContains(field: String, query: String): Boolean {
+    val f = field.lowercase()
+    val q = query.lowercase()
+    if (q.length < 2 || f.length < 2) return false
+    if (f.contains(q)) return true
+    for (len in listOf(q.length - 1, q.length, q.length + 1)) {
+        if (len < 1) continue
+        if (len >= f.length) {
+            if (TextUtil.levenshtein(f, q) <= 1) return true
+        } else {
+            for (i in 0..f.length - len) {
+                if (TextUtil.levenshtein(f.substring(i, i + len), q) <= 1) return true
+            }
+        }
+    }
+    return false
+}
+
+/**
+ * 跨目录搜索：空查询返回空（搜索页等输入）；否则页标题／副标题、
+ * 行标题／页标题／分段标题含查询（去首尾空白、不区分大小写）。
+ * 页结果在前、行结果在后，各按目录顺序；行结果带定位标题。
+ * 错别字容错：精确未命中的页／行再走 fuzzyContains，容错结果排在
+ * 全部精确结果之后、各自按目录顺序；容错只看标题字段（页标题／行
+ * 标题），副标题／分段标题保持精确匹配——副标题窗口太容易误撞
+ * （如“声音”撞上副标题里的“键音”）。同义词映射对端原文未给
+ * 映射表，不做。simplify 缺省恒等，生产调用方传繁→简转换，
+ * 使繁体查询能命中简体标题（主机单测不碰 Android 资产）。
+ */
+fun searchCatalog(
+    query: String,
+    pages: List<ResolvedPage>,
+    rows: List<ResolvedRow>,
+    simplify: (String) -> String = { it },
+): List<SearchResult> {
+    val q = query.trim()
+    if (q.isEmpty()) return emptyList()
+    val folded = simplify(q).lowercase()
+    fun exact(text: String): Boolean = simplify(text).lowercase().contains(folded)
+    fun fuzzy(text: String): Boolean = fuzzyContains(simplify(text), folded)
+    val (exactPages, restPages) = pages.partition { exact(it.title) || (it.subtitle?.let { s -> exact(s) } == true) }
+    val pageResults = exactPages.map {
+        SearchResult(
+            title = it.title,
+            path = buildSearchPath(it.groupTitle, it.title, null),
+            pageKey = it.key,
+            focusTitle = null,
+        )
+    }
+    val fuzzyPageResults = restPages.filter { fuzzy(it.title) }.map {
+        SearchResult(
+            title = it.title,
+            path = buildSearchPath(it.groupTitle, it.title, null),
+            pageKey = it.key,
+            focusTitle = null,
+        )
+    }
+    val (exactRows, restRows) = rows.partition {
+        exact(it.title) || exact(it.pageTitle) || (it.sectionTitle?.let { s -> exact(s) } == true)
+    }
+    val rowResults = exactRows.map {
+        SearchResult(
+            title = it.title,
+            path = buildSearchPath(it.groupTitle, it.pageTitle, it.sectionTitle),
+            pageKey = it.pageKey,
+            focusTitle = it.focusTitle ?: it.title,
+        )
+    }
+    val fuzzyRowResults = restRows.filter { fuzzy(it.title) }.map {
+        SearchResult(
+            title = it.title,
+            path = buildSearchPath(it.groupTitle, it.pageTitle, it.sectionTitle),
+            pageKey = it.pageKey,
+            focusTitle = it.focusTitle ?: it.title,
+        )
+    }
+    return pageResults + rowResults + fuzzyPageResults + fuzzyRowResults
+}
+

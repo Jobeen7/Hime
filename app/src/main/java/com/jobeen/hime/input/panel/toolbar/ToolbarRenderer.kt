@@ -1,0 +1,1344 @@
+package com.jobeen.hime.input.panel.toolbar
+
+import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
+import android.text.TextPaint
+import android.text.TextUtils
+import androidx.core.graphics.withRotation
+import com.jobeen.hime.input.panel.PanelAction
+import com.jobeen.hime.input.panel.IRenderer
+import com.jobeen.hime.input.panel.KawaiiPanel
+import com.jobeen.hime.input.panel.Paints
+import com.jobeen.hime.input.panel.component.ClipboardTab
+import com.jobeen.hime.skin.icon.IconAlias
+import com.jobeen.hime.skin.icon.MaterialSymbols
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.skin.model.MenuAction
+import com.jobeen.hime.skin.model.ToolbarLayoutSpec
+import com.jobeen.hime.skin.model.ToolbarSlot
+import com.jobeen.hime.skin.model.ToolbarStyleSpec
+import com.jobeen.hime.skin.model.contentRect
+import com.jobeen.hime.skin.model.toolbarSlotGeometry
+
+/**
+ * 自定义钮按压态：涟漪动画进行中（alpha>0 且半径未到峰值）且按压点落在该槽内。
+ * 动画结束（半径到峰值）、取消（alpha 清零）后即不再是按压态，按下颜色随之收回；
+ * 未设按下颜色时调用方回落背景色（旧行为不变）。
+ */
+internal fun customPressedFaceActive(
+    pressAlpha: Int,
+    pressRadius: Float,
+    pressRadiusMax: Float,
+    pressCx: Float,
+    slotLeft: Float,
+    slotRight: Float,
+): Boolean = pressAlpha > 0 && pressRadiusMax > 0f && pressRadius < pressRadiusMax &&
+    pressCx in slotLeft..slotRight
+
+/**
+ * 工具栏触摸分区：左固定槽 / 右固定槽 / 中间区。纯函数（与 hitTest
+ * 同一套几何：48dp 边缘触摸区，右槽优先），供 JVM 测试；hitTest 直接
+ * 用它分区，保证绘制与命中对同一 x 的判断一致。
+ */
+internal enum class ToolbarHitRegion { MENU, CLOSE, CENTER }
+
+/**
+ * MENU 槽位动作（W19-6b，纯函数）：皮肤 menuAction 决定 MENU 钮开什么——
+ * panel → 8 钮快捷面板（ShortcutPanel）；menu（缺省）→ 原 16 项菜单（SwitchKeyboard）。
+ */
+internal fun menuSlotAction(menuAction: MenuAction): PanelAction =
+    if (menuAction == MenuAction.PANEL) PanelAction.ShortcutPanel else PanelAction.SwitchKeyboard
+
+/** 隐藏时中间区命中被压制；首尾固定槽不受影响。纯函数，供 JVM 测试。 */
+internal fun toolbarCenterHitSuppressed(
+    toolbarHidden: Boolean,
+    region: ToolbarHitRegion,
+): Boolean = toolbarHidden && region == ToolbarHitRegion.CENTER
+
+/**
+ * 槽位排列版触摸分区（审计 B 项）：首尾槽中心取槽位几何，
+ * 缺失的槽不产生分区（落入中央区）；无布局时与旧分区一致。
+ */
+internal fun toolbarHitRegionLayout(
+    x: Float,
+    width: Int,
+    density: Float,
+    leftPadDp: Float,
+    rightPadDp: Float,
+    centerPadDp: Float,
+    slots: List<ToolbarSlot>,
+): ToolbarHitRegion {
+    val geo = toolbarSlotGeometry(
+        width, density, (leftPadDp + 4) * density, (rightPadDp + 4) * density,
+        centerPadDp * density, slots,
+    )
+    val edgeTouchW = 48f * density
+    // 右槽优先（与旧分区一致）：窄条上两触摸区重叠时归右槽。
+    val closeCenter = geo.closeCenter
+    if (closeCenter != null &&
+        x in (closeCenter - edgeTouchW / 2f).coerceAtLeast(0f)..(closeCenter + edgeTouchW / 2f).coerceAtMost(width.toFloat())
+    ) {
+        return ToolbarHitRegion.CLOSE
+    }
+    val menuCenter = geo.menuCenter
+    if (menuCenter != null &&
+        x in (menuCenter - edgeTouchW / 2f).coerceAtLeast(0f)..(menuCenter + edgeTouchW / 2f).coerceAtMost(width.toFloat())
+    ) {
+        return ToolbarHitRegion.MENU
+    }
+    return ToolbarHitRegion.CENTER
+}
+
+class ToolbarRenderer(
+    private val resources: ToolbarRendererResources,
+    var horizontalPaddingDp: Float = 0f,
+    var centerHorizontalPaddingDp: Float = 12f,
+    var iconScale: Float = 0.94f,
+    centerActions: List<PanelAction> = ToolbarConfig.DEFAULT_ACTIONS,
+    centerIconOverrides: Map<String, String> = emptyMap(),
+    /**
+     * Symbol 名解析接线（参考项）：工具栏按钮 icon 不是包内
+     * 资产 id 时查 Material Symbols 注册表。由构造点注入
+     * （MaterialSymbols.drawable）；null = 无符号源，按旧口径绘制空白。
+     * 皮肤工具栏构成字段（按钮清单/展开收起图标）由工具栏分流负责，
+     * 本类只负责“非资产 id → 注册表”这一段接线。
+     */
+    private val symbolIconProvider: ((String) -> Drawable?)? = null,
+    /**
+     * 工具栏样式（审计 B 项）：构造点经快照传入（StateRenders /
+     * KawaiiPanelView），长驻渲染器由 refreshTheme 重设；
+     * null = 未定义（旧口径：无条背景、无边框、无附加内边距）。
+     */
+    var toolbarStyle: ToolbarStyleSpec? = null,
+    /**
+     * 工具栏布局（审计 B 项）：构造点经快照传入，长驻渲染器由
+     * refreshTheme 重设；null = 未定义（出厂排列）。
+     */
+    var toolbarLayout: ToolbarLayoutSpec? = null,
+    /**
+     * 开关启用判定（E6）：构造点注入（StateRenders /
+     * KawaiiPanelView，以 ToolbarToggleState.isActive 绑定上下文）；
+     * null = 无判定（旧口径：池钮一律常态色）。函数型参数置末。
+     */
+    var toggleActive: ((PanelAction) -> Boolean)? = null,
+    /**
+     * 当前配色方案（P4：锁定通知样式解析用，由面板视图在构建与
+     * refreshTheme 时同步；null = 不解析样式覆盖，只换动作）。
+     */
+    var scheme: KeyboardColors.ColorScheme? = null,
+    /**
+     * 语音入口可见判定（H2-13）：构造点注入（StateRenders /
+     * KawaiiPanelView，以 voiceInputEnabled 绑定上下文）；null =
+     * 无判定（旧口径：语音键一律可见）。函数型参数置末。
+     * 绘制／命中时逐次求值，开关切换后下次绘制即生效。
+     */
+    var voiceEnabled: (() -> Boolean)? = null,
+) : IRenderer {
+
+    var textEditingMode: Boolean = false
+    var copyText: String? = null
+    var clipMode: Boolean = false
+    // 剪贴板搜索态（仅 CLIPBOARD 分页）：true 时胶囊区改画搜索框
+    var clipSearchMode: Boolean = false
+    var clipSearchQuery: String = ""
+    var clipSearchHint: String = ""
+    // 剪贴板条目编辑态：true 时胶囊区改画提示行（全文编辑在列表区），
+    // 动作区两槽改为「保存 / 取消」文字按钮
+    var clipEditMode: Boolean = false
+    var clipEditHint: String = ""
+    var clipEditSaveLabel: String = ""
+    var clipCancelLabel: String = ""
+    // 剪贴板多选态：true 时胶囊区改画已选计数，动作区两槽为「删除 / 取消」
+    var clipMultiMode: Boolean = false
+    var clipMultiLabel: String = ""
+    var clipDeleteLabel: String = ""
+    // 排序态：胶囊区改画提示文字，动作区 slot1 为「完成」
+    var clipReorderMode: Boolean = false
+    var clipReorderLabel: String = ""
+    var clipDoneLabel: String = ""
+    var clipTab: ClipboardTab = ClipboardTab.CLIPBOARD
+    var clipLabelClipboard: String = ""
+    var clipLabelPhrase: String = ""
+    var clipSelectedTextColor: Int = 0
+    var clipSelectedBgColor: Int = 0
+    override var recording: Boolean = false
+    /**
+     * 工具栏隐藏：true 时只藏中间按钮区，首尾 32dp 固定槽照常绘制
+     * 与响应，候选渲染（ComposingRenderer）不受影响。条高不归零，
+     * 由窗口层保证；此处只管本渲染器的绘制与命中。
+     */
+    var toolbarHidden: Boolean = false
+
+    private data class ClipGeom(
+        val capsuleLeft: Float, val capsuleRight: Float, val capsuleTop: Float, val capsuleH: Float,
+        val actionLeft: Float, val actionRight: Float, val closeLeft: Float, val closeRight: Float,
+    )
+
+    private fun clipGeom(width: Int, height: Int, density: Float): ClipGeom {
+        val hPad = (horizontalPaddingDp + 4) * density
+        val fixedW = 32f * density
+        val menuRight = hPad + fixedW
+        val capsuleH = 32f * density
+        val capsuleTop = (height - capsuleH) / 2f
+        val btnW = 30f * density
+        val btnGap = 6f * density
+        val closeRight = width - hPad
+        val closeLeft = closeRight - btnW
+        val actionRight = closeLeft - btnGap
+        val actionLeft = actionRight - btnW * 2f - btnGap
+        val rightZone = actionLeft
+        val leftZone = menuRight + centerHorizontalPaddingDp * density
+        val availW = (rightZone - 8f * density - leftZone).coerceAtLeast(0f)
+        val capsuleW = (180f * density).coerceAtMost(availW)
+        val capsuleLeft = leftZone
+        val capsuleRight = capsuleLeft + capsuleW
+        return ClipGeom(
+            capsuleLeft,
+            capsuleRight,
+            capsuleTop,
+            capsuleH,
+            actionLeft,
+            actionRight,
+            closeLeft,
+            closeRight
+        )
+    }
+
+    private fun actionSlotCenter(g: ClipGeom, index: Int, density: Float): Float {
+        val btnW = 30f * density
+        val gap = 6f * density
+        return g.actionRight - btnW / 2f - index * (btnW + gap)
+    }
+
+    private fun drawActionIcon(
+        canvas: Canvas,
+        drawable: Drawable,
+        centerX: Float,
+        centerY: Float,
+        paints: Paints,
+        density: Float,
+    ) {
+        drawable.setTint(dimColor(paints.toolbarIconColor))
+        val size = 18f * density
+        drawable.setBounds(
+            (centerX - size / 2f).toInt(),
+            (centerY - size / 2f).toInt(),
+            (centerX + size / 2f).toInt(),
+            (centerY + size / 2f).toInt(),
+        )
+        drawable.draw(canvas)
+    }
+
+
+    private fun dimColor(color: Int): Int {
+        return if (recording) (color and 0x00FFFFFF) or 0x5A000000 else color
+    }
+
+    // 中央区按钮来源（优先级见 ToolbarSkinResolution）：
+    // 出厂默认。长驻实例经 updateCenterActions（回落出厂默认）热更新。
+    private var fallbackCenterActions: List<PanelAction> = centerActions
+    private var fallbackCenterIconOverrides: Map<String, String> = centerIconOverrides
+
+    private var centerButtons: List<ImageButton> = buildCenterButtons()
+
+    /** 语音总开关当前值（未注入＝旧口径：开）。 */
+    private fun isVoiceEnabledNow(): Boolean = voiceEnabled?.invoke() ?: true
+
+    /**
+     * 当前可见的中央池钮（皮肤／默认路）：绘制与命中同取此表，
+     * 几何一致；开关关时语音键不占槽位，其余钮重新均分。
+     */
+    private fun visibleCenterButtons(): List<ImageButton> =
+        centerButtons.filter { isToolbarActionVisible(it.action, isVoiceEnabledNow()) }
+
+    /**
+     * 用户覆盖中央区（工具栏编辑轮）：非空时整段替换 [centerButtons]
+     * （池钮与自定义钮按用户列顺序混排）。池钮复用 [ImageButton]
+     * 绘制；自定义钮按定义绘制文字／表情／图片＋可选背景面。
+     * 槽位宽：自定义钮取 widthDp，池钮均分剩余（剩余 ≤0 时池钮
+     * 槽宽为 0、绘制与命中皆跳过）。与 [userCenterSlots] 同一数学，
+     * 绘制与命中不得各算一套。
+     */
+    sealed interface UserCenterItem {
+        data class Pool(val action: PanelAction) : UserCenterItem
+        data class Custom(val def: ToolbarCustomButton, val bitmap: Bitmap?) : UserCenterItem
+    }
+
+    private var userCenter: List<UserCenterItem>? = null
+
+    /**
+     * 用户中央区图标覆盖（与 userCenter 同步更新）：
+     * 键＝池钮 id；字符串覆盖走 iconFor（内置资产／符号名），
+     * 上传图片覆盖是调用方解好的 Drawable（位图随旧值一并回收）。
+     */
+    private var userCenterIconOverrides: Map<String, String> = emptyMap()
+    private var userCenterIconDrawables: Map<String, Drawable> = emptyMap()
+
+    /** 热更新用户覆盖中央区（null＝清除，回落皮肤／默认；旧自定义位图随之回收）。 */
+    fun updateUserCenter(
+        items: List<UserCenterItem>?,
+        iconOverrides: Map<String, String> = emptyMap(),
+        iconDrawables: Map<String, Drawable> = emptyMap(),
+    ) {
+        userCenter?.forEach { item ->
+            (item as? UserCenterItem.Custom)?.bitmap?.let { bitmap ->
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
+        }
+        recycleIconDrawables()
+        userCenter = items
+        userCenterIconOverrides = iconOverrides
+        userCenterIconDrawables = iconDrawables
+    }
+
+    fun clearUserCenter() {
+        userCenter = null
+        userCenterIconOverrides = emptyMap()
+        recycleIconDrawables()
+        userCenterIconDrawables = emptyMap()
+    }
+
+    private fun recycleIconDrawables() {
+        userCenterIconDrawables.values.forEach { drawable ->
+            (drawable as? BitmapDrawable)?.bitmap?.let { bitmap ->
+                if (!bitmap.isRecycled) bitmap.recycle()
+            }
+        }
+    }
+
+    /** 中央区几何（与 draw／hitTest 同口径，含样式内边距与槽位排列）。 */
+    private fun centerArea(width: Int, density: Float): Pair<Float, Float> {
+        val style = toolbarStyle
+        val hPad = (horizontalPaddingDp + 4 + (style?.insets?.left ?: 0f)) * density
+        val rPad = (horizontalPaddingDp + 4 + (style?.insets?.right ?: 0f)) * density
+        val geo = toolbarSlotGeometry(
+            width, density, hPad, rPad,
+            centerHorizontalPaddingDp * density, effectiveSlots(),
+        )
+        return geo.centerLeft to geo.centerWidth
+    }
+
+    /** 生效槽位排列：皮肤未定义布局时为出厂排列。 */
+    private fun effectiveSlots(): List<ToolbarSlot> =
+        toolbarLayout?.slots ?: ToolbarLayoutSpec.DEFAULT.slots
+
+    /** 用户中央区槽位：项＋左右界（池钮槽宽为 0 时命中跳过）。 */
+    private data class UserCenterSlot(val item: UserCenterItem, val left: Float, val right: Float)
+
+    private fun userCenterSlots(width: Int, density: Float): List<UserCenterSlot>? {
+        val items = userCenter ?: return null
+        if (items.isEmpty()) return emptyList()
+        // H2-13：语音总开关关时池钮语音键不占槽位（自定义钮不走此口，
+        // 见 ToolbarVoiceVisibility）；其余池钮重新均分。
+        val visibleItems = items.filter { item ->
+            item !is UserCenterItem.Pool ||
+                isToolbarActionVisible(item.action, isVoiceEnabledNow())
+        }
+        if (visibleItems.isEmpty()) return emptyList()
+        val (areaLeft, areaW) = centerArea(width, density)
+        var customTotal = 0f
+        for (item in visibleItems) {
+            if (item is UserCenterItem.Custom) customTotal += item.def.widthDp * density
+        }
+        val poolCount = visibleItems.count { it is UserCenterItem.Pool }
+        val poolW = if (poolCount > 0) {
+            ((areaW - customTotal) / poolCount).coerceAtLeast(0f)
+        } else 0f
+        val slots = mutableListOf<UserCenterSlot>()
+        var x = areaLeft
+        for (item in visibleItems) {
+            val w = if (item is UserCenterItem.Custom) item.def.widthDp * density else poolW
+            slots += UserCenterSlot(item, x, x + w)
+            x += w
+        }
+        return slots
+    }
+
+    /** 纯探针（View 手势机 DOWN 用，无副作用，不改按压态）。 */
+    fun userCenterHit(x: Float, width: Int, density: Float): UserCenterItem? {
+        if (toolbarHidden) return null
+        if (clipMode || copyText != null) return null
+        val slots = userCenterSlots(width, density) ?: return null
+        return slots.firstOrNull { x in it.left..it.right && it.right > it.left }?.item
+    }
+
+    private val customTextPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        textAlign = Paint.Align.CENTER
+    }
+
+    private fun drawUserCenter(
+        canvas: Canvas, height: Int, width: Int, paints: Paints, density: Float,
+    ) {
+        val slots = userCenterSlots(width, density) ?: return
+        for (slot in slots) {
+            if (slot.right <= slot.left) continue
+            val cx = (slot.left + slot.right) / 2f
+            val cy = height / 2f
+            when (val item = slot.item) {
+                is UserCenterItem.Pool -> {
+                    val savedColor = paints.toolbarIconColor
+                    val disabled = (textEditingMode && item.action in TEXT_EDIT_DISABLED) || recording
+                    if (disabled) {
+                        paints.toolbarIconColor = (savedColor and 0x00FFFFFF) or 0x62000000.toInt()
+                    }
+                    ImageButton(
+                        userCenterIcon(item.action), item.action, iconScale = iconScale,
+                    ).draw(canvas, cx, cy, paints, density)
+                    if (disabled) {
+                        paints.toolbarIconColor = savedColor
+                    }
+                }
+                is UserCenterItem.Custom -> {
+                    val def = item.def
+                    val pressed = customPressedFaceActive(
+                        pressAlpha, pressRadius, pressRadiusMax,
+                        pressCx, slot.left, slot.right,
+                    )
+                    val faceColor = if (pressed) {
+                        def.pressedArgb ?: def.backgroundArgb
+                    } else {
+                        def.backgroundArgb
+                    }
+                    val inset = 2f * density
+                    val faceTop = cy - 16f * density
+                    val faceBottom = cy + 16f * density
+                    if (faceColor != null) {
+                        val facePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = dimColor(faceColor)
+                        }
+                        canvas.drawRoundRect(
+                            slot.left + inset, faceTop,
+                            slot.right - inset, faceBottom,
+                            8f * density, 8f * density, facePaint,
+                        )
+                    }
+                    if (def.borderWidthDp > 0f && def.borderArgb != null) {
+                        val stroke = def.borderWidthDp * density
+                        val borderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                            color = dimColor(def.borderArgb)
+                            style = Paint.Style.STROKE
+                            strokeWidth = stroke
+                        }
+                        canvas.drawRoundRect(
+                            slot.left + inset + stroke / 2f, faceTop + stroke / 2f,
+                            slot.right - inset - stroke / 2f, faceBottom - stroke / 2f,
+                            8f * density, 8f * density, borderPaint,
+                        )
+                    }
+                    val bitmap = item.bitmap
+                    if (def.kind == CustomDisplayKind.IMAGE && bitmap != null) {
+                        val box = def.iconSizeDp * density
+                        val scale = minOf(box / bitmap.width, box / bitmap.height)
+                        val w = bitmap.width * scale
+                        val h = bitmap.height * scale
+                        val dst = RectF(cx - w / 2f, cy - h / 2f, cx + w / 2f, cy + h / 2f)
+                        canvas.drawBitmap(bitmap, null, dst, null)
+                    } else {
+                        val text = when (def.kind) {
+                            CustomDisplayKind.IMAGE -> def.display
+                            else -> def.display
+                        }
+                        if (text.isNotEmpty()) {
+                            customTextPaint.apply {
+                                color = dimColor(paints.toolbarIconColor)
+                                // 字号：自定义字号优先，否则跟随图标大小（旧行为）；
+                                // 与图标大小同口径（乘 density，不另乘字体缩放）。
+                                textSize = def.effectiveTextSizeDp() * density
+                            }
+                            val avail = slot.right - slot.left - 4f * density
+                            val fitted = if (def.kind == CustomDisplayKind.EMOJI) {
+                                // 表情不截断：超宽则等比缩小字号（下限 8dp），不断字形簇。
+                                var size = customTextPaint.textSize
+                                while (size > 8f * density &&
+                                    customTextPaint.measureText(text) > avail
+                                ) {
+                                    size *= 0.9f
+                                    customTextPaint.textSize = size
+                                }
+                                text
+                            } else {
+                                TextUtils.ellipsize(
+                                    text, customTextPaint, avail,
+                                    TextUtils.TruncateAt.END,
+                                ).toString()
+                            }
+                            val textY = cy - (customTextPaint.descent() + customTextPaint.ascent()) / 2f
+                            canvas.drawText(fitted, cx, textY, customTextPaint)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun buildCenterButtons(): List<ImageButton> {
+        // 皮肤 v3 死壳删除后通知锁存与键样式恒为空，中央区恒为出厂默认。
+        val resolved = ToolbarSkinResolution.resolve(fallbackCenterActions)
+        return resolved.centerActions.map { action ->
+            ImageButton(
+                iconFor(action, fallbackCenterIconOverrides), action, iconScale = iconScale,
+            )
+        }
+    }
+
+
+
+
+
+
+
+    /**
+     * 热更新中央区按钮（长驻渲染器刷新用；面板态渲染器
+     * 每次新建、本就读最新默认）。直接调用 = 明确回落出厂默认。
+     */
+    fun updateCenterActions(
+        actions: List<PanelAction>,
+        iconOverrides: Map<String, String> = emptyMap(),
+    ) {
+        fallbackCenterActions = actions
+        fallbackCenterIconOverrides = iconOverrides
+        centerButtons = buildCenterButtons()
+    }
+
+
+    /**
+     * 用户中央区池钮图标：上传图片覆盖优先，其次字符串覆盖
+     * （内置资产／符号名），都没有回落该动作默认图标；覆盖值
+     * 解析不到按既有行为画空白＋记日志（见 iconFor）。
+     */
+    private fun userCenterIcon(action: PanelAction): Drawable? {
+        val actionId = ToolbarConfig.POOL.find { it.action == action }?.id ?: return null
+        userCenterIconDrawables[actionId]?.let { return it }
+        return iconFor(action, userCenterIconOverrides)
+    }
+
+    /**
+     * 按钮图标：先查该动作的图标覆盖（换图标），无覆盖则用动作
+     * 自身图标。图标 id 与动作 id 共用命名空间，结构图标
+     * （菜单/返回/收起/删除/搜索）同理。
+     */
+    private fun iconFor(action: PanelAction, iconOverrides: Map<String, String>): Drawable? {
+        val actionId = ToolbarConfig.POOL.find { it.action == action }?.id ?: return null
+        val iconId = iconOverrides[actionId] ?: actionId
+        val drawable = drawableForIconId(iconId)
+        if (drawable == null && iconId != actionId) {
+            // 覆盖值既非资产 id 又不在符号注册表内：空白按钮（与缺
+            // 图标既有行为一致）+ 一条日志（只记动作与图标名元数据；
+            // 构造/热更新期调用，非绘制热路径）。
+            com.jobeen.hime.skin.diag.DiagLog.w(
+                "toolbar", "toolbar_icon_unresolved",
+                mapOf("actionId" to actionId, "icon" to iconId),
+            )
+        }
+        return drawable
+    }
+
+    private fun drawableForIconId(iconId: String): Drawable? = when (iconId) {
+        "emoji" -> resources.emoji
+        "select_all" -> resources.selectAll
+        "copy" -> resources.copy
+        "paste" -> resources.paste
+        "clipboard" -> resources.clipboard
+        "symbol" -> resources.symbol
+        "phrases" -> resources.phrases
+        "voice" -> resources.voice
+        "cursor" -> resources.cursor
+        "undo" -> resources.undo
+        "redo" -> resources.redo
+        "palette" -> resources.palette
+        "traditional_chinese" -> resources.traditionalChinese
+        "command_panel" -> resources.commandPanel
+        "voice_plugin" -> resources.voicePlugin
+        "menu" -> resources.menu
+        "arrow" -> resources.arrow
+        "expand" -> resources.expand
+        "clear" -> resources.clear
+        "search" -> resources.search
+        // 非资产 id → Material Symbols 注册表（先经别名层规范化）；
+        // 未知名返回 null。
+        else -> symbolIconProvider?.invoke(
+            IconAlias.resolve(iconId, MaterialSymbols.NAMES.keys) ?: iconId,
+        )
+    }
+
+    /** 展开钮当前图标：皮肤边缘图标走 skinCollapse 分流（见下），此处只回落内置图。 */
+    private fun expandDrawable(): Drawable? = resources.expand
+
+    companion object {
+        /**
+         * 文本编辑态下禁用的中央按钮：与顺序无关、按动作判定
+         * （旧实现按下标 i>=2 写死，中央区可排序后必然错位）。
+         * 集合与改版前一致：复制 / 粘贴 / 剪贴板。
+         */
+        val TEXT_EDIT_DISABLED: Set<PanelAction> = setOf(
+            PanelAction.Copy, PanelAction.Paste, PanelAction.Clipboard,
+        )
+    }
+
+    var pressAlpha: Int = 0
+    var pressCx: Float = 0f
+    var pressCy: Float = 0f
+    var pressRadius: Float = 0f
+    var pressRadiusMax: Float = 0f
+    private val pressPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    /** 样式条背景／边框画笔（审计 B 项）：颜色逐帧由样式写入，不复用涟漪画笔。 */
+    private val styleBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.FILL
+    }
+    private val styleBorderPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+    }
+    // draw 期复用：旧实现每次绘制新建 2-3 个 Paint（工具栏每帧重绘时持续分配）
+    private val copyBgPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val dimTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val trackPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
+    private val segPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    private val searchTextPaint = Paint(Paint.ANTI_ALIAS_FLAG)
+    private val searchLinePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeCap = Paint.Cap.ROUND
+    }
+    // 搜索文本尾部截断缓存：(查询, 可用宽, 字号) -> 显示文本
+    private var searchEllipsizeKey: Triple<String, Float, Float>? = null
+    private var searchEllipsizeValue: String = ""
+    private val addPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { textAlign = Paint.Align.CENTER }
+    // 复制药丸截断缓存：（源文本, 可用宽, 字号）→ 截断结果
+    private var ellipsizeCacheKey: Triple<String, Float, Float>? = null
+    private var ellipsizeCacheValue: String? = null
+
+    override fun draw(
+        canvas: Canvas, width: Int, height: Int, paints: Paints,
+        scrollX: Float, isExpanded: Boolean, density: Float,
+    ) {
+        if (width <= 0 || height <= 0) return
+        // 样式内边距（审计 B 项）：左右叠加到 App 横向内边距上，
+        // 上下决定内容垂直中心；无样式时与旧几何逐字节一致。
+        // 内容矩形与单测共用同一数学（contentRect），绘制与命中
+        // 不得各算一套（命中见 hitTest 主条分支）。
+        val style = toolbarStyle
+        val contentRect = style?.contentRect(
+            width, height, density, (horizontalPaddingDp + 4) * density,
+        )
+        val hPad = contentRect?.left ?: (horizontalPaddingDp + 4) * density
+        val rPad = contentRect?.let { width - it.right } ?: hPad
+        val barCy = contentRect?.cy ?: height / 2f
+        val fixedW = 32f * density
+
+        // 样式条背景（满条画，圆角共用样式值；录制变暗与面板同口径）。
+        // 在涟漪之前画，涟漪压在背景上；剪贴板态（drawClipbar）同样
+        // 以此为条底（其自有内容画在其上），边框只框主条（见文末）。
+        if (style?.background != null) {
+            styleBgPaint.color = dimColor(style.background)
+            val radius = (style.cornerRadiusDp ?: 0f) * density
+            canvas.drawRoundRect(
+                0f, 0f, width.toFloat(), height.toFloat(), radius, radius, styleBgPaint,
+            )
+        }
+
+        // 槽位排列（审计 B 项）：默认左菜单、中央区、右收起；
+        // 皮肤 toolbarLayout 改排列时三槽按新顺序落位，缺失的槽不画。
+        val slots = effectiveSlots()
+        val centerPad = centerHorizontalPaddingDp * density
+        val geo = toolbarSlotGeometry(width, density, hPad, rPad, centerPad, slots)
+        val menuCenter = geo.menuCenter
+        val centerAreaLeft = geo.centerLeft
+        val centerAreaW = geo.centerWidth
+
+        // 隐藏时中间区的按压涟漪一并跳过（首尾槽的涟漪照常）。
+        val centerRippleSuppressed = toolbarHidden &&
+            pressCx in centerAreaLeft..(centerAreaLeft + centerAreaW)
+        if (pressRadius > 0f && pressRadiusMax > 0f && !centerRippleSuppressed) {
+            val progress = (pressRadius / pressRadiusMax).coerceIn(0f, 1f)
+            val currentAlpha = (pressAlpha * (1f - progress)).toInt().coerceIn(0, 255)
+            if (currentAlpha > 0) {
+                pressPaint.color = paints.toolbarPressedColor
+                pressPaint.alpha = currentAlpha
+                canvas.drawCircle(pressCx, pressCy, pressRadius, pressPaint)
+            }
+        }
+
+        if (clipMode) {
+            drawClipbar(canvas, width, height, paints, density)
+            return
+        }
+
+        // 最左侧槽：皮肤展开图标优先（解码失败则回落内置菜单/返回）；
+        // 剪贴板态（drawClipbar）不走此分支，仍用内置返回箭头。
+        // 布局无菜单槽时整段跳过（menuCenter 为 null）。
+        if (menuCenter != null) run {
+            val d = if (textEditingMode || copyText != null || showArrow) resources.arrow else resources.menu
+            if (d != null) {
+                d.setTint(dimColor(paints.toolbarIconColor))
+                val iw = d.intrinsicWidth.toFloat() * iconScale
+                val ih = d.intrinsicHeight.toFloat() * iconScale
+                d.setBounds(
+                    (menuCenter - iw / 2f).toInt(), (barCy - ih / 2f).toInt(),
+                    (menuCenter + iw / 2f).toInt(), (barCy + ih / 2f).toInt(),
+                )
+                d.draw(canvas)
+            }
+        }
+
+        // 隐藏时中间区整段跳过（复制 pill、用户中央区、中央按钮皆不画）；
+        // 首尾固定槽在上下两段照常绘制。
+        if (!toolbarHidden) if (copyText != null) {
+            val t = copyText!!
+            val textPaint = if (recording) dimTextPaint.apply {
+                set(paints.candidateTextPaint)
+                color = dimColor(paints.candidateTextPaint.color)
+            } else paints.candidateTextPaint
+            val bgPaint = copyBgPaint.apply {
+                color = dimColor(paints.candidateBgPaint.color)
+            }
+            val pillR = 6f * density
+            val pillH = 34f * density
+            val pillPad = 8f * density
+            val clipLeft = centerAreaLeft + 16f * density
+            val clipRight = width - rPad - fixedW - centerPad - 16f * density
+            val textCenterY = height / 2f
+            val gap = 8f * density
+            val iconW =
+                (resources.clipboard?.intrinsicWidth?.toFloat()?.times(iconScale)?.toInt() ?: 0)
+            val iconH =
+                (resources.clipboard?.intrinsicHeight?.toFloat()?.times(iconScale)?.toInt() ?: 0)
+            val iconAvail = if (resources.clipboard != null) iconW + gap else 0f
+            val availW = clipRight - clipLeft
+            val maxTextW = availW - iconAvail - pillPad * 2
+            val src = if (t.length > 256) t.take(256) else t
+            // 截断结果缓存：按压动画约 18 帧重绘时 copyText 不变，此前每帧
+            // 都重跑一遍二分（每轮迭代还新建子串+拼接串）
+            val cacheKey = Triple(src, maxTextW, textPaint.textSize)
+            val ellipsized = if (cacheKey == ellipsizeCacheKey) {
+                ellipsizeCacheValue!!
+            } else {
+                val computed = if (textPaint.measureText(src) <= maxTextW) {
+                    src
+                } else {
+                    var lo = 0
+                    var hi = src.length
+                    while (lo < hi) {
+                        val mid = (lo + hi) / 2
+                        if (textPaint.measureText(src.take(mid) + "…") <= maxTextW) lo = mid + 1
+                        else hi = mid
+                    }
+                    src.take((lo - 1).coerceAtLeast(0)) + "…"
+                }
+                ellipsizeCacheKey = cacheKey
+                ellipsizeCacheValue = computed
+                computed
+            }
+            val textW = textPaint.measureText(ellipsized)
+            val totalW = iconAvail + textW
+            val contentLeft = clipLeft + (availW - totalW) / 2f
+            val bgLeft = contentLeft - pillPad
+            val bgRight = contentLeft + totalW + pillPad
+            val bgTop = textCenterY - pillH / 2f
+            val bgBottom = textCenterY + pillH / 2f
+            canvas.drawRoundRect(bgLeft, bgTop, bgRight, bgBottom, pillR, pillR, bgPaint)
+            var drawX = contentLeft
+            if (resources.clipboard != null) {
+                resources.clipboard.setTint(dimColor(paints.toolbarIconColor))
+                val iconTop = (textCenterY - iconH / 2f).toInt()
+                resources.clipboard.setBounds(
+                    drawX.toInt(), iconTop, drawX.toInt() + iconW, iconTop + iconH
+                )
+                resources.clipboard.draw(canvas)
+                drawX += iconW + gap
+            }
+            val textY = textCenterY - (textPaint.descent() + textPaint.ascent()) / 2f
+            canvas.drawText(ellipsized, drawX, textY, textPaint)
+        } else if (userCenter != null) {
+            drawUserCenter(canvas, height, width, paints, density)
+        } else if (ToolbarSlot.CENTER in slots) {
+            // 布局无中央槽时池钮行不画（用户自定义区是用户层，仍画跨度）。
+            // H2-13：只画可见钮（语音键关时不占槽位，其余钮重新均分；
+            // 全隐藏时循环不执行）。
+            val visibleButtons = visibleCenterButtons()
+            val otherW = if (visibleButtons.isEmpty()) 0f else centerAreaW / visibleButtons.size
+            for ((i, btn) in visibleButtons.withIndex()) {
+                val savedColor = paints.toolbarIconColor
+                val disabled = (textEditingMode && btn.action in TEXT_EDIT_DISABLED) || recording
+                // 开关着色（E6）：开关且启用 → 启用色；禁用优先变暗
+                // （与既有 disabled 分支同 save/restore 口径）。
+                val toggleOn = !disabled && toggleActive?.invoke(btn.action) == true
+                if (disabled) {
+                    paints.toolbarIconColor = (savedColor and 0x00FFFFFF) or 0x62000000.toInt()
+                } else if (toggleOn) {
+                    paints.toolbarIconColor = paints.toolbarActivedColor
+                }
+                btn.draw(
+                    canvas, centerAreaLeft + otherW * i + otherW / 2f,
+                    barCy, paints, density,
+                )
+                if (disabled || toggleOn) {
+                    paints.toolbarIconColor = savedColor
+                }
+            }
+        }
+
+        val expandCenter = geo.closeCenter
+        // 最右侧槽：皮肤收起图标优先（资产 > 符号名 > 结构覆盖），
+        // 均缺失回落内置收起图；展开态仍旋转 180°（与内置图行为一致）。
+        // 布局无收起槽时整段跳过。
+        val expandIcon = expandDrawable()
+        if (expandCenter != null && expandIcon != null) {
+            expandIcon.setTint(paints.toolbarIconColor)
+            val iw = expandIcon.intrinsicWidth.toFloat() * iconScale
+            val ih = expandIcon.intrinsicHeight.toFloat() * iconScale
+            expandIcon.setBounds(
+                (expandCenter - iw / 2f).toInt(), (barCy - ih / 2f).toInt(),
+                (expandCenter + iw / 2f).toInt(), (barCy + ih / 2f).toInt(),
+            )
+            if (!textEditingMode && isExpanded) {
+                canvas.withRotation(180f, expandCenter, barCy) { expandIcon.draw(this) }
+            } else {
+                expandIcon.draw(canvas)
+            }
+        }
+
+        // 样式边框（主条末尾画，压在内容上框住整条；剪贴板态
+        // 已在 drawClipbar 提前返回，不框剪贴板条）。
+        if (style?.borderColor != null && (style.borderWidthDp ?: 0f) > 0f) {
+            val bw = style.borderWidthDp!! * density
+            styleBorderPaint.color = style.borderColor
+            styleBorderPaint.strokeWidth = bw
+            val radius = (style.cornerRadiusDp ?: 0f) * density
+            val half = bw / 2f
+            canvas.drawRoundRect(
+                half, half, width - half, height - half, radius, radius, styleBorderPaint,
+            )
+        }
+    }
+
+    private fun drawClipbar(
+        canvas: Canvas, width: Int, height: Int, paints: Paints, density: Float,
+    ) {
+        val hPad = (horizontalPaddingDp + 4) * density
+        val fixedW = 32f * density
+        val menuCenter = hPad + fixedW / 2f
+        val g = clipGeom(width, height, density)
+
+        // 返回箭头
+        resources.arrow?.let { d ->
+            d.setTint(dimColor(paints.toolbarIconColor))
+            val iw = d.intrinsicWidth.toFloat() * iconScale
+            val ih = d.intrinsicHeight.toFloat() * iconScale
+            d.setBounds(
+                (menuCenter - iw / 2f).toInt(), (height / 2f - ih / 2f).toInt(),
+                (menuCenter + iw / 2f).toInt(), (height / 2f + ih / 2f).toInt(),
+            )
+            d.draw(canvas)
+        }
+
+        if (clipSearchMode) {
+            drawClipSearchbar(canvas, g, height, paints, density)
+            drawClipClose(canvas, g, height, paints, density)
+            return
+        }
+
+        if (clipEditMode) {
+            drawClipEditbar(canvas, g, height, paints, density)
+            drawClipClose(canvas, g, height, paints, density)
+            return
+        }
+
+        if (clipMultiMode) {
+            drawClipMultibar(canvas, g, height, paints, density)
+            drawClipClose(canvas, g, height, paints, density)
+            return
+        }
+
+        if (clipReorderMode) {
+            drawClipReorderbar(canvas, g, height, paints, density)
+            drawClipClose(canvas, g, height, paints, density)
+            return
+        }
+
+        // 胶囊（剪切板 / 快捷短语）
+        trackPaint.color = paints.toolbarIconColor and 0x1FFFFFFF
+        canvas.drawRoundRect(
+            g.capsuleLeft,
+            g.capsuleTop,
+            g.capsuleRight,
+            g.capsuleTop + g.capsuleH,
+            g.capsuleH / 2f,
+            g.capsuleH / 2f,
+            trackPaint
+        )
+        val segW = (g.capsuleRight - g.capsuleLeft) / 2f
+        val cy = g.capsuleTop + g.capsuleH / 2f
+        val segPaint = this.segPaint
+        // 两段标签直接展开绘制（此前每帧现建 List+Pair，与本文件绘制期
+        // 复用的约定不一致）
+        for (i in 0..1) {
+            val label = if (i == 0) clipLabelClipboard else clipLabelPhrase
+            val selected = (i == 0) == (clipTab == ClipboardTab.CLIPBOARD)
+            val segLeft = g.capsuleLeft + segW * i
+            val segRight = segLeft + segW
+            if (selected) {
+                canvas.drawRoundRect(
+                    segLeft + 3f * density, g.capsuleTop + 3f * density,
+                    segRight - 3f * density, g.capsuleTop + g.capsuleH - 3f * density,
+                    g.capsuleH / 2f - 3f * density, g.capsuleH / 2f - 3f * density,
+                    pressPaint.apply { color = clipSelectedBgColor; alpha = 255 },
+                )
+            }
+            segPaint.color =
+                if (selected) clipSelectedTextColor else dimColor(paints.toolbarIconColor)
+            segPaint.textSize = 14f * density
+            val fm = segPaint.fontMetrics
+            canvas.drawText(
+                label,
+                (segLeft + segRight) / 2f,
+                cy - fm.ascent / 2f - fm.descent / 2f,
+                segPaint
+            )
+        }
+
+        // 操作按钮：剪切板分页为「搜索（左槽）+清空」，常用语分页为「新增」和「全部删除」
+        val actionCy = height / 2f
+        if (clipTab == ClipboardTab.CLIPBOARD) {
+            resources.search?.let { d ->
+                drawActionIcon(canvas, d, actionSlotCenter(g, 1, density), actionCy, paints, density)
+            }
+            resources.clear?.let { d ->
+                drawActionIcon(canvas, d, actionSlotCenter(g, 0, density), actionCy, paints, density)
+            }
+        } else {
+            addPaint.textSize = 22f * density
+            addPaint.color = dimColor(paints.toolbarIconColor)
+            canvas.drawText(
+                "＋",
+                actionSlotCenter(g, 1, density),
+                actionCy - addPaint.ascent() / 2f - addPaint.descent() / 2f,
+                addPaint,
+            )
+            resources.clear?.let { d ->
+                drawActionIcon(canvas, d, actionSlotCenter(g, 0, density), actionCy, paints, density)
+            }
+        }
+
+        // 关闭键盘按钮（始终显示）
+        drawClipClose(canvas, g, height, paints, density)
+    }
+
+    private fun drawClipClose(
+        canvas: Canvas, g: ClipGeom, height: Int, paints: Paints, density: Float,
+    ) {
+        resources.expand?.let { d ->
+            d.setTint(dimColor(paints.toolbarIconColor))
+            val iw = d.intrinsicWidth.toFloat() * iconScale
+            val ih = d.intrinsicHeight.toFloat() * iconScale
+            d.setBounds(
+                (g.closeLeft + (g.closeRight - g.closeLeft - iw) / 2f).toInt(),
+                (height / 2f - ih / 2f).toInt(),
+                (g.closeLeft + (g.closeRight - g.closeLeft + iw) / 2f).toInt(),
+                (height / 2f + ih / 2f).toInt(),
+            )
+            d.draw(canvas)
+        }
+    }
+
+    /** 搜索态：胶囊区改画搜索框（图标+查询文本+尾部光标），动作区 slot0 画清除叉。 */
+    private fun drawClipSearchbar(
+        canvas: Canvas, g: ClipGeom, height: Int, paints: Paints, density: Float,
+    ) {
+        val fieldLeft = g.capsuleLeft
+        val fieldRight = g.actionLeft - 6f * density
+        val fieldTop = g.capsuleTop
+        val fieldH = g.capsuleH
+        trackPaint.color = paints.toolbarIconColor and 0x1FFFFFFF
+        canvas.drawRoundRect(
+            fieldLeft, fieldTop, fieldRight, fieldTop + fieldH,
+            fieldH / 2f, fieldH / 2f, trackPaint
+        )
+        val cy = fieldTop + fieldH / 2f
+        // 左侧放大镜
+        resources.search?.let { d ->
+            d.setTint(dimColor(paints.toolbarIconColor))
+            val size = 16f * density
+            val cx = fieldLeft + 16f * density
+            d.setBounds(
+                (cx - size / 2f).toInt(), (cy - size / 2f).toInt(),
+                (cx + size / 2f).toInt(), (cy + size / 2f).toInt(),
+            )
+            d.draw(canvas)
+        }
+        // 查询文本（或 hint）：超宽时保留尾部（最新输入在尾端）
+        val textPaint = searchTextPaint
+        textPaint.textSize = 14f * density
+        val textLeft = fieldLeft + 28f * density
+        val textRight = fieldRight - 10f * density
+        val availW = (textRight - textLeft).coerceAtLeast(0f)
+        val q = clipSearchQuery
+        val showing: String
+        if (q.isEmpty()) {
+            textPaint.color = dimColor(paints.toolbarIconColor)
+            showing = clipSearchHint
+            val fm = textPaint.fontMetrics
+            canvas.drawText(showing, textLeft, cy - fm.ascent / 2f - fm.descent / 2f, textPaint)
+        } else {
+            textPaint.color = paints.toolbarIconColor
+            val key = Triple(q, availW, textPaint.textSize)
+            showing = if (key == searchEllipsizeKey) {
+                searchEllipsizeValue
+            } else {
+                var s = q
+                while (s.isNotEmpty() && textPaint.measureText(s) > availW) s = s.drop(1)
+                searchEllipsizeKey = key
+                searchEllipsizeValue = s
+                s
+            }
+            val fm = textPaint.fontMetrics
+            val baseline = cy - fm.ascent / 2f - fm.descent / 2f
+            canvas.drawText(showing, textLeft, baseline, textPaint)
+            // 尾部光标（静态竖线，表达可继续输入）
+            val cursorX = textLeft + textPaint.measureText(showing) + 2f * density
+            searchLinePaint.color = paints.toolbarIconColor
+            searchLinePaint.strokeWidth = 1.6f * density
+            val halfTextH = (fm.descent - fm.ascent) / 2f * 0.8f
+            canvas.drawLine(cursorX, cy - halfTextH, cursorX, cy + halfTextH, searchLinePaint)
+        }
+        // 动作区 slot0：清除叉（两条对角线，不依赖字体字形）
+        val xCenter = actionSlotCenter(g, 0, density)
+        val half = 6f * density
+        searchLinePaint.color = dimColor(paints.toolbarIconColor)
+        searchLinePaint.strokeWidth = 1.6f * density
+        canvas.drawLine(xCenter - half, cy - half, xCenter + half, cy + half, searchLinePaint)
+        canvas.drawLine(xCenter - half, cy + half, xCenter + half, cy - half, searchLinePaint)
+    }
+
+    /**
+     * 编辑态：胶囊区只画一行提示（条目全文在上方列表区多行编辑），
+     * 动作区两槽画「取消 / 保存」文字（slot1=取消、slot0=保存，
+     * 与 hitTest 的槽位判定一致：靠右 btnW 内为 slot0）。
+     */
+    private fun drawClipEditbar(
+        canvas: Canvas, g: ClipGeom, height: Int, paints: Paints, density: Float,
+    ) {
+        val cy = height / 2f
+        val textPaint = searchTextPaint
+        textPaint.textSize = 14f * density
+        textPaint.color = dimColor(paints.toolbarIconColor)
+        val fm = textPaint.fontMetrics
+        canvas.drawText(
+            clipEditHint, g.capsuleLeft + 4f * density,
+            cy - fm.ascent / 2f - fm.descent / 2f, textPaint
+        )
+        drawClipTextAction(canvas, actionSlotCenter(g, 1, density), cy, clipCancelLabel, paints, density)
+        drawClipTextAction(canvas, actionSlotCenter(g, 0, density), cy, clipEditSaveLabel, paints, density)
+    }
+
+    /** 多选态：胶囊区画已选计数文本，动作区两槽画「取消 / 删除」文字。 */
+    private fun drawClipMultibar(
+        canvas: Canvas, g: ClipGeom, height: Int, paints: Paints, density: Float,
+    ) {
+        val cy = height / 2f
+        val textPaint = searchTextPaint
+        textPaint.textSize = 14f * density
+        textPaint.color = paints.toolbarIconColor
+        val fm = textPaint.fontMetrics
+        canvas.drawText(
+            clipMultiLabel, g.capsuleLeft + 4f * density,
+            cy - fm.ascent / 2f - fm.descent / 2f, textPaint
+        )
+        drawClipTextAction(canvas, actionSlotCenter(g, 1, density), cy, clipCancelLabel, paints, density)
+        drawClipTextAction(canvas, actionSlotCenter(g, 0, density), cy, clipDeleteLabel, paints, density)
+    }
+
+    private fun drawClipReorderbar(
+        canvas: Canvas, g: ClipGeom, height: Int, paints: Paints, density: Float,
+    ) {
+        val cy = height / 2f
+        val textPaint = searchTextPaint
+        textPaint.textSize = 14f * density
+        textPaint.color = paints.toolbarIconColor
+        val fm = textPaint.fontMetrics
+        canvas.drawText(
+            clipReorderLabel, g.capsuleLeft + 4f * density,
+            cy - fm.ascent / 2f - fm.descent / 2f, textPaint
+        )
+        drawClipTextAction(canvas, actionSlotCenter(g, 1, density), cy, clipDoneLabel, paints, density)
+    }
+
+    /** 动作槽文字按钮（编辑/多选栏共用）：居中 14sp 文字。 */
+    private fun drawClipTextAction(
+        canvas: Canvas, cx: Float, cy: Float, label: String, paints: Paints, density: Float,
+    ) {
+        if (label.isEmpty()) return
+        val p = searchTextPaint
+        p.textSize = 14f * density
+        p.color = paints.toolbarIconColor
+        val w = p.measureText(label)
+        val fm = p.fontMetrics
+        canvas.drawText(label, cx - w / 2f, cy - fm.ascent / 2f - fm.descent / 2f, p)
+    }
+
+    override fun hitTest(
+        x: Float, y: Float, width: Int, height: Int,
+        scrollX: Float, isExpanded: Boolean, density: Float,
+    ): KawaiiPanel.TouchResult? {
+        if (width <= 0) return null
+        val hPad = (horizontalPaddingDp + 4) * density
+        val fixedW = 32f * density
+        val edgeTouchW = 48f * density
+        val clipMenuCenter = hPad + fixedW / 2f
+        val clipCloseCenter = width - hPad - fixedW / 2f
+        val clipMenuTouchLeft = (clipMenuCenter - edgeTouchW / 2f).coerceAtLeast(0f)
+        val clipMenuTouchRight = (clipMenuCenter + edgeTouchW / 2f).coerceAtMost(width.toFloat())
+        val clipCloseTouchLeft = (clipCloseCenter - edgeTouchW / 2f).coerceAtLeast(0f)
+        val clipCloseTouchRight = (clipCloseCenter + edgeTouchW / 2f).coerceAtMost(width.toFloat())
+
+        if (clipMode) {
+            val g = clipGeom(width, height, density)
+            val setPress = { cx: Float ->
+                pressCx = cx
+                pressCy = height / 2f
+                pressRadiusMax = height * 0.55f
+                pressRadius = 0f
+            }
+            if (clipSearchMode) {
+                // 搜索态：左箭头=退出搜索，动作区 slot0=清除查询/退出，
+                // slot1 与搜索框本身点击无动作，收起键照常
+                if (x in clipMenuTouchLeft..clipMenuTouchRight) {
+                    setPress(clipMenuCenter)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipSearchExit, tapX = x, tapY = y
+                    )
+                }
+                if (x in g.actionLeft..g.actionRight) {
+                    val btnW = 30f * density
+                    if (x < g.actionRight - btnW) return null
+                    setPress(actionSlotCenter(g, 0, density))
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipSearchClear, tapX = x, tapY = y
+                    )
+                }
+                if (x in clipCloseTouchLeft..clipCloseTouchRight) {
+                    setPress((g.closeLeft + g.closeRight) / 2f)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.CloseKeyboard, tapX = x, tapY = y
+                    )
+                }
+                return null
+            }
+            if (clipEditMode) {
+                // 编辑态：左箭头=取消编辑，动作区 slot1=取消、slot0=保存，
+                // 编辑框本身点击无动作，收起键照常
+                if (x in clipMenuTouchLeft..clipMenuTouchRight) {
+                    setPress(clipMenuCenter)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipEditCancel, tapX = x, tapY = y
+                    )
+                }
+                if (x in g.actionLeft..g.actionRight) {
+                    val btnW = 30f * density
+                    val slot0 = x >= g.actionRight - btnW
+                    setPress(actionSlotCenter(g, if (slot0) 0 else 1, density))
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        if (slot0) PanelAction.ClipEditSave else PanelAction.ClipEditCancel,
+                        tapX = x, tapY = y
+                    )
+                }
+                if (x in clipCloseTouchLeft..clipCloseTouchRight) {
+                    setPress((g.closeLeft + g.closeRight) / 2f)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.CloseKeyboard, tapX = x, tapY = y
+                    )
+                }
+                return null
+            }
+            if (clipMultiMode) {
+                // 多选态：左箭头=退出多选，动作区 slot1=退出、slot0=删除所选，
+                // 胶囊区点击无动作，收起键照常
+                if (x in clipMenuTouchLeft..clipMenuTouchRight) {
+                    setPress(clipMenuCenter)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipMultiExit, tapX = x, tapY = y
+                    )
+                }
+                if (x in g.actionLeft..g.actionRight) {
+                    val btnW = 30f * density
+                    val slot0 = x >= g.actionRight - btnW
+                    setPress(actionSlotCenter(g, if (slot0) 0 else 1, density))
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        if (slot0) PanelAction.ClipMultiDelete else PanelAction.ClipMultiExit,
+                        tapX = x, tapY = y
+                    )
+                }
+                if (x in clipCloseTouchLeft..clipCloseTouchRight) {
+                    setPress((g.closeLeft + g.closeRight) / 2f)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.CloseKeyboard, tapX = x, tapY = y
+                    )
+                }
+                return null
+            }
+            if (clipReorderMode) {
+                // 排序态：左箭头与动作区（完成）都退出排序，收起键照常
+                if (x in clipMenuTouchLeft..clipMenuTouchRight) {
+                    setPress(clipMenuCenter)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipReorderExit, tapX = x, tapY = y
+                    )
+                }
+                if (x in g.actionLeft..g.actionRight) {
+                    setPress(actionSlotCenter(g, 1, density))
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.ClipReorderExit, tapX = x, tapY = y
+                    )
+                }
+                if (x in clipCloseTouchLeft..clipCloseTouchRight) {
+                    setPress((g.closeLeft + g.closeRight) / 2f)
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        PanelAction.CloseKeyboard, tapX = x, tapY = y
+                    )
+                }
+                return null
+            }
+            if (x in clipMenuTouchLeft..clipMenuTouchRight) {
+                setPress(clipMenuCenter)
+                return KawaiiPanel.TouchResult.ToolbarAction(
+                    menuSlotAction(MenuAction.MENU),
+                    tapX = x, tapY = y
+                )
+            }
+            if (x in g.capsuleLeft..g.capsuleRight && y in g.capsuleTop..(g.capsuleTop + g.capsuleH)) {
+                val segW = (g.capsuleRight - g.capsuleLeft) / 2f
+                setPress(g.capsuleLeft + (if (x < g.capsuleLeft + segW) segW / 2f else segW + segW / 2f))
+                val isClipboard = x < g.capsuleLeft + segW
+                return KawaiiPanel.TouchResult.ToolbarAction(
+                    PanelAction.ClipTab(isClipboard), tapX = x, tapY = y
+                )
+            }
+            if (x in g.actionLeft..g.actionRight) {
+                val action = if (clipTab == ClipboardTab.CLIPBOARD) {
+                    val btnW = 30f * density
+                    val slot = if (x > g.actionRight - btnW) 0 else 1
+                    setPress(actionSlotCenter(g, slot, density))
+                    if (slot == 0) PanelAction.ClearClipboard else PanelAction.ClipSearch
+                } else {
+                    val btnW = 30f * density
+                    val slot = if (x > g.actionRight - btnW) 0 else 1
+                    setPress(actionSlotCenter(g, slot, density))
+                    if (slot == 0) PanelAction.ClearPhrases else PanelAction.AddPhrase
+                }
+                return KawaiiPanel.TouchResult.ToolbarAction(action, tapX = x, tapY = y)
+            }
+            if (x in clipCloseTouchLeft..clipCloseTouchRight) {
+                setPress((g.closeLeft + g.closeRight) / 2f)
+                return KawaiiPanel.TouchResult.ToolbarAction(
+                    PanelAction.CloseKeyboard, tapX = x, tapY = y
+                )
+            }
+            return null
+        }
+
+        // 主条生效几何（审计 B 项）：与 draw 同口径的样式内边距；
+        // 剪贴板态已在上文提前返回，不走此分支。
+        val style = toolbarStyle
+        val effLeftPadDp = horizontalPaddingDp + (style?.insets?.left ?: 0f)
+        val effRightPadDp = horizontalPaddingDp + (style?.insets?.right ?: 0f)
+        val barCy = if (style == null) {
+            height / 2f
+        } else {
+            ((style.insets.top * density) + (height - style.insets.bottom * density)) / 2f
+        }
+        val effHPad = (effLeftPadDp + 4) * density
+        val effRPad = (effRightPadDp + 4) * density
+        // 槽位几何（审计 B 项）：与 draw 同一套排列与内边距。
+        val slots = effectiveSlots()
+        val centerPad = centerHorizontalPaddingDp * density
+        val geo = toolbarSlotGeometry(width, density, effHPad, effRPad, centerPad, slots)
+        val centerAreaLeft = geo.centerLeft
+        val centerAreaW = geo.centerWidth
+        // H2-13：命中与绘制同取可见表（语音键关时不占槽位）。
+        val visibleButtons = visibleCenterButtons()
+        val otherW = if (visibleButtons.isEmpty()) 0f else centerAreaW / visibleButtons.size
+
+        // 隐藏时中间区命中一律压制（首尾槽照常）；分区几何与上文同口径。
+        if (toolbarCenterHitSuppressed(
+                toolbarHidden,
+                toolbarHitRegionLayout(x, width, density, effLeftPadDp, effRightPadDp, centerHorizontalPaddingDp, slots),
+            )
+        ) return null
+
+        val closeCenter = geo.closeCenter
+        val menuCenter = geo.menuCenter
+        val closeTouchLeft = closeCenter?.let { (it - edgeTouchW / 2f).coerceAtLeast(0f) }
+        val closeTouchRight = closeCenter?.let { (it + edgeTouchW / 2f).coerceAtMost(width.toFloat()) }
+        val menuTouchLeft = menuCenter?.let { (it - edgeTouchW / 2f).coerceAtLeast(0f) }
+        val menuTouchRight = menuCenter?.let { (it + edgeTouchW / 2f).coerceAtMost(width.toFloat()) }
+        if (closeCenter != null && closeTouchLeft != null && closeTouchRight != null &&
+            x in closeTouchLeft..closeTouchRight
+        ) {
+            pressCx = closeCenter
+            pressCy = barCy
+            pressRadiusMax = height * 0.55f
+            pressRadius = 0f
+            return KawaiiPanel.TouchResult.ToolbarAction(
+                PanelAction.CloseKeyboard,
+                tapX = x,
+                tapY = y,
+            )
+        }
+        if (menuCenter != null && menuTouchLeft != null && menuTouchRight != null &&
+            x in menuTouchLeft..menuTouchRight
+        ) {
+            pressCx = menuCenter
+            pressCy = barCy
+            pressRadiusMax = height * 0.55f
+            pressRadius = 0f
+            return KawaiiPanel.TouchResult.ToolbarAction(
+                menuSlotAction(MenuAction.MENU),
+                tapX = x,
+                tapY = y,
+            )
+        }
+        if (copyText != null) return null
+        // 用户覆盖中央区：池钮走既有动作路；自定义钮返回 null
+        // （手势归 View 的自定义手势机，命中探针走 userCenterHit）。
+        // 用户层高于皮肤层：自定义区在跨度内仍命中，不受中央槽缺失影响。
+        if (userCenter != null) {
+                    val slots = userCenterSlots(width, density) ?: return null
+                    val slot = slots.firstOrNull {
+                        x in it.left..it.right && it.right > it.left
+                    } ?: return null
+                    val pool = slot.item as? UserCenterItem.Pool ?: return null
+                    if (textEditingMode && pool.action in TEXT_EDIT_DISABLED) {
+                        return null
+                    }
+                    pressCx = (slot.left + slot.right) / 2f
+                    pressCy = barCy
+                    pressRadiusMax = height * 0.55f
+                    pressRadius = 0f
+                    return KawaiiPanel.TouchResult.ToolbarAction(
+                        pool.action,
+                        tapX = x,
+                        tapY = y,
+                    )
+                }
+                // 布局无中央槽时池钮行不命中（与绘制一致）。
+                if (ToolbarSlot.CENTER !in slots) return null
+                val index = ((x - centerAreaLeft) / otherW).toInt()
+                    .takeIf { it in visibleButtons.indices } ?: return null
+                if (textEditingMode && visibleButtons[index].action in TEXT_EDIT_DISABLED) return null
+                pressCx = centerAreaLeft + otherW * index + otherW / 2f
+                pressCy = barCy
+                pressRadiusMax = height * 0.55f
+                pressRadius = 0f
+                return KawaiiPanel.TouchResult.ToolbarAction(
+                    visibleButtons[index].action,
+                    tapX = x,
+                    tapY = y,
+                )
+    }
+
+    var showArrow: Boolean = false
+}

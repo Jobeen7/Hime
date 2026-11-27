@@ -1,0 +1,206 @@
+package com.jobeen.hime.ui
+
+import android.net.Uri
+import android.os.Bundle
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.Composable
+import androidx.lifecycle.lifecycleScope
+import com.jobeen.hime.R
+import com.jobeen.hime.base.util.ToastUtil
+import com.jobeen.hime.data.backup.BackupManager
+import com.jobeen.hime.error.DeepErrorMapper
+import com.jobeen.hime.data.backup.readBackupBytes
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.ui.screen.BackupScreen
+import com.jobeen.hime.ui.screen.BackupUiState
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import timber.log.Timber
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+/**
+ * 备份与还原：口令在对话框收集，本类负责 SAF 文件读写与加解密调用。
+ * 还原成功后杀掉主进程重启——各设置管理器有内存缓存、键盘服务也在本
+ * 进程，重启是让覆盖后的设置整体生效的最可靠方式（系统会自动拉起键盘）。
+ */
+class BackupActivity : ImeActivity() {
+    private val uiState = BackupUiState()
+    // U-S4：备份口令／还原 URI 是 SAF 回调的待办输入，必须随实例状态保存——
+    // 原先只是 Activity 普通字段，旋转或外观 recreate() 时丢失，SAF 回调
+    // 随后静默丢单（备份什么都没写、还原不弹口令框）。
+    private var pendingBackupPassword: CharArray? = null
+    private var pendingRestoreUri: Uri? = null
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        pendingBackupPassword?.let { outState.putCharArray(KEY_PENDING_PASSWORD, it) }
+        pendingRestoreUri?.let { outState.putParcelable(KEY_PENDING_RESTORE_URI, it) }
+    }
+
+    private val createDocumentLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/octet-stream")
+    ) { uri: Uri? ->
+        val password = pendingBackupPassword
+        pendingBackupPassword = null
+        if (uri != null && password != null) {
+            doCreateBackup(uri, password)
+        } else {
+            password?.fill(' ')
+        }
+    }
+
+    private val openDocumentLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            pendingRestoreUri = uri
+            uiState.showRestorePasswordDialog = true
+        }
+    }
+
+
+    override fun onCreateBeforeContent(savedInstanceState: Bundle?) {
+        // U-S4：重建时恢复 SAF 待办输入；还原 URI 在则重弹口令框，
+        // 否则用户选好文件后无处输口令。
+        pendingBackupPassword = savedInstanceState?.getCharArray(KEY_PENDING_PASSWORD)
+        @Suppress("DEPRECATION")
+        pendingRestoreUri = savedInstanceState?.getParcelable(KEY_PENDING_RESTORE_URI)
+        if (pendingRestoreUri != null) {
+            uiState.showRestorePasswordDialog = true
+        }
+        observeRestoreState()
+        observeInterruptedRestore()
+    }
+
+    @Composable
+    override fun Content() {
+        BackupScreen(
+            state = uiState,
+            onBack = { finish() },
+            onCreateBackup = { password ->
+                pendingBackupPassword = password.toCharArray()
+                val stamp = SimpleDateFormat("yyyyMMdd-HHmm", Locale.US).format(Date())
+                createDocumentLauncher.launch("hime-backup-$stamp.${BackupManager.FILE_EXTENSION}")
+            },
+            onPickRestoreFile = {
+                openDocumentLauncher.launch(arrayOf("*/*"))
+            },
+            onRestoreWithPassword = { password ->
+                val uri = pendingRestoreUri
+                pendingRestoreUri = null
+                if (uri != null) doRestore(uri, password.toCharArray())
+            },
+            onRollbackInterruptedRestore = {
+                BackupManager.startRollbackInterruptedRestore()
+            },
+            onDismissInterruptedRestore = {
+                BackupManager.dismissInterruptedRestore()
+            },
+        )
+    }
+
+    private fun doCreateBackup(uri: Uri, password: CharArray) {
+        uiState.busyText = getString(R.string.backup_working_create)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                val backup = BackupManager.createBackup(password)
+                password.fill(' ')
+                val written = contentResolver.openOutputStream(uri)?.use { out ->
+                    out.write(backup.bytes)
+                    true
+                } ?: false
+                withContext(Dispatchers.Main) {
+                    uiState.busyText = null
+                    ToastUtil.showToast(
+                        if (!written) getString(R.string.backup_write_failed)
+                        else getString(R.string.backup_done)
+                    )
+                }
+            } catch (e: Exception) {
+                password.fill(' ')
+                // 取消重抛（S-M1）：不吞取消、不报失败 toast（口令已清）。
+                if (e is CancellationException) throw e
+                Timber.w(e, "Create backup failed")
+                withContext(Dispatchers.Main) {
+                    uiState.busyText = null
+                    ToastUtil.showToast(getString(R.string.backup_failed, DeepErrorMapper.userMessage(this@BackupActivity, e)))
+                }
+            }
+        }
+    }
+
+    private fun doRestore(uri: Uri, password: CharArray) {
+        uiState.busyText = getString(R.string.backup_working_restore)
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // 流式读取并在读入过程中执行 64MB 硬上限：超大文件在超限
+                // 当刻即中止，不会先全量读入内存才被大小检查拦下
+                val bytes = contentResolver.openInputStream(uri)?.use { readBackupBytes(it) }
+                    ?: throw BackupManager.BackupException("无法读取备份文件")
+                // 还原本体交给应用级作用域执行：旋转/退出本页不再取消
+                // 还原（旧实现挂在本页作用域上，旋转会把还原与回滚一并
+                // 腰斩，留下半还原状态）。结果经 restoreState 回报，
+                // 由 onCreate 的收集器统一处理。
+                BackupManager.startRestore(bytes, password)
+            } catch (e: Exception) {
+                password.fill(' ')
+                // 取消重抛（S-M1）：不吞取消、不报失败 toast（口令已清）。
+                if (e is CancellationException) throw e
+                Timber.w(e, "Read backup file failed")
+                withContext(Dispatchers.Main) {
+                    uiState.busyText = null
+                    ToastUtil.showToast(getString(R.string.backup_restore_failed, DeepErrorMapper.userMessage(this@BackupActivity, e)))
+                }
+            }
+        }
+    }
+
+    companion object {
+        private const val KEY_PENDING_PASSWORD = "pending_backup_password"
+        private const val KEY_PENDING_RESTORE_URI = "pending_restore_uri"
+    }
+
+    /** 观察应用级还原状态：终态统一在这里提示/重启并消费掉。 */
+    private fun observeRestoreState() {
+        lifecycleScope.launch {
+            BackupManager.restoreState.collect { state ->
+                when (state) {
+                    BackupManager.RestoreState.Running ->
+                        uiState.busyText = getString(R.string.backup_working_restore)
+                    is BackupManager.RestoreState.Done -> {
+                        BackupManager.consumeRestoreState()
+                        uiState.busyText = null
+                        ToastUtil.showToast(
+                            if (state.skippedAiMessages > 0) {
+                                getString(R.string.backup_restore_done_skipped, state.skippedAiMessages)
+                            } else {
+                                getString(R.string.backup_restore_done)
+                            }
+                        )
+                        // 进程重启由 BackupManager 在置 Done 时自行安排：
+                        // 离开本页的用户收不到这条观察，重启不能只挂在这里
+                    }
+                    is BackupManager.RestoreState.Failed -> {
+                        BackupManager.consumeRestoreState()
+                        uiState.busyText = null
+                        ToastUtil.showToast(getString(R.string.backup_restore_failed, DeepErrorMapper.userMessageForMessage(this@BackupActivity, state.message)))
+                    }
+                    BackupManager.RestoreState.Idle -> Unit
+                }
+            }
+        }
+    }
+
+    /** 观察中断还原提示（D-S2）：启动对账检出 REPLACING journal 时置位，本页顶部显示横幅。 */
+    private fun observeInterruptedRestore() {
+        lifecycleScope.launch {
+            BackupManager.interruptedRestore.collect { info ->
+                uiState.interruptedRestore = info
+            }
+        }
+    }
+}

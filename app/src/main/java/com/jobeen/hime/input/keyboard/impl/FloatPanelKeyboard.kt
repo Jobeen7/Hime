@@ -1,0 +1,68 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.input.keyboard.impl
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.res.Configuration
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.input.keyboard.key.KeyDef
+import com.jobeen.hime.input.keyboard.key.KeyDef.Appearance.Variant
+import com.jobeen.hime.input.keyboard.key.KeyboardAction
+import com.jobeen.hime.skin.runtime.SkinColorMode
+
+/**
+ * 悬浮面板（工具类型 floatPanel 的无绑定回退视图）：
+ * 对端面板的钮多为对端应用内 URL（设置／文件／脚本／性能等），
+ * 无法移植；本板只取可移植子集——键盘设置、方案切换、符号板、
+ * 表情板四钮（状态面板 #RimeSwitcher 在 Hime 无对应物，不列）。
+ * 皮肤为 floatPanel 绑定了自定义布局时不走本板。
+ */
+@SuppressLint("ViewConstructor")
+class FloatPanelKeyboard(
+    context: Context,
+    colors: KeyboardColors.ColorScheme,
+    layout: List<List<KeyDef>> = effectiveLayout(context),
+) : BaseKeyboard(context, colors, layout) {
+
+    override fun name(): String = NAME
+
+    companion object {
+        const val NAME = "floatPanel"
+
+        /** 生效布局：与 LayoutSwitchKeyboard 同口径（覆写装配）。 */
+        fun effectiveLayout(context: Context): List<List<KeyDef>> {
+            val raw = buildLayout()
+            return raw
+        }
+
+        /** 出厂行（纯函数）：单行四钮，行宽和恰为 1.0。 */
+        fun buildLayout(): List<List<KeyDef>> = listOf(
+            listOf(
+                actionButton("设置", KeyboardAction.SettingsAction, 0.25f),
+                actionButton("方案", KeyboardAction.RotateSchema, 0.25f),
+                actionButton(
+                    "符号", KeyboardAction.LayoutSwitchAction(SymbolKeyboard.NAME), 0.25f,
+                ),
+                actionButton(
+                    "表情", KeyboardAction.LayoutSwitchAction(EmojiKeyboard.NAME), 0.25f,
+                ),
+            ),
+        )
+
+        private fun actionButton(
+            displayText: String,
+            action: KeyboardAction,
+            percentWidth: Float,
+        ): KeyDef = KeyDef(
+            appearance = KeyDef.Appearance.Text(
+                displayText = displayText,
+                textSize = 18f,
+                percentWidth = percentWidth,
+                variant = Variant.Alternative,
+            ),
+            behaviors = setOf(KeyDef.Behavior.Press(action)),
+        )
+    }
+}

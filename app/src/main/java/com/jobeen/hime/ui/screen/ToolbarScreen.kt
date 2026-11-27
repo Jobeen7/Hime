@@ -1,0 +1,2250 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.ui.screen
+
+import android.content.Context
+import android.net.Uri
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.jobeen.hime.R
+import com.jobeen.hime.input.panel.toolbar.CustomButtonSlot
+import com.jobeen.hime.input.panel.toolbar.CustomDisplayKind
+import com.jobeen.hime.input.panel.toolbar.ToolbarActionBinding
+import com.jobeen.hime.input.panel.toolbar.ToolbarBackground
+import com.jobeen.hime.input.panel.toolbar.ToolbarButtonEntry
+import com.jobeen.hime.input.panel.toolbar.ToolbarConfig
+import com.jobeen.hime.input.panel.toolbar.ToolbarCustomButton
+import com.jobeen.hime.input.panel.toolbar.ToolbarCustomConfig
+import com.jobeen.hime.input.panel.toolbar.ToolbarSkinState
+import com.jobeen.hime.input.panel.toolbar.ToolbarUserData
+import com.jobeen.hime.input.panel.toolbar.ToolbarUserStore
+import com.jobeen.hime.skin.icon.MaterialSymbols
+import com.jobeen.hime.skin.model.WhitelistAction
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.ui.screen.ScreenComponent.GroupCard
+import com.jobeen.hime.ui.screen.ScreenComponent.NavRow
+import com.jobeen.hime.ui.screen.ScreenComponent.SettingsGroup
+import com.jobeen.hime.ui.screen.ScreenComponent.SliderRow
+import com.jobeen.hime.ui.screen.ScreenComponent.SwitchRow
+import java.io.File
+import java.util.UUID
+
+/**
+ * App 内工具栏编辑页（2026-10-29 工具栏编辑轮）。
+ *
+ * 分层与存储见 [ToolbarUserStore]：用户编辑按皮肤 id 分键，
+ * 胜过皮肤工具栏；皮肤未定义处回落出厂默认。编辑在工具栏
+ * 下次刷新时生效（键盘重开或皮肤／主题刷新，与皮肤工具栏
+ * 改动同口径）。本页不设隐藏工具栏开关——Hime 无此能力，
+ * 不造开关。
+ *
+ * 页内导航（单 Activity 内状态机，不另起 Activity）：
+ * 主页 → 编辑按钮／添加按钮／新建自定义按钮／自定义工具栏
+ * → 各表单；返回一律回主页（表单内返回回来源页）。
+ * 切换行为只走选择自定义工具栏对话框（管理页只做新建／编辑
+ * ／删除，不留行内切换入口，避免双入口歧义）。
+ */
+private enum class ToolbarPage {
+    MAIN, EDIT, TOOLBARS,
+}
+
+/**
+ * 编辑草稿列的保存器（U-M1）：ToolbarButtonEntry 只有 ref＋enabled，
+ * 展平成字符串表保存（不拼分隔符，ref 含任意字符也安全），按对还原。
+ */
+private val toolbarEntryListSaver: Saver<List<ToolbarButtonEntry>, List<String>> = Saver(
+    save = { entries -> entries.flatMap { listOf(it.ref, it.enabled.toString()) } },
+    restore = { flat ->
+        flat.chunked(2).mapNotNull { pair ->
+            pair.getOrNull(0)?.let { ToolbarButtonEntry(it, pair.getOrNull(1).toBoolean()) }
+        }
+    },
+)
+private val nullableToolbarEntryListSaver: Saver<List<ToolbarButtonEntry>?, List<String>> = Saver(
+    // 不直接调 toolbarEntryListSaver.save：Saver.save 是 SaverScope 上的
+    // 成员扩展，let 内收不到接收者；直接内联同一段扁平化逻辑。
+    save = { entries -> entries?.flatMap { listOf(it.ref, it.enabled.toString()) } },
+    restore = { flat -> toolbarEntryListSaver.restore(flat) },
+)
+
+/**
+ * 图标覆盖草稿的保存器（与编辑草稿列同式）：map 展平成
+ * [k1, v1, k2, v2, …] 保存，按对还原。
+ */
+private val toolbarIconMapSaver: Saver<Map<String, String>, List<String>> = Saver(
+    save = { map -> map.flatMap { (k, v) -> listOf(k, v) } },
+    restore = { flat ->
+        flat.chunked(2).mapNotNull { pair ->
+            pair.getOrNull(0)?.let { it to (pair.getOrNull(1) ?: "") }
+        }.toMap()
+    },
+)
+
+@Composable
+fun ToolbarScreen(onBack: () -> Unit) {
+    val context = LocalContext.current
+    val storeFile = remember { File(context.filesDir, ToolbarUserStore.FILE_NAME) }
+    val imageDir = remember { File(context.filesDir, ToolbarUserStore.IMAGE_DIR) }
+    // 当前皮肤 id：current() 触发持久化 verified 记录加载，与输入
+    // 服务面板创建后的 peek() 口径一致（设置页进程可能尚未加载
+    // 快照，直接 peek 会误取 builtin 键、与键盘侧串台）。
+    val skinId = remember {
+        ToolbarUserStore.BUILTIN_SKIN_KEY
+    }
+    var data by remember { mutableStateOf(ToolbarUserStore.load(storeFile).data) }
+    // U-M1：页内导航与编辑草稿随页内态保存——旋转不再丢编辑页与未保存
+    // 的草稿（data 本身由防抖盘＋退出刷盘覆盖，不进 rememberSaveable）。
+    // ToolbarPage 是枚举（Serializable），直接保存；草稿列用上方的保存器。
+    var page by rememberSaveable { mutableStateOf(ToolbarPage.MAIN) }
+    // 编辑目标列：null＝当前皮肤默认列；toolbarId＝该自定义栏的列。
+    var editToolbarId by rememberSaveable { mutableStateOf<String?>(null) }
+    // 编辑草稿（仅皮肤默认列起步情形）：seed == null 表示非起步
+    // （用户列非空或自定义栏编辑），草稿即当前列；seed 非空时
+    // 草稿起步于生效列，且仅草稿与起步列不同时才写盘。
+    var editSeed by rememberSaveable(stateSaver = nullableToolbarEntryListSaver) {
+        mutableStateOf<List<ToolbarButtonEntry>?>(null)
+    }
+    var editDraft by rememberSaveable(stateSaver = toolbarEntryListSaver) {
+        mutableStateOf<List<ToolbarButtonEntry>>(emptyList())
+    }
+    // 图标覆盖草稿（与编辑草稿列同步进出编辑页；写盘与列表写盘同目标）。
+    var editIconDraft by rememberSaveable(stateSaver = toolbarIconMapSaver) {
+        mutableStateOf<Map<String, String>>(emptyMap())
+    }
+    // 图标选择对话框目标：null＝关闭；ref＝正在改图标的按钮。
+    var iconPickerRef by rememberSaveable { mutableStateOf<String?>(null) }
+    // 自定义按钮表单目标：null＝新建；id＝编辑既有定义。
+    var customFormId by rememberSaveable { mutableStateOf<String?>(null) }
+    // 自定义栏表单目标：null＝新建；id＝编辑既有栏。
+    var toolbarFormId by rememberSaveable { mutableStateOf<String?>(null) }
+    // 对话框态：添加／自定义按钮表单／自定义栏表单均为对话框（页式入口已拆除）；
+    // customFormId／toolbarFormId 沿用“null＝新建、id＝编辑”语义。
+    var addDialog by rememberSaveable { mutableStateOf(false) }
+    var customFormOpen by rememberSaveable { mutableStateOf(false) }
+    var toolbarFormOpen by rememberSaveable { mutableStateOf(false) }
+    // 选择自定义工具栏对话框（切换唯一入口；管理页不再行内切换）。
+    var selectDialog by rememberSaveable { mutableStateOf(false) }
+
+    fun persist(next: ToolbarUserData) {
+        data = next
+        ToolbarUserStore.saveDebounced(storeFile, next)
+    }
+    // 退出前刷盘：500ms 防抖内返回不丢最后一次编辑。
+    DisposableEffect(Unit) {
+        onDispose { ToolbarUserStore.flush() }
+    }
+
+    fun backToMain() {
+        editToolbarId = null
+        editSeed = null
+        editDraft = emptyList()
+        editIconDraft = emptyMap()
+        iconPickerRef = null
+        page = ToolbarPage.MAIN
+    }
+    BackHandler(enabled = page != ToolbarPage.MAIN) { backToMain() }
+
+    fun currentSkinState(): ToolbarSkinState =
+        data.skins[skinId] ?: ToolbarSkinState()
+
+    fun activeToolbar(): ToolbarCustomConfig? =
+        currentSkinState().activeToolbarId?.let { data.customToolbars[it] }
+
+    fun currentList(): List<ToolbarButtonEntry> =
+        editToolbarId?.let { data.customToolbars[it]?.buttons }
+            ?: currentSkinState().buttons
+
+    /** 当前编辑目标的图标覆盖（皮肤默认列或当前自定义栏）。 */
+    fun currentIcons(): Map<String, String> =
+        editToolbarId?.let { data.customToolbars[it]?.iconOverrides }
+            ?: currentSkinState().iconOverrides
+
+    fun setCurrentList(
+        list: List<ToolbarButtonEntry>,
+        icons: Map<String, String> = currentIcons(),
+    ) {
+        val next = if (editToolbarId == null) {
+            data.copy(
+                skins = data.skins + (
+                    skinId to currentSkinState().copy(buttons = list, iconOverrides = icons)
+                ),
+            )
+        } else {
+            val config = data.customToolbars[editToolbarId] ?: return
+            data.copy(
+                customToolbars = data.customToolbars +
+                    (editToolbarId!! to config.copy(buttons = list, iconOverrides = icons)),
+            )
+        }
+        persist(next)
+    }
+
+    /** 图标覆盖写盘（与列表写盘同目标；图标改动本身即写盘，不受列表起步门控约束）。 */
+    fun setCurrentIcons(icons: Map<String, String>) {
+        setCurrentList(currentList(), icons)
+    }
+
+    /** 图标覆盖提交：草稿＋写盘。 */
+    fun applyEditIcons(icons: Map<String, String>) {
+        editIconDraft = icons
+        setCurrentIcons(icons)
+    }
+
+    /** 进入编辑页：皮肤默认列且用户列为空时以生效列起步（不写盘）；其余用当前列。 */
+    fun enterEdit() {
+        val targetId = currentSkinState().activeToolbarId
+        editToolbarId = targetId
+        editIconDraft = currentIcons()
+        if (targetId == null && currentSkinState().buttons.isEmpty()) {
+            // 皮肤 v3 死壳删除后无皮肤栏按钮 id，起步列恒取默认 5 项。
+            editSeed = ToolbarUserStore.seedEntries(null)
+            editDraft = editSeed!!
+        } else {
+            editSeed = null
+            editDraft = currentList()
+        }
+        page = ToolbarPage.EDIT
+    }
+
+    /** 草稿提交：非起步情形、或草稿与起步列不同时才写盘。 */
+    fun applyEditList(next: List<ToolbarButtonEntry>) {
+        editDraft = next
+        // 删钮连同删其图标覆盖（悬空覆盖渲染层本就忽略，此处顺手清掉、
+        // 不让配置里攒陈旧项；与列表同一次写盘带走）。
+        val pruned = editIconDraft.filterKeys { ref -> next.any { it.ref == ref } }
+        if (pruned != editIconDraft) editIconDraft = pruned
+        if (ToolbarUserStore.shouldPersistEdit(editSeed, next)) setCurrentList(next, pruned)
+    }
+
+    @Composable
+    fun editTitle(): String {
+        val active = editToolbarId?.let { data.customToolbars[it] }
+        return if (active != null) {
+            stringResource(R.string.toolbar_edit_named, active.name)
+        } else {
+            stringResource(R.string.toolbar_edit_buttons)
+        }
+    }
+
+    SettingsPageScaffold(
+        title = stringResource(R.string.toolbar_title),
+        onBack = {
+            if (customFormOpen) customFormOpen = false
+            else if (toolbarFormOpen) toolbarFormOpen = false
+            else if (addDialog) addDialog = false
+            else if (iconPickerRef != null) iconPickerRef = null
+            else if (selectDialog) selectDialog = false
+            else if (page != ToolbarPage.MAIN) backToMain()
+            else onBack()
+        },
+    ) {
+        when (page) {
+            ToolbarPage.MAIN -> ToolbarMainPage(
+                data = data,
+                skinId = skinId,
+                activeToolbar = activeToolbar(),
+                hideToolbar = data.hideToolbar,
+                onHideChange = { persist(data.copy(hideToolbar = it)) },
+                onEditCurrent = { enterEdit() },
+                onOpenToolbars = { page = ToolbarPage.TOOLBARS },
+                onNewToolbar = {
+                    toolbarFormId = null
+                    toolbarFormOpen = true
+                },
+            )
+            ToolbarPage.EDIT -> ToolbarEditPage(
+                title = editTitle(),
+                list = editDraft,
+                icons = editIconDraft,
+                onListChange = ::applyEditList,
+                defOf = { data.customButtons[it] },
+                onAdd = { addDialog = true },
+                onEditCustom = { id ->
+                    customFormId = id
+                    customFormOpen = true
+                },
+                onIconPick = { iconPickerRef = it },
+            )
+            // 添加／自定义按钮表单／自定义栏表单均为对话框（见 when 后的对话框挂载），
+            // 此处不再有页分支。
+            ToolbarPage.TOOLBARS -> ToolbarToolbarsPage(
+                data = data,
+                activeId = currentSkinState().activeToolbarId,
+                skinId = skinId,
+                onSelect = { selectDialog = true },
+                onOpenForm = { id ->
+                    toolbarFormId = id
+                    toolbarFormOpen = true
+                },
+                onNew = {
+                    toolbarFormId = null
+                    toolbarFormOpen = true
+                },
+            )
+        }
+        if (addDialog) {
+            ToolbarAddDialog(
+                list = editDraft,
+                customButtons = data.customButtons,
+                onAddPool = { id ->
+                    applyEditList(editDraft + ToolbarButtonEntry(id))
+                    addDialog = false
+                },
+                onAddCustom = { id ->
+                    applyEditList(editDraft + ToolbarButtonEntry(id))
+                    addDialog = false
+                },
+                onNewCustom = {
+                    customFormId = null
+                    customFormOpen = true
+                    addDialog = false
+                },
+                onDismiss = { addDialog = false },
+            )
+        }
+        if (iconPickerRef != null) {
+            ToolbarIconPickerDialog(
+                ref = iconPickerRef!!,
+                current = editIconDraft[iconPickerRef],
+                imageDir = imageDir,
+                onSelect = { iconId ->
+                    val ref = iconPickerRef!!
+                    val next = if (iconId == null) editIconDraft - ref
+                    else editIconDraft + (ref to iconId)
+                    applyEditIcons(next)
+                    iconPickerRef = null
+                },
+                onDismiss = { iconPickerRef = null },
+            )
+        }
+        if (customFormOpen) {
+            ToolbarCustomFormDialog(
+                existing = customFormId?.let { data.customButtons[it] },
+                imageDir = imageDir,
+                onSave = { def, isNew ->
+                    var next = data.copy(
+                        customButtons = data.customButtons + (def.id to def),
+                    )
+                    // 新建保存后进当前列（列表未满时；满则只存定义）。
+                    // 编辑页内新建走草稿：追加到草稿，草稿与起步列不同
+                    // 才连同列写盘（加钮恒不同；只看不改不写盘）。
+                    if (isNew && page == ToolbarPage.EDIT &&
+                        editDraft.size < ToolbarUserStore.MAX_BUTTONS
+                    ) {
+                        val draftNext = editDraft + ToolbarButtonEntry(def.id)
+                        editDraft = draftNext
+                        if (ToolbarUserStore.shouldPersistEdit(editSeed, draftNext)) {
+                            next = if (editToolbarId == null) {
+                                val state = next.skins[skinId] ?: ToolbarSkinState()
+                                next.copy(
+                                    skins = next.skins +
+                                        (skinId to state.copy(buttons = draftNext)),
+                                )
+                            } else {
+                                val config = next.customToolbars[editToolbarId]
+                                if (config != null) {
+                                    next.copy(
+                                        customToolbars = next.customToolbars +
+                                            (editToolbarId!! to config.copy(
+                                                buttons = draftNext,
+                                            )),
+                                    )
+                                } else next
+                            }
+                        }
+                    } else if (isNew && currentList().size < ToolbarUserStore.MAX_BUTTONS) {
+                        if (editToolbarId == null) {
+                            val state = next.skins[skinId] ?: ToolbarSkinState()
+                            next = next.copy(
+                                skins = next.skins +
+                                    (skinId to state.copy(
+                                        buttons = state.buttons + ToolbarButtonEntry(def.id),
+                                    )),
+                            )
+                        } else {
+                            val config = next.customToolbars[editToolbarId]
+                            if (config != null) {
+                                next = next.copy(
+                                    customToolbars = next.customToolbars +
+                                        (editToolbarId!! to config.copy(
+                                            buttons = config.buttons + ToolbarButtonEntry(def.id),
+                                        )),
+                                )
+                            }
+                        }
+                    }
+                    persist(next)
+                    customFormOpen = false
+                },
+                onDelete = { def ->
+                    val removedLists: (List<ToolbarButtonEntry>) -> List<ToolbarButtonEntry> =
+                        { list -> list.filter { it.ref != def.id } }
+                    // 删定义连同删其图标覆盖（自定义钮的覆盖本就不渲染，
+                    // 但删定义时一并清掉、不留悬空项）。
+                    val iconImageFiles = (
+                        data.skins.values.mapNotNull { it.iconOverrides[def.id] } +
+                            data.customToolbars.values.mapNotNull { it.iconOverrides[def.id] }
+                        ).filter { it.startsWith(ToolbarUserStore.IMAGE_ICON_PREFIX) }
+                        .mapNotNull {
+                            ToolbarUserStore.sanitizeImageFile(
+                                it.removePrefix(ToolbarUserStore.IMAGE_ICON_PREFIX),
+                            )
+                        }
+                    var next = data.copy(
+                        customButtons = data.customButtons - def.id,
+                        customToolbars = data.customToolbars.mapValues { (_, config) ->
+                            config.copy(
+                                buttons = removedLists(config.buttons),
+                                iconOverrides = config.iconOverrides - def.id,
+                            )
+                        },
+                        skins = data.skins.mapValues { (_, state) ->
+                            state.copy(
+                                buttons = removedLists(state.buttons),
+                                iconOverrides = state.iconOverrides - def.id,
+                            )
+                        },
+                    )
+                    if (def.kind == CustomDisplayKind.IMAGE) {
+                        ToolbarUserStore.sanitizeImageFile(def.imageFile)?.let { name ->
+                            runCatching { File(imageDir, name).delete() }
+                        }
+                    }
+                    iconImageFiles.forEach { name ->
+                        runCatching { File(imageDir, name).delete() }
+                    }
+                    persist(next)
+                    customFormOpen = false
+                },
+                onDismiss = { customFormOpen = false },
+            )
+        }
+        if (toolbarFormOpen) {
+            ToolbarToolbarFormDialog(
+                existing = toolbarFormId?.let { data.customToolbars[it] },
+                customButtons = data.customButtons,
+                imageDir = imageDir,
+                skinId = skinId,
+                data = data,
+                onSave = { config, isNew ->
+                    val next = data.copy(
+                        customToolbars = data.customToolbars + (config.id to config),
+                    )
+                    persist(next)
+                    toolbarFormOpen = false
+                    // 新建后直进该栏的按钮编辑；编辑既有栏关对话框回栏列表。
+                    // 两路都须先设草稿（与主入口 enterEdit 同口径：以被
+                    // 编辑栏当前列起步），否则编辑页列表为空／残留，添加
+                    // 会整列覆盖原列。
+                    if (isNew) {
+                        editToolbarId = config.id
+                        editSeed = null
+                        editDraft = currentList()
+                        page = ToolbarPage.EDIT
+                    }
+                },
+                onEditButtons = { id ->
+                    editToolbarId = id
+                    editSeed = null
+                    editDraft = currentList()
+                    page = ToolbarPage.EDIT
+                    toolbarFormOpen = false
+                },
+                onDelete = { config ->
+                    var next = data.copy(customToolbars = data.customToolbars - config.id)
+                    next = next.copy(
+                        skins = next.skins.mapValues { (_, state) ->
+                            if (state.activeToolbarId == config.id) {
+                                state.copy(activeToolbarId = null)
+                            } else state
+                        },
+                    )
+                    if (config.background is ToolbarBackground.Image) {
+                        ToolbarUserStore.sanitizeImageFile(config.background.file)?.let { name ->
+                            runCatching { File(imageDir, name).delete() }
+                        }
+                    }
+                    persist(next)
+                    toolbarFormOpen = false
+                },
+                onDismiss = { toolbarFormOpen = false },
+            )
+        }
+        if (selectDialog) {
+            ToolbarSelectDialog(
+                data = data,
+                activeId = currentSkinState().activeToolbarId,
+                skinId = skinId,
+                onUse = { id ->
+                    persist(
+                        data.copy(
+                            skins = data.skins +
+                                (skinId to currentSkinState().copy(activeToolbarId = id)),
+                        ),
+                    )
+                    selectDialog = false
+                },
+                onUseDefault = {
+                    persist(
+                        data.copy(
+                            skins = data.skins +
+                                (skinId to currentSkinState().copy(activeToolbarId = null)),
+                        ),
+                    )
+                    selectDialog = false
+                },
+                onDismiss = { selectDialog = false },
+            )
+        }
+    }
+}
+
+@Composable
+private fun ToolbarMainPage(
+    data: ToolbarUserData,
+    skinId: String,
+    activeToolbar: ToolbarCustomConfig?,
+    hideToolbar: Boolean,
+    onHideChange: (Boolean) -> Unit,
+    onEditCurrent: () -> Unit,
+    onOpenToolbars: () -> Unit,
+    onNewToolbar: () -> Unit,
+) {
+    val state = data.skins[skinId] ?: ToolbarSkinState()
+    val context = LocalContext.current
+    // 皮肤 v3 死壳删除后无皮肤栏按钮 id，主页计数恒回落默认 5 项。
+    val currentCount = ToolbarUserStore.mainPageCount(
+        skinId,
+        data,
+        null,
+    )
+    // 主页计数诊断（2026-11-02 修复批，2026-11-06 改与 resolve 同口径）：
+    // 只在生效列变化时记一次，来源列按 resolve 抉择判定——栏 id 悬空
+    // 时 resolve 直接回落皮肤／默认、不看用户列，便于下次主页与键盘
+    // 实际渲染计数不一致时直接定位是哪一列胜出。
+    LaunchedEffect(state, activeToolbar, data.customButtons) {
+        val source = when {
+            ToolbarUserStore.resolve(skinId, data) == null -> "default"
+            state.activeToolbarId != null -> "active"
+            else -> "user"
+        }
+        DiagLog.d(
+            "toolbar", "main_page_count",
+            mapOf(
+                "count" to currentCount,
+                "source" to source,
+                "activeEnabled" to (activeToolbar?.buttons?.count { it.enabled } ?: -1),
+                "userEnabled" to state.buttons.count { it.enabled },
+            ),
+        )
+    }
+    SettingsGroup(title = stringResource(R.string.toolbar_current)) {
+        NavRow(
+            title = activeToolbar?.name ?: stringResource(R.string.toolbar_default),
+            subtitle = stringResource(R.string.toolbar_button_count, currentCount),
+            onClick = onOpenToolbars,
+        )
+        NavRow(
+            title = stringResource(R.string.toolbar_edit_buttons),
+            subtitle = stringResource(R.string.toolbar_edit_current_hint),
+            onClick = onEditCurrent,
+        )
+        // 隐藏工具栏：全局开关（不分皮肤），开＝只藏中间按钮区
+        // （首尾固定槽与候选不受影响，条高不变），改动在工具栏
+        // 下次刷新时生效（与工具栏编辑同口径）。
+        SwitchRow(
+            title = stringResource(R.string.toolbar_hide_toolbar),
+            checked = hideToolbar,
+            onCheckedChange = onHideChange,
+        )
+    }
+    SettingsGroup(title = stringResource(R.string.toolbar_custom_toolbars)) {
+        NavRow(
+            title = stringResource(R.string.toolbar_custom_toolbars),
+            subtitle = stringResource(R.string.toolbar_toolbar_count, data.customToolbars.size),
+            onClick = onOpenToolbars,
+        )
+        NavRow(
+            title = stringResource(R.string.toolbar_new_toolbar),
+            onClick = onNewToolbar,
+        )
+    }
+    Text(
+        text = stringResource(R.string.toolbar_main_note),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+        modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+    )
+    Spacer(Modifier.height(20.dp))
+}
+
+@Composable
+private fun ToolbarEditPage(
+    title: String,
+    list: List<ToolbarButtonEntry>,
+    icons: Map<String, String>,
+    onListChange: (List<ToolbarButtonEntry>) -> Unit,
+    defOf: (String) -> ToolbarCustomButton?,
+    onAdd: () -> Unit,
+    onEditCustom: (String) -> Unit,
+    onIconPick: (String) -> Unit,
+) {
+    var deleteIndex by remember { mutableStateOf<Int?>(null) }
+    // 编辑页标题（与分组标题同式：14sp 半粗体正文色，左 4dp、上 8dp、下 6dp）。
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier.padding(start = 4.dp, top = 8.dp, bottom = 6.dp),
+    ) {
+        Text(
+            text = title,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+    if (list.isEmpty()) {
+        Text(
+            text = stringResource(R.string.toolbar_empty_note),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(vertical = 12.dp),
+        )
+    }
+    // 每钮一张卡：名·id 在上、图标行在中、控件行（开关＋上移＋下移＋删除）在下右对齐。
+    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        list.forEachIndexed { index, entry ->
+            val customDef = if (ToolbarUserStore.isCustomRef(entry.ref)) {
+                defOf(entry.ref)
+            } else null
+            val label = if (customDef != null) {
+                when {
+                    customDef.kind == CustomDisplayKind.IMAGE ->
+                        stringResource(R.string.toolbar_image_button)
+                    else -> customDef.display
+                }
+            } else if (ToolbarUserStore.isCustomRef(entry.ref)) {
+                entry.ref
+            } else {
+                ToolbarConfig.item(entry.ref)?.label ?: entry.ref
+            }
+            GroupCard {
+                // 编辑行：名·id 在上（名上 id 下）；自定义钮
+                // 的 id 行用内部标识（custom:xxxxxxxx），同名钮可区分。
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .then(
+                            if (customDef != null) {
+                                Modifier.clickable { onEditCustom(entry.ref) }
+                            } else Modifier,
+                        ),
+                ) {
+                    Text(
+                        text = label,
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = entry.ref,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                // 图标行：当前图标灰色摘要在右；池钮点开选图标，
+                // 自定义钮点开按钮表单（图标即其显示形态，在表单里改）。
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable {
+                            if (customDef != null) onEditCustom(entry.ref)
+                            else onIconPick(entry.ref)
+                        }
+                        .padding(vertical = 12.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.toolbar_icon),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        text = iconOverrideSummary(icons[entry.ref], customDef),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                Row(
+                    horizontalArrangement = Arrangement.End,
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Switch(
+                        checked = entry.enabled,
+                        onCheckedChange = { checked ->
+                            val next = list.toMutableList()
+                            next[index] = entry.copy(enabled = checked)
+                            onListChange(next)
+                        },
+                    )
+                    IconButton(
+                        onClick = {
+                            if (index > 0) {
+                                val next = list.toMutableList()
+                                next[index] = next[index - 1].also { next[index - 1] = next[index] }
+                                onListChange(next)
+                            }
+                        },
+                        enabled = index > 0,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ArrowUpward,
+                            contentDescription = stringResource(R.string.toolbar_move_up),
+                        )
+                    }
+                    IconButton(
+                        onClick = {
+                            if (index < list.size - 1) {
+                                val next = list.toMutableList()
+                                next[index] = next[index + 1].also { next[index + 1] = next[index] }
+                                onListChange(next)
+                            }
+                        },
+                        enabled = index < list.size - 1,
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.ArrowDownward,
+                            contentDescription = stringResource(R.string.toolbar_move_down),
+                        )
+                    }
+                    IconButton(onClick = { deleteIndex = index }) {
+                        Icon(
+                            imageVector = Icons.Filled.Delete,
+                            contentDescription = stringResource(R.string.toolbar_delete),
+                        )
+                    }
+                }
+            }
+        }
+    }
+    Spacer(Modifier.height(12.dp))
+    val full = list.size >= ToolbarUserStore.MAX_BUTTONS
+    // 添加钮：居中药丸（与参考底部悬浮药丸同形；页内居中，不做真悬浮）。
+    Row(
+        horizontalArrangement = Arrangement.Center,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Button(
+            onClick = onAdd,
+            enabled = !full,
+            shape = RoundedCornerShape(50),
+        ) {
+            Icon(imageVector = Icons.Filled.Add, contentDescription = null)
+            Spacer(Modifier.width(8.dp))
+            Text(text = stringResource(R.string.toolbar_add_button))
+        }
+    }
+    if (full) {
+        Text(
+            text = stringResource(R.string.toolbar_full_note, ToolbarUserStore.MAX_BUTTONS),
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+        )
+    }
+    Spacer(Modifier.height(20.dp))
+    val doomed = deleteIndex?.let { list.getOrNull(it) }
+    if (doomed != null) {
+        SettingsDialog(
+            onDismissRequest = { deleteIndex = null },
+            title = stringResource(R.string.toolbar_delete_button_title),
+            description = stringResource(R.string.toolbar_delete_button_note),
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = { deleteIndex = null },
+                ),
+                SettingsDialogAction(
+                    text = stringResource(R.string.toolbar_delete),
+                    color = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        val next = list.toMutableList()
+                        next.removeAt(deleteIndex!!)
+                        onListChange(next)
+                        deleteIndex = null
+                    },
+                ),
+            ),
+        )
+    }
+}
+
+/**
+ * 图标行灰色摘要：自定义钮显示其显示形态（图片钮显文件名，
+ * 文字／表情钮显文字）；池钮无覆盖显“默认”，有覆盖显覆盖
+ * 图标名（内置图标显其中文名、符号显符号名、上传图片显文件名）。
+ */
+@Composable
+private fun iconOverrideSummary(
+    iconId: String?,
+    customDef: ToolbarCustomButton?,
+): String {
+    if (customDef != null) {
+        return when (customDef.kind) {
+            CustomDisplayKind.IMAGE -> stringResource(
+                R.string.toolbar_icon_image, customDef.imageFile.orEmpty(),
+            )
+            else -> customDef.display.ifBlank { customDef.id }
+        }
+    }
+    if (iconId == null) return stringResource(R.string.toolbar_icon_default)
+    if (iconId.startsWith(ToolbarUserStore.IMAGE_ICON_PREFIX)) {
+        return stringResource(
+            R.string.toolbar_icon_image,
+            iconId.removePrefix(ToolbarUserStore.IMAGE_ICON_PREFIX),
+        )
+    }
+    return ToolbarConfig.item(iconId)?.label ?: iconId
+}
+
+/**
+ * 图标选择对话框：默认（恢复默认图标）／内置图标（池子各钮的
+ * 默认图标，按池子实时取，命令面板／语音插件等新项自动在列）／
+ * 符号（Material Symbols 注册表）／上传图片（走自定义按钮
+ * IMAGE 同款选图／存图，5MB 上限）。选后立即回调，不另存按钮。
+ */
+@Composable
+private fun ToolbarIconPickerDialog(
+    ref: String,
+    current: String?,
+    imageDir: File,
+    onSelect: (String?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var imageError by remember { mutableStateOf(false) }
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        imageError = false
+        val imported = importToolbarImage(context, imageDir, uri)
+        if (imported != null) {
+            // 换掉旧上传图：旧文件一并删掉，不在图目录里攒孤儿。
+            current?.takeIf { it.startsWith(ToolbarUserStore.IMAGE_ICON_PREFIX) }?.let { old ->
+                ToolbarUserStore.sanitizeImageFile(
+                    old.removePrefix(ToolbarUserStore.IMAGE_ICON_PREFIX),
+                )?.let { name -> runCatching { File(imageDir, name).delete() } }
+            }
+            onSelect(ToolbarUserStore.IMAGE_ICON_PREFIX + imported)
+        } else {
+            imageError = true
+        }
+    }
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.toolbar_icon_title),
+        body = {
+            Column {
+                Text(
+                    text = ToolbarConfig.item(ref)?.label ?: ref,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
+                )
+                if (current != null) {
+                    ToolbarIconPickRow(
+                        text = stringResource(R.string.toolbar_icon_default),
+                        selected = false,
+                        onClick = { onSelect(null) },
+                    )
+                }
+                ToolbarIconSectionHeader(stringResource(R.string.toolbar_icon_builtin))
+                ToolbarConfig.POOL.forEach { item ->
+                    ToolbarIconPickRow(
+                        text = "${item.label} · ${item.id}",
+                        selected = current == item.id,
+                        onClick = { onSelect(item.id) },
+                    )
+                }
+                ToolbarIconSectionHeader(stringResource(R.string.toolbar_icon_symbols))
+                MaterialSymbols.NAMES.keys.sorted().forEach { name ->
+                    ToolbarIconPickRow(
+                        text = name,
+                        selected = current == name,
+                        onClick = { onSelect(name) },
+                    )
+                }
+                Spacer(Modifier.height(8.dp))
+                Button(
+                    onClick = { imagePicker.launch(arrayOf("image/*")) },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(text = stringResource(R.string.toolbar_icon_upload_image))
+                }
+                if (imageError) {
+                    Text(
+                        text = stringResource(R.string.toolbar_image_error),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+                    )
+                }
+            }
+        },
+        actions = listOf(
+            SettingsDialogAction(
+                text = stringResource(R.string.cancel),
+                onClick = onDismiss,
+            ),
+        ),
+    )
+}
+
+@Composable
+private fun ToolbarIconSectionHeader(text: String) {
+    Text(
+        text = text,
+        fontSize = 14.sp,
+        fontWeight = FontWeight.SemiBold,
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier.padding(start = 4.dp, top = 8.dp, bottom = 6.dp),
+    )
+}
+
+/** 图标选择行（与添加按钮对话框同式：名在左，已选灰字在右）。 */
+@Composable
+private fun ToolbarIconPickRow(
+    text: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        modifier = Modifier
+            .fillMaxWidth()
+            .then(
+                if (selected) Modifier.alpha(0.5f)
+                else Modifier.clickable { onClick() },
+            )
+            .padding(vertical = 12.dp),
+    ) {
+        Text(
+            text = text,
+            style = MaterialTheme.typography.bodyLarge,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f),
+        )
+        if (selected) {
+            Text(
+                text = stringResource(R.string.toolbar_icon_selected),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+    }
+}
+
+/** 动作名（资源文案，与白名单一一对应）。 */
+@Composable
+internal fun whitelistActionLabel(action: WhitelistAction): String = stringResource(
+    when (action) {
+        WhitelistAction.COMMIT_DIRECT -> R.string.action_commit_direct
+        WhitelistAction.LITERAL_NEWLINE -> R.string.action_literal_newline
+        WhitelistAction.ENTER -> R.string.action_enter
+        WhitelistAction.DELETE -> R.string.action_delete
+        WhitelistAction.DELETE_FORWARD -> R.string.action_delete_forward
+        WhitelistAction.SPACE -> R.string.action_space
+        WhitelistAction.CURSOR_LEFT -> R.string.action_cursor_left
+        WhitelistAction.CURSOR_RIGHT -> R.string.action_cursor_right
+        WhitelistAction.ROTATE_SCHEMA -> R.string.action_rotate_schema
+        WhitelistAction.OPEN_SCHEMA_PICKER -> R.string.action_open_schema_picker
+        WhitelistAction.SWITCH_SCHEMA -> R.string.action_switch_schema
+        WhitelistAction.SWITCH_SYSTEM_IME -> R.string.action_switch_system_ime
+        WhitelistAction.OPEN_SYSTEM_IME_PICKER -> R.string.action_open_system_ime_picker
+        WhitelistAction.HIDE_KEYBOARD -> R.string.action_hide_keyboard
+        WhitelistAction.CAPS -> R.string.action_caps
+        WhitelistAction.SWITCH_LAYOUT -> R.string.action_switch_layout
+        WhitelistAction.RESUME -> R.string.action_resume
+        WhitelistAction.CLEAR -> R.string.action_clear
+        WhitelistAction.UNDO -> R.string.action_undo
+        WhitelistAction.REDO -> R.string.action_redo
+        WhitelistAction.VOICE_INPUT -> R.string.action_voice_input
+        // P3 新增通知动作（工具栏按钮亦可指派，执行见 KeyOverrideApplier）。
+        WhitelistAction.CHARACTER -> R.string.action_character
+        WhitelistAction.SEND_KEYS -> R.string.action_send_keys
+        WhitelistAction.SEND_KEY_EVENT -> R.string.action_send_key_event
+        WhitelistAction.RIME_OPTION -> R.string.action_rime_option
+        WhitelistAction.DELAY -> R.string.action_delay
+        WhitelistAction.SNIPPET -> R.string.action_snippet
+        WhitelistAction.TOGGLE_ASCII_MODE -> R.string.action_toggle_ascii_mode
+        WhitelistAction.TAB -> R.string.action_tab
+        WhitelistAction.ESCAPE -> R.string.action_escape
+        WhitelistAction.COMMAND -> R.string.action_command
+        WhitelistAction.CONTROL -> R.string.action_control
+        WhitelistAction.OPTION -> R.string.action_option
+        WhitelistAction.HOME -> R.string.action_home
+        WhitelistAction.END -> R.string.action_end
+        WhitelistAction.SETTINGS -> R.string.action_settings
+        WhitelistAction.SYSTEM_SETTINGS -> R.string.action_system_settings
+        WhitelistAction.NONE -> R.string.action_none
+        WhitelistAction.DISMISS_KEYBOARD -> R.string.action_dismiss_keyboard
+        WhitelistAction.OPEN_URL -> R.string.action_open_url
+        WhitelistAction.RETURN_PRIMARY_KEYBOARD -> R.string.action_return_primary_keyboard
+        WhitelistAction.RETURN_LAST_KEYBOARD -> R.string.action_return_last_keyboard
+        WhitelistAction.MOMENTARY_SHIFT -> R.string.action_momentary_shift
+        WhitelistAction.SYMBOL -> R.string.action_symbol
+        WhitelistAction.HASH_TRADITIONAL -> R.string.action_hash_traditional
+        WhitelistAction.HASH_RIME_SWITCHER -> R.string.action_hash_rime_switcher
+        WhitelistAction.HASH_SECOND_CANDIDATE -> R.string.action_hash_second_candidate
+        WhitelistAction.HASH_THIRD_CANDIDATE -> R.string.action_hash_third_candidate
+        WhitelistAction.HASH_SWITCH_SCHEME -> R.string.action_hash_switch_scheme
+        WhitelistAction.HASH_LINE_START -> R.string.action_hash_line_start
+        WhitelistAction.HASH_LINE_END -> R.string.action_hash_line_end
+        WhitelistAction.HASH_NEWLINE -> R.string.action_hash_newline
+        WhitelistAction.HASH_ENTER -> R.string.action_hash_enter
+        WhitelistAction.HASH_RETYPE -> R.string.action_hash_retype
+        WhitelistAction.HASH_CUT -> R.string.action_hash_cut
+        WhitelistAction.HASH_COPY -> R.string.action_hash_copy
+        WhitelistAction.HASH_PASTE -> R.string.action_hash_paste
+        WhitelistAction.HASH_DELETE_TEXT -> R.string.action_hash_delete_text
+        WhitelistAction.HASH_UNDO -> R.string.action_hash_undo
+        WhitelistAction.HASH_REDO -> R.string.action_hash_redo
+        WhitelistAction.HASH_VERTICAL_PAGE_UP -> R.string.action_hash_vertical_page_up
+        WhitelistAction.HASH_VERTICAL_PAGE_DOWN -> R.string.action_hash_vertical_page_down
+        WhitelistAction.HASH_SHOW_PHRASE_VIEW -> R.string.action_hash_show_phrase_view
+        WhitelistAction.HASH_CANDIDATES_BAR_TOGGLE -> R.string.action_hash_candidates_bar_toggle
+        WhitelistAction.HASH_RIME_PREV_PAGE -> R.string.action_hash_rime_prev_page
+        WhitelistAction.HASH_RIME_NEXT_PAGE -> R.string.action_hash_rime_next_page
+        WhitelistAction.HASH_RIME_DEPLOY -> R.string.action_hash_rime_deploy
+        WhitelistAction.HASH_RIME_SYNC -> R.string.action_hash_rime_sync
+        WhitelistAction.HASH_TOGGLE_EMBEDDED_INPUT -> R.string.action_hash_toggle_embedded_input
+        WhitelistAction.HASH_TOGGLE_SYMBOL_BAR -> R.string.action_hash_toggle_symbol_bar
+        WhitelistAction.HASH_KEYBOARD_MENU -> R.string.action_hash_keyboard_menu
+        WhitelistAction.HASH_TOGGLE_COMMAND_VIEW -> R.string.action_hash_toggle_command_view
+        WhitelistAction.HASH_CLEAR_CLIPBOARD -> R.string.action_hash_clear_clipboard
+        WhitelistAction.HASH_SELECT_TEXT -> R.string.action_hash_select_text
+        WhitelistAction.HASH_SHOW_PASTEBOARD_VIEW -> R.string.action_hash_show_pasteboard_view
+        WhitelistAction.HASH_SUB_COLLECTION_PAGE_UP -> R.string.action_hash_sub_collection_page_up
+        WhitelistAction.HASH_SUB_COLLECTION_PAGE_DOWN -> R.string.action_hash_sub_collection_page_down
+        WhitelistAction.HASH_KEYBOARD_PERFORMANCE -> R.string.action_hash_keyboard_performance
+    },
+)
+
+@Composable
+internal fun customSlotLabel(slot: CustomButtonSlot): String = stringResource(
+    when (slot) {
+        CustomButtonSlot.TAP -> R.string.slot_tap
+        CustomButtonSlot.LONG_PRESS -> R.string.slot_long_press
+        CustomButtonSlot.DOUBLE_TAP -> R.string.slot_double_tap
+        CustomButtonSlot.SWIPE_UP -> R.string.slot_swipe_up
+        CustomButtonSlot.SWIPE_DOWN -> R.string.slot_swipe_down
+        CustomButtonSlot.SWIPE_LEFT -> R.string.slot_swipe_left
+        CustomButtonSlot.SWIPE_RIGHT -> R.string.slot_swipe_right
+    },
+)
+
+@Composable
+internal fun customKindLabel(kind: CustomDisplayKind): String = stringResource(
+    when (kind) {
+        CustomDisplayKind.TEXT -> R.string.kind_text
+        CustomDisplayKind.EMOJI -> R.string.kind_emoji
+        CustomDisplayKind.IMAGE -> R.string.kind_image
+    },
+)
+
+/** 必填值动作的输入提示（其余动作无值字段）。 */
+@Composable
+internal fun requiredValueHint(action: WhitelistAction): String = stringResource(
+    when (action) {
+        WhitelistAction.COMMIT_DIRECT -> R.string.value_hint_commit
+        WhitelistAction.SWITCH_SCHEMA -> R.string.value_hint_schema
+        WhitelistAction.SWITCH_LAYOUT -> R.string.value_hint_layout
+        else -> R.string.value_hint_generic
+    },
+)
+
+internal fun newImageFileName(mime: String?, fallbackExt: String): String {
+    val ext = when (mime) {
+        "image/png" -> "png"
+        "image/jpeg" -> "jpg"
+        "image/webp" -> "webp"
+        "image/gif" -> "gif"
+        "image/bmp" -> "bmp"
+        else -> fallbackExt.lowercase().ifEmpty { "bin" }
+    }
+    return "img_" + UUID.randomUUID().toString().substring(0, 8) + "." + ext
+}
+
+/**
+ * 从系统选图导入一张工具栏图片（与自定义按钮同口径：5MB 上限，
+ * 按 mime 定扩展名、随机文件名存入图目录）：成功返回新文件名，
+ * 失败返回 null。
+ */
+private fun importToolbarImage(context: Context, imageDir: File, uri: Uri): String? {
+    return runCatching {
+        val input = context.contentResolver.openInputStream(uri)
+            ?: return@runCatching null
+        input.use { stream ->
+            val out = java.io.ByteArrayOutputStream()
+            val buf = ByteArray(8192)
+            var total = 0L
+            var overflow = false
+            while (true) {
+                val n = stream.read(buf)
+                if (n < 0) break
+                total += n
+                if (total > 5L * 1024 * 1024) {
+                    overflow = true
+                    break
+                }
+                out.write(buf, 0, n)
+            }
+            if (overflow) return@runCatching null
+            val mime = context.contentResolver.getType(uri)
+            val ext = uri.lastPathSegment
+                ?.substringAfterLast('.', "")
+                ?.lowercase()
+                .orEmpty()
+            val name = newImageFileName(mime, ext)
+            val file = File(imageDir, name)
+            file.parentFile?.mkdirs()
+            file.writeBytes(out.toByteArray())
+            name
+        }
+    }.getOrNull()
+}
+
+/** 预设色（与外观页预设同值，工具栏页自有副本，不改外观页）。 */
+private val TOOLBAR_COLOR_PRESETS: List<Pair<Int, Int?>> = listOf(
+    R.string.follow to null,
+    R.string.color_white to 0xFFFFFFFF.toInt(),
+    R.string.color_light_gray to 0xFFEEEEEE.toInt(),
+    R.string.color_dark_gray to 0xFF424242.toInt(),
+    R.string.color_black to 0xFF000000.toInt(),
+    R.string.color_red to 0xFFE53935.toInt(),
+    R.string.color_green to 0xFF43A047.toInt(),
+    R.string.color_blue to 0xFF1E88E5.toInt(),
+    R.string.color_orange to 0xFFFB8C00.toInt(),
+)
+
+@Composable
+private fun presetColorName(value: Int?): String {
+    if (value == null) return stringResource(R.string.follow)
+    val res = TOOLBAR_COLOR_PRESETS.firstOrNull { it.second == value }?.first
+    return if (res != null) stringResource(res) else stringResource(R.string.color_custom)
+}
+
+@Composable
+private fun toolbarBackgroundSummary(background: ToolbarBackground): String {
+    return when (background) {
+        is ToolbarBackground.Color -> stringResource(
+            R.string.toolbar_bg_color_named, presetColorName(background.argb),
+        )
+        is ToolbarBackground.Transparent -> stringResource(R.string.toolbar_bg_transparent)
+        is ToolbarBackground.Image -> stringResource(R.string.toolbar_bg_image)
+    }
+}
+
+/** 预设色选择对话框（跟随＋8 色；返回 null＝跟随；栏背景不含跟随项）。 */
+@Composable
+private fun ToolbarColorDialog(
+    selected: Int?,
+    includeFollow: Boolean = true,
+    onSelect: (Int?) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.toolbar_pick_color),
+        body = {
+            Column {
+                TOOLBAR_COLOR_PRESETS.filter { includeFollow || it.second != null }.forEach { (nameRes, argb) ->
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                onSelect(argb)
+                                onDismiss()
+                            }
+                            .padding(vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(nameRes),
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (argb == selected) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        actions = listOf(
+            SettingsDialogAction(
+                text = stringResource(R.string.cancel),
+                onClick = onDismiss,
+            ),
+        ),
+    )
+}
+
+@Composable
+/**
+ * 自定义工具栏管理页：只做新建／编辑（点行进表单，表单内删除），
+ * 切换只走选择对话框（顶部“选择自定义工具栏”按钮），行内不再
+ * 设使用／回默认入口，避免双入口歧义。
+ */
+private fun ToolbarToolbarsPage(
+    data: ToolbarUserData,
+    activeId: String?,
+    skinId: String,
+    onSelect: () -> Unit,
+    onOpenForm: (String) -> Unit,
+    onNew: () -> Unit,
+) {
+    OutlinedButton(
+        onClick = onSelect,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Text(text = stringResource(R.string.toolbar_select_toolbar))
+    }
+    Spacer(Modifier.height(8.dp))
+    SettingsGroup(title = stringResource(R.string.toolbar_custom_toolbars)) {
+        if (data.customToolbars.isEmpty()) {
+            Text(
+                text = stringResource(R.string.toolbar_no_toolbars),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(vertical = 12.dp),
+            )
+        }
+        data.customToolbars.values.forEach { config ->
+            val isActive = config.id == activeId
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clickable { onOpenForm(config.id) }
+                        .padding(vertical = 12.dp),
+                ) {
+                    Text(
+                        text = config.name,
+                        style = MaterialTheme.typography.bodyLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = stringResource(
+                            R.string.toolbar_config_summary,
+                            ToolbarUserStore.listRowCount(
+                                skinId,
+                                data,
+                                null,
+                                config,
+                                isActive,
+                            ),
+                            toolbarBackgroundSummary(config.background),
+                        ),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (isActive) {
+                    Text(
+                        text = stringResource(R.string.toolbar_in_use),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.padding(start = 8.dp),
+                    )
+                }
+            }
+        }
+    }
+    Button(
+        onClick = onNew,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Icon(imageVector = Icons.Filled.Add, contentDescription = null)
+        Spacer(Modifier.width(8.dp))
+        Text(text = stringResource(R.string.toolbar_new_toolbar))
+    }
+    Spacer(Modifier.height(20.dp))
+}
+
+/** 选择自定义工具栏对话框：切换唯一入口——列出自定义栏（点行
+ * 使用并关闭），使用中行只标“使用中”不点；有使用中栏时给回默认
+ * 动作；空表时只显示暂无文案＋取消。 */
+@Composable
+private fun ToolbarSelectDialog(
+    data: ToolbarUserData,
+    activeId: String?,
+    skinId: String,
+    onUse: (String) -> Unit,
+    onUseDefault: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.toolbar_select_toolbar),
+        body = {
+            Column {
+                if (data.customToolbars.isEmpty()) {
+                    Text(
+                        text = stringResource(R.string.toolbar_no_toolbars),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(vertical = 12.dp),
+                    )
+                }
+                data.customToolbars.values.forEach { config ->
+                    val isActive = config.id == activeId
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .then(
+                                if (isActive) Modifier
+                                else Modifier.clickable { onUse(config.id) },
+                            )
+                            .padding(vertical = 12.dp),
+                    ) {
+                        Column(Modifier.weight(1f)) {
+                            Text(
+                                text = config.name,
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                            )
+                            Text(
+                                text = stringResource(
+                                    R.string.toolbar_config_summary,
+                                    ToolbarUserStore.listRowCount(
+                                        skinId,
+                                        data,
+                                        null,
+                                        config,
+                                        isActive,
+                                    ),
+                                    toolbarBackgroundSummary(config.background),
+                                ),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                        if (isActive) {
+                            Text(
+                                text = stringResource(R.string.toolbar_in_use),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.padding(start = 8.dp),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        actions = buildList {
+            if (activeId != null) {
+                add(
+                    SettingsDialogAction(
+                        text = stringResource(R.string.toolbar_use_default),
+                        onClick = onUseDefault,
+                    ),
+                )
+            }
+            add(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = onDismiss,
+                ),
+            )
+        },
+    )
+}
+
+/** 添加按钮对话框：新建行在首，其后池行（副标题带 Hime 原生 id），最后未进列表的自定义行。 */
+@Composable
+private fun ToolbarAddDialog(
+    list: List<ToolbarButtonEntry>,
+    customButtons: Map<String, ToolbarCustomButton>,
+    onAddPool: (String) -> Unit,
+    onAddCustom: (String) -> Unit,
+    onNewCustom: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = stringResource(R.string.toolbar_add_button),
+        body = {
+            Column {
+                ToolbarUserStore.toolbarAddRows(list, customButtons).forEach { row ->
+                    when (row) {
+                        is ToolbarUserStore.ToolbarAddRow.NewCustom -> Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onNewCustom() }
+                                .padding(vertical = 12.dp),
+                        ) {
+                            // 新建行：单行（与池行名·id 同行一致；说明行已并入标题省略号）。
+                            Text(
+                                text = stringResource(R.string.toolbar_new_custom_button) + "...",
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                        is ToolbarUserStore.ToolbarAddRow.Pool -> Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(
+                                    if (row.added) Modifier.alpha(0.5f)
+                                    else Modifier.clickable { onAddPool(row.id) },
+                                )
+                                .padding(vertical = 12.dp),
+                        ) {
+                            // 添加行：名·id 同行（池 id 即 Hime 原生 id）。
+                            Text(
+                                text = "${row.label} · ${row.id}",
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                            if (row.added) {
+                                Text(
+                                    text = stringResource(R.string.toolbar_added),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                        is ToolbarUserStore.ToolbarAddRow.Custom -> Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { onAddCustom(row.id) }
+                                .padding(vertical = 12.dp),
+                        ) {
+                            // 添加行：名·id 同行（自定义钮 id 即内部标识）。
+                            Text(
+                                text = if (row.isImage) {
+                                    "${stringResource(R.string.toolbar_image_button)} · ${row.id}"
+                                } else {
+                                    "${row.display} · ${row.id}"
+                                },
+                                style = MaterialTheme.typography.bodyLarge,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f),
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        actions = listOf(
+            SettingsDialogAction(
+                text = stringResource(R.string.cancel),
+                onClick = onDismiss,
+            ),
+        ),
+    )
+}
+
+/** 自定义按钮单个手势槽行：动作行＋必填值输入框（与页式表单同口径）。 */
+@Composable
+private fun ToolbarCustomSlotRow(
+    slot: CustomButtonSlot,
+    binding: ToolbarActionBinding?,
+    onPick: () -> Unit,
+    onValueChange: (String) -> Unit,
+) {
+    NavRow(
+        title = customSlotLabel(slot),
+        subtitle = when {
+            binding == null -> stringResource(R.string.toolbar_unspecified)
+            binding.action.valueRule == WhitelistAction.ValueRule.REQUIRED &&
+                binding.value.isNullOrBlank() -> stringResource(R.string.toolbar_value_missing)
+            else -> whitelistActionLabel(binding.action)
+        },
+        onClick = onPick,
+    )
+    if (binding != null &&
+        binding.action.valueRule == WhitelistAction.ValueRule.REQUIRED
+    ) {
+        OutlinedTextField(
+            shape = MaterialTheme.shapes.medium,
+            value = binding.value ?: "",
+            onValueChange = onValueChange,
+            label = { Text(text = requiredValueHint(binding.action)) },
+            singleLine = true,
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(vertical = 4.dp),
+        )
+    }
+}
+
+/** 新建／编辑自定义按钮对话框：基本＋点击＋外观＋更多手势与尺寸（默认收起）。 */
+@Composable
+private fun ToolbarCustomFormDialog(
+    existing: ToolbarCustomButton?,
+    imageDir: File,
+    onSave: (ToolbarCustomButton, Boolean) -> Unit,
+    onDelete: (ToolbarCustomButton) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var kind by remember { mutableStateOf(existing?.kind ?: CustomDisplayKind.TEXT) }
+    var display by remember { mutableStateOf(existing?.display ?: "") }
+    var imageFile by remember { mutableStateOf(existing?.imageFile) }
+    var iconSize by remember {
+        mutableStateOf((existing?.iconSizeDp ?: ToolbarUserStore.DEFAULT_ICON_DP).toFloat())
+    }
+    var width by remember {
+        mutableStateOf((existing?.widthDp ?: ToolbarUserStore.DEFAULT_WIDTH_DP).toFloat())
+    }
+    var backgroundArgb by remember { mutableStateOf(existing?.backgroundArgb) }
+    var fontSizeSp by remember { mutableStateOf(existing?.fontSizeSp) }
+    var borderArgb by remember { mutableStateOf(existing?.borderArgb) }
+    var borderWidthDp by remember { mutableStateOf(existing?.borderWidthDp ?: 0f) }
+    var pressedArgb by remember { mutableStateOf(existing?.pressedArgb) }
+    var bindings by remember { mutableStateOf(existing?.bindings ?: emptyMap()) }
+    var errorText by remember { mutableStateOf<String?>(null) }
+    var imageError by remember { mutableStateOf(false) }
+    var actionSlot by remember { mutableStateOf<CustomButtonSlot?>(null) }
+    var colorDialog by remember { mutableStateOf(false) }
+    var borderColorDialog by remember { mutableStateOf(false) }
+    var pressedColorDialog by remember { mutableStateOf(false) }
+    var appearanceDialog by remember { mutableStateOf(false) }
+    var moreExpanded by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        imageError = false
+        val imported = importToolbarImage(context, imageDir, uri)
+        if (imported != null) {
+            val old = imageFile
+            if (old != null && old != imported) {
+                runCatching { File(imageDir, old).delete() }
+            }
+            imageFile = imported
+            kind = CustomDisplayKind.IMAGE
+        } else {
+            imageError = true
+        }
+    }
+
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = if (existing == null) {
+            stringResource(R.string.toolbar_new_custom_button)
+        } else {
+            stringResource(
+                R.string.toolbar_edit_named,
+                if (existing.kind == CustomDisplayKind.IMAGE) {
+                    stringResource(R.string.toolbar_image_button)
+                } else {
+                    existing.display
+                },
+            )
+        },
+        body = {
+            Column {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                ) {
+                    CustomDisplayKind.entries.forEach { entry ->
+                        val selected = kind == entry
+                        if (selected) {
+                            Button(onClick = {}) {
+                                Text(text = customKindLabel(entry))
+                            }
+                        } else {
+                            OutlinedButton(onClick = { kind = entry }) {
+                                Text(text = customKindLabel(entry))
+                            }
+                        }
+                        Spacer(Modifier.width(8.dp))
+                    }
+                }
+                if (kind != CustomDisplayKind.IMAGE) {
+                    OutlinedTextField(
+                        shape = MaterialTheme.shapes.medium,
+                        value = display,
+                        onValueChange = { display = it },
+                        label = {
+                            Text(
+                                text = if (kind == CustomDisplayKind.EMOJI) {
+                                    stringResource(R.string.toolbar_display_emoji)
+                                } else {
+                                    stringResource(R.string.toolbar_display_text)
+                                },
+                            )
+                        },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                    )
+                } else {
+                    Button(
+                        onClick = { imagePicker.launch(arrayOf("image/*")) },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 4.dp),
+                    ) {
+                        Text(
+                            text = if (imageFile != null) {
+                                stringResource(R.string.toolbar_image_picked, imageFile!!)
+                            } else {
+                                stringResource(R.string.toolbar_pick_image)
+                            },
+                        )
+                    }
+                    if (imageError) {
+                        Text(
+                            text = stringResource(R.string.toolbar_image_error),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.error,
+                            modifier = Modifier.padding(start = 4.dp),
+                        )
+                    }
+                }
+                SliderRow(
+                    title = stringResource(R.string.toolbar_icon_size),
+                    value = iconSize,
+                    defaultValue = 24f,
+                    valueLabel = stringResource(R.string.toolbar_dp_value, iconSize.toInt()),
+                    range = ToolbarUserStore.MIN_ICON_DP.toFloat()..ToolbarUserStore.MAX_ICON_DP.toFloat(),
+                    onValueChange = { iconSize = it },
+                )
+                ToolbarCustomSlotRow(
+                    slot = CustomButtonSlot.TAP,
+                    binding = bindings[CustomButtonSlot.TAP],
+                    onPick = { actionSlot = CustomButtonSlot.TAP },
+                    onValueChange = { value ->
+                        bindings[CustomButtonSlot.TAP]?.let { current ->
+                            bindings = bindings + (CustomButtonSlot.TAP to current.copy(value = value))
+                        }
+                    },
+                )
+                NavRow(
+                    title = stringResource(R.string.toolbar_button_appearance),
+                    subtitle = presetColorName(backgroundArgb),
+                    onClick = { appearanceDialog = true },
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { moreExpanded = !moreExpanded }
+                        .padding(vertical = 12.dp),
+                ) {
+                    Text(
+                        text = stringResource(R.string.toolbar_more_gestures_size),
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Text(
+                        text = if (moreExpanded) "▼" else "▶",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                if (moreExpanded) {
+                    SliderRow(
+                        title = stringResource(R.string.toolbar_button_width),
+                        value = width,
+                        defaultValue = 48f,
+                        valueLabel = stringResource(R.string.toolbar_dp_value, width.toInt()),
+                        range = ToolbarUserStore.MIN_WIDTH_DP.toFloat()..ToolbarUserStore.MAX_WIDTH_DP.toFloat(),
+                        onValueChange = { width = it },
+                    )
+                    listOf(
+                        CustomButtonSlot.LONG_PRESS,
+                        CustomButtonSlot.DOUBLE_TAP,
+                        CustomButtonSlot.SWIPE_UP,
+                        CustomButtonSlot.SWIPE_DOWN,
+                        CustomButtonSlot.SWIPE_LEFT,
+                        CustomButtonSlot.SWIPE_RIGHT,
+                    ).forEach { slot ->
+                        ToolbarCustomSlotRow(
+                            slot = slot,
+                            binding = bindings[slot],
+                            onPick = { actionSlot = slot },
+                            onValueChange = { value ->
+                                bindings[slot]?.let { current ->
+                                    bindings = bindings + (slot to current.copy(value = value))
+                                }
+                            },
+                        )
+                    }
+                }
+                if (errorText != null) {
+                    Text(
+                        text = errorText!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+                    )
+                }
+                if (existing != null) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { confirmDelete = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_delete),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        },
+        actions = listOf(
+            SettingsDialogAction(
+                text = stringResource(R.string.cancel),
+                onClick = onDismiss,
+            ),
+            SettingsDialogAction(
+                text = stringResource(R.string.toolbar_save),
+                onClick = {
+                    val id = existing?.id ?: ToolbarUserStore.newCustomButtonId()
+                    val (def, problems) = ToolbarUserStore.buildCustomButton(
+                        id = id,
+                        kind = kind,
+                        display = display,
+                        imageFile = imageFile,
+                        iconSizeDp = iconSize.toInt(),
+                        widthDp = width.toInt(),
+                        backgroundArgb = backgroundArgb,
+                        fontSizeSp = fontSizeSp,
+                        borderArgb = borderArgb,
+                        borderWidthDp = borderWidthDp,
+                        pressedArgb = pressedArgb,
+                        bindings = bindings,
+                    )
+                    if (def != null) {
+                        errorText = null
+                        onSave(def, existing == null)
+                    } else {
+                        errorText = problems.joinToString("；")
+                    }
+                },
+            ),
+        ),
+    )
+    // 按钮外观子对话框：控件直写表单态（与颜色对话框同口径），完成即关闭，
+    // 真正保存仍由主表单的保存按钮完成。
+    if (appearanceDialog) {
+        SettingsDialog(
+            onDismissRequest = { appearanceDialog = false },
+            title = stringResource(R.string.toolbar_button_appearance),
+            body = {
+                Column {
+                    SwitchRow(
+                        title = stringResource(R.string.toolbar_font_follow_icon),
+                        checked = fontSizeSp == null,
+                        onCheckedChange = { follow ->
+                            fontSizeSp = if (follow) null else ToolbarUserStore.DEFAULT_FONT_SP
+                        },
+                    )
+                    val fontSp = fontSizeSp
+                    if (fontSp != null) {
+                        SliderRow(
+                            title = stringResource(R.string.toolbar_font_size),
+                            value = fontSp,
+                            defaultValue = 14f,
+                            valueLabel = stringResource(R.string.toolbar_sp_value, fontSp.toInt()),
+                            range = ToolbarUserStore.MIN_FONT_SP..ToolbarUserStore.MAX_FONT_SP,
+                            onValueChange = { fontSizeSp = it },
+                        )
+                    }
+                    NavRow(
+                        title = stringResource(R.string.toolbar_button_background),
+                        subtitle = presetColorName(backgroundArgb),
+                        onClick = { colorDialog = true },
+                    )
+                    SliderRow(
+                        title = stringResource(R.string.toolbar_border_width),
+                        value = borderWidthDp,
+                        defaultValue = 0f,
+                        valueLabel = stringResource(R.string.toolbar_dp_value, borderWidthDp.toInt()),
+                        range = ToolbarUserStore.MIN_BORDER_DP..ToolbarUserStore.MAX_BORDER_DP,
+                        onValueChange = { v ->
+                            borderWidthDp = v
+                            if (v > 0f && borderArgb == null) {
+                                borderArgb = ToolbarUserStore.DEFAULT_BORDER_ARGB
+                            }
+                        },
+                    )
+                    NavRow(
+                        title = stringResource(R.string.toolbar_button_border_color),
+                        subtitle = borderArgb?.let { presetColorName(it) }
+                            ?: stringResource(R.string.toolbar_border_none),
+                        onClick = { borderColorDialog = true },
+                    )
+                    NavRow(
+                        title = stringResource(R.string.toolbar_pressed_color),
+                        subtitle = pressedArgb?.let { presetColorName(it) }
+                            ?: stringResource(R.string.toolbar_pressed_default),
+                        onClick = { pressedColorDialog = true },
+                    )
+                }
+            },
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.toolbar_done),
+                    onClick = { appearanceDialog = false },
+                ),
+            ),
+        )
+    }
+    if (colorDialog) {
+        ToolbarColorDialog(
+            selected = backgroundArgb,
+            onSelect = { backgroundArgb = it },
+            onDismiss = { colorDialog = false },
+        )
+    }
+    if (borderColorDialog) {
+        ToolbarColorDialog(
+            selected = borderArgb,
+            includeFollow = false,
+            onSelect = { borderArgb = it },
+            onDismiss = { borderColorDialog = false },
+        )
+    }
+    if (pressedColorDialog) {
+        ToolbarColorDialog(
+            selected = pressedArgb,
+            onSelect = { pressedArgb = it },
+            onDismiss = { pressedColorDialog = false },
+        )
+    }
+    val slot = actionSlot
+    if (slot != null) {
+        val current = bindings[slot]
+        SettingsDialog(
+            onDismissRequest = { actionSlot = null },
+            title = stringResource(R.string.toolbar_pick_action, customSlotLabel(slot)),
+            body = {
+                Column {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                bindings = bindings - slot
+                                actionSlot = null
+                            }
+                            .padding(vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_unspecified),
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (current == null) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                    WhitelistAction.entries.forEach { action ->
+                        val voiceBlocked = action == WhitelistAction.VOICE_INPUT &&
+                            slot != CustomButtonSlot.LONG_PRESS
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .then(
+                                    if (voiceBlocked) Modifier.alpha(0.5f)
+                                    else Modifier.clickable {
+                                        bindings = bindings +
+                                            (slot to ToolbarActionBinding(action, null))
+                                        actionSlot = null
+                                    },
+                                )
+                                .padding(vertical = 10.dp),
+                        ) {
+                            Column(Modifier.weight(1f)) {
+                                Text(
+                                    text = whitelistActionLabel(action),
+                                    style = MaterialTheme.typography.bodyLarge,
+                                )
+                                if (voiceBlocked) {
+                                    Text(
+                                        text = stringResource(R.string.toolbar_voice_long_only),
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    )
+                                }
+                            }
+                            if (current?.action == action) {
+                                Icon(
+                                    imageVector = Icons.Filled.Check,
+                                    contentDescription = null,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = { actionSlot = null },
+                ),
+            ),
+        )
+    }
+    if (confirmDelete && existing != null) {
+        SettingsDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = stringResource(R.string.toolbar_delete_custom_title),
+            description = stringResource(R.string.toolbar_delete_custom_note),
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = { confirmDelete = false },
+                ),
+                SettingsDialogAction(
+                    text = stringResource(R.string.toolbar_delete),
+                    color = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        confirmDelete = false
+                        onDelete(existing)
+                    },
+                ),
+            ),
+        )
+    }
+}
+
+/** 新建／编辑自定义工具栏对话框：栏名＋栏背景＋（既有栏）按钮编辑入口。 */
+@Composable
+private fun ToolbarToolbarFormDialog(
+    existing: ToolbarCustomConfig?,
+    customButtons: Map<String, ToolbarCustomButton>,
+    imageDir: File,
+    skinId: String,
+    data: ToolbarUserData,
+    onSave: (ToolbarCustomConfig, Boolean) -> Unit,
+    onEditButtons: (String) -> Unit,
+    onDelete: (ToolbarCustomConfig) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    val context = LocalContext.current
+    var name by remember { mutableStateOf(existing?.name ?: "") }
+    var background by remember {
+        mutableStateOf<ToolbarBackground>(
+            existing?.background ?: ToolbarBackground.Transparent,
+        )
+    }
+    var errorText by remember { mutableStateOf<String?>(null) }
+    var backgroundDialog by remember { mutableStateOf(false) }
+    var colorDialog by remember { mutableStateOf(false) }
+    var imageError by remember { mutableStateOf(false) }
+    var confirmDelete by remember { mutableStateOf(false) }
+
+    val imagePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        imageError = false
+        val imported = importToolbarImage(context, imageDir, uri)
+        if (imported != null) {
+            val old = (background as? ToolbarBackground.Image)?.file
+            if (old != null && old != imported) {
+                runCatching { File(imageDir, old).delete() }
+            }
+            background = ToolbarBackground.Image(imported)
+        } else {
+            imageError = true
+        }
+    }
+
+    SettingsDialog(
+        onDismissRequest = onDismiss,
+        title = if (existing == null) {
+            stringResource(R.string.toolbar_new_toolbar)
+        } else {
+            stringResource(R.string.toolbar_edit_named, existing.name)
+        },
+        body = {
+            Column {
+                OutlinedTextField(
+                    shape = MaterialTheme.shapes.medium,
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text(text = stringResource(R.string.toolbar_toolbar_name)) },
+                    singleLine = true,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 4.dp),
+                )
+                NavRow(
+                    title = stringResource(R.string.toolbar_toolbar_background),
+                    subtitle = toolbarBackgroundSummary(background),
+                    onClick = { backgroundDialog = true },
+                )
+                if (existing != null) {
+                    NavRow(
+                        title = stringResource(R.string.toolbar_edit_buttons),
+                        subtitle = stringResource(
+                            R.string.toolbar_button_count,
+                            ToolbarUserStore.listRowCount(
+                                skinId,
+                                data,
+                                null,
+                                existing,
+                                existing.id == data.skins[skinId]?.activeToolbarId,
+                            ),
+                        ),
+                        onClick = { onEditButtons(existing.id) },
+                    )
+                }
+                if (imageError) {
+                    Text(
+                        text = stringResource(R.string.toolbar_image_error),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(start = 4.dp),
+                    )
+                }
+                if (errorText != null) {
+                    Text(
+                        text = errorText!!,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.padding(start = 4.dp, top = 4.dp),
+                    )
+                }
+                if (existing != null) {
+                    Spacer(Modifier.height(8.dp))
+                    OutlinedButton(
+                        onClick = { confirmDelete = true },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_delete),
+                            color = MaterialTheme.colorScheme.error,
+                        )
+                    }
+                }
+            }
+        },
+        actions = listOf(
+            SettingsDialogAction(
+                text = stringResource(R.string.cancel),
+                onClick = onDismiss,
+            ),
+            SettingsDialogAction(
+                text = stringResource(R.string.toolbar_save),
+                onClick = {
+                    if (name.isBlank()) {
+                        errorText = context.getString(R.string.toolbar_name_empty)
+                    } else {
+                        errorText = null
+                        val config = ToolbarCustomConfig(
+                            id = existing?.id ?: ToolbarUserStore.newCustomToolbarId(),
+                            name = name.trim(),
+                            buttons = existing?.buttons ?: emptyList(),
+                            background = background,
+                        )
+                        val problems = ToolbarUserStore.validateCustomToolbar(config, customButtons)
+                        if (problems.isEmpty()) {
+                            onSave(config, existing == null)
+                        } else {
+                            errorText = problems.joinToString("；")
+                        }
+                    }
+                },
+            ),
+        ),
+    )
+    if (backgroundDialog) {
+        SettingsDialog(
+            onDismissRequest = { backgroundDialog = false },
+            title = stringResource(R.string.toolbar_toolbar_background),
+            body = {
+                Column {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                backgroundDialog = false
+                                colorDialog = true
+                            }
+                            .padding(vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_bg_color),
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (background is ToolbarBackground.Color) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                background = ToolbarBackground.Transparent
+                                backgroundDialog = false
+                            }
+                            .padding(vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_bg_transparent),
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (background is ToolbarBackground.Transparent) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable {
+                                backgroundDialog = false
+                                imagePicker.launch(arrayOf("image/*"))
+                            }
+                            .padding(vertical = 10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.toolbar_bg_image),
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        if (background is ToolbarBackground.Image) {
+                            Icon(
+                                imageVector = Icons.Filled.Check,
+                                contentDescription = null,
+                            )
+                        }
+                    }
+                }
+            },
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = { backgroundDialog = false },
+                ),
+            ),
+        )
+    }
+    if (colorDialog) {
+        ToolbarColorDialog(
+            selected = (background as? ToolbarBackground.Color)?.argb,
+            includeFollow = false,
+            onSelect = { argb ->
+                if (argb != null) background = ToolbarBackground.Color(argb)
+            },
+            onDismiss = { colorDialog = false },
+        )
+    }
+    if (confirmDelete && existing != null) {
+        SettingsDialog(
+            onDismissRequest = { confirmDelete = false },
+            title = stringResource(R.string.toolbar_delete_toolbar_title),
+            description = stringResource(R.string.toolbar_delete_toolbar_note),
+            actions = listOf(
+                SettingsDialogAction(
+                    text = stringResource(R.string.cancel),
+                    onClick = { confirmDelete = false },
+                ),
+                SettingsDialogAction(
+                    text = stringResource(R.string.toolbar_delete),
+                    color = MaterialTheme.colorScheme.error,
+                    onClick = {
+                        confirmDelete = false
+                        onDelete(existing)
+                    },
+                ),
+            ),
+        )
+    }
+}

@@ -1,0 +1,580 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.data.manager
+
+import java.io.File
+import java.io.IOException
+import java.util.zip.ZipFile
+
+/**
+ * 多目录方案导入：SAF/下载的 zip 解压到独立新目录（同名合并覆盖），
+ * 再做 T9 字段注入、写启用表、切指针、部署、选首位方案。
+ *
+ * extractZip/stripTopDir/isProtectedEntry/ExtractResult 移植自 .6 单目录导入
+ * （feature/single-dir-scheme 的 SingleSchemeImport.kt），语义不变；
+ * 其余（目录名、T9 注入、导入编排）为本包新写。
+ * 调用方负责：zipFile 是已落盘的暂存文件（用后自删）；部署与选方案、
+ * 指针写盘、镜像写盘以 lambda 传入（本文件不碰引擎与 Context，便于单测）。
+ */
+
+/** 导入 zip 上限：256MiB（DESIGN P3；复制期与编排期双重检查）。 */
+const val MAX_IMPORT_ZIP_BYTES = 256L * 1024 * 1024
+
+/**
+ * 一次方案包解压的汇总结果。
+ *
+ * @property installed 实际写出的文件数。
+ * @property skippedProtected 因命中用户保护规则而跳过的文件数。
+ * @property skippedUnsafe 因路径不安全（穿越、绝对路径、canonical 校验失败）而跳过的文件数。
+ * @property newSchemaIds 根级方案文件（形如 `xxx.schema.yaml`）的主干名，按条目顺序，不去重。
+ * @property totalBytes 实际写出的总字节数。
+ */
+data class ExtractResult(
+    val installed: Int,
+    val skippedProtected: Int,
+    val skippedUnsafe: Int,
+    val newSchemaIds: List<String>,
+    val totalBytes: Long,
+)
+
+/**
+ * 计算可剥离的顶层目录前缀。
+ *
+ * 契约：
+ * - [names] 为空时返回 null。
+ * - 取首个名字的 `/` 之前部分为候选前缀；首个名字不含 `/` 时返回 null。
+ * - 全部名字都以 `前缀 + "/"` 开头时返回该前缀，否则返回 null。
+ */
+fun stripTopDir(names: List<String>): String? {
+    if (names.isEmpty()) return null
+    val first = names.first()
+    val slashIdx = first.indexOf('/')
+    if (slashIdx <= 0) return null
+    val prefix = first.substring(0, slashIdx)
+    val prefixSlash = prefix + "/"
+    if (prefix.isEmpty()) return null
+    for (name in names) {
+        if (!name.startsWith(prefixSlash)) return null
+    }
+    return prefix
+}
+
+/**
+ * 判断相对路径是否为受保护的用户文件（永不覆盖）。
+ *
+ * 契约：
+ * - rel 按 `/` 分段，任一段以 `.userdb` 结尾时返回 true。
+ * - 取最后一段为文件名：根级（只有一段）的 `default.yaml` 返回 true；
+ *   文件名以 `.custom.yaml` 结尾返回 true；文件名为 `custom_phrase.txt` 返回 true；
+ *   文件名以 `.userdict.txt` 结尾返回 true。
+ * - 其余返回 false。
+ */
+fun isProtectedEntry(rel: String): Boolean {
+    if (rel.isEmpty()) return false
+    val segments = rel.split('/')
+    for (segment in segments) {
+        if (segment.endsWith(".userdb")) return true
+    }
+    val fileName = segments.last()
+    if (segments.size == 1 && fileName == "default.yaml") return true
+    if (fileName.endsWith(".custom.yaml")) return true
+    if (fileName == "custom_phrase.txt") return true
+    if (fileName.endsWith(".userdict.txt")) return true
+    return false
+}
+
+/**
+ * 将 ZIP 方案包直接解压到目标目录（无事务与回滚）。
+ *
+ * 契约：
+ * - 用 [ZipFile] 打开；打不开或条目损坏时抛 [IOException]，由调用方处理。
+ * - 只处理文件条目；目录条目（名字以 `/` 结尾）忽略。
+ * - 用全部文件条目名计算 [stripTopDir]；有前缀时剥离 `前缀 + "/"`；剥离后为空的条目跳过（不计数）。
+ * - 相对路径含 `..` 段或为绝对路径（以 `/` 开头）时记 skippedUnsafe，不写盘。
+ * - [isProtectedEntry] 为真时记 skippedProtected，不写盘。
+ * - 其余条目写入 targetDir 下的同相对路径：写盘前做 canonical 前缀校验，失败记 skippedUnsafe；
+ *   父目录按需创建；同名直接覆盖（不删目标独有文件）。
+ * - 写盘成功记 installed 并累计写出字节数；相对路径只有一段且以 `.schema.yaml` 结尾时，
+ *   把文件名去掉后缀的主干记入 newSchemaIds（保持顺序，不去重）。
+ * - ZipFile 必须可靠关闭。
+ *
+ * @deprecated 旧编排入口：唯一入口为 SchemePackageImport.importPackageTransaction，
+ * 新代码勿用；旧 importPackage 已随 D-L2 删除。本文件的 injectT9Fields、
+ * injectOptionsSegments、repairSchemeFiles、determineDirName 仍在生产使用，不受此影响。
+ */
+@Deprecated(
+    message = "旧导入入口，唯一入口为 SchemePackageImport.importPackageTransaction",
+    level = DeprecationLevel.WARNING,
+)
+fun extractZip(zipFile: File, targetDir: File): ExtractResult {
+    targetDir.mkdirs()
+    ZipFile(zipFile).use { zip ->
+        val fileEntries = zip.entries().asSequence().filter { !it.isDirectory }.toList()
+        val entryNames = fileEntries.map { it.name }
+        val topDir = stripTopDir(entryNames)
+        val prefixSlash = topDir?.let { it + "/" } ?: ""
+
+        var installed = 0
+        var skippedProtected = 0
+        var skippedUnsafe = 0
+        var totalBytes = 0L
+        val newSchemaIds = mutableListOf<String>()
+
+        for (entry in fileEntries) {
+            var relativePath = entry.name
+            if (prefixSlash.isNotEmpty() && relativePath.startsWith(prefixSlash)) {
+                relativePath = relativePath.substring(prefixSlash.length)
+            }
+
+            if (relativePath.isEmpty()) continue
+
+            if (relativePath.startsWith("/") || relativePath.split("/").any { it == ".." }) {
+                skippedUnsafe += 1
+                continue
+            }
+
+            if (isProtectedEntry(relativePath)) {
+                skippedProtected += 1
+                continue
+            }
+
+            val outFile = File(targetDir, relativePath)
+            val targetCanonical = targetDir.canonicalFile
+            val outCanonical = outFile.canonicalFile
+            if (outCanonical != targetCanonical && !outCanonical.path.startsWith(targetCanonical.path + File.separator)) {
+                skippedUnsafe += 1
+                continue
+            }
+
+            outFile.parentFile?.mkdirs()
+
+            val bytes = zip.getInputStream(entry).use { input ->
+                outFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            totalBytes += bytes
+            installed += 1
+
+            val parts = relativePath.split("/")
+            if (parts.size == 1 && relativePath.endsWith(".schema.yaml")) {
+                newSchemaIds.add(relativePath.removeSuffix(".schema.yaml"))
+            }
+        }
+
+        return ExtractResult(installed, skippedProtected, skippedUnsafe, newSchemaIds, totalBytes)
+    }
+}
+
+/**
+ * 新目录名：包内单一顶层目录名优先，否则 zip 文件名去 .zip 后净化。
+ * 净化与保留名（build、初始目录）走 [SchemeDirs.importDirName]；结果为空、
+ * `.`、`..` 时回落为 `imported`（绝不让解压目标落到根本身）。
+ */
+fun determineDirName(topDir: String?, fallbackName: String): String {
+    val raw = topDir?.takeIf { it.isNotBlank() }
+        ?: fallbackName.removeSuffix(".zip").removeSuffix(".ZIP")
+    val cleaned = raw.takeIf { it.isNotBlank() } ?: "imported"
+    val named = SchemeDirs.importDirName(cleaned)
+    return named.takeIf { it.isNotBlank() && it != "." && it != ".." } ?: "imported"
+}
+
+/** T9 字段注入映射：按 [parseSchemaFile] 读出的 schema_id 命中，与文件名无关。 */
+private val T9_FIELD_INJECTIONS: Map<String, Map<String, String>> = mapOf(
+    "wanxiang_t9" to mapOf(
+        "layout" to "T9",
+        "punctuation" to "FullWidth",
+        "kind" to "PinYin",
+        "candidateKind" to "T9PinYin",
+    ),
+    // t9i 与 t9 同为九键拼音：缺 candidateKind 时左列“可能拼音”门控必空，
+    // 故与 t9 同口径注入；其 t9_processor 在当前 librime 内无注册，
+    // 部署时被软跳过（engine.cc 记错后 continue，不阻断部署）。
+    "wanxiang_t9i" to mapOf(
+        "layout" to "T9",
+        "punctuation" to "FullWidth",
+        "kind" to "PinYin",
+        "candidateKind" to "T9PinYin",
+    ),
+    "wanxiang_lite" to mapOf(
+        "layout" to "Qwerty",
+        "punctuation" to "FullWidth",
+        "kind" to "PinYin",
+        "candidateKind" to "PinYin",
+    ),
+    "wanxiang_english" to mapOf(
+        "layout" to "Qwerty",
+        "punctuation" to "HalfWidth",
+        "kind" to "English",
+    ),
+    // 混合编码与 lite 同为全键盘拼音系：英文直输、标点半角、候选拼音；
+    // 上游无 switches，故无 options 注入（见 OPTIONS_INJECTIONS 注释）。
+    "wanxiang_mixedcode" to mapOf(
+        "layout" to "Qwerty",
+        "punctuation" to "HalfWidth",
+        "kind" to "PinYin",
+        "candidateKind" to "PinYin",
+    ),
+)
+
+/** 一次注入的汇总：注入后正确的文件数（已改写或原本已正确），与读/写失败而跳过的文件主干名。 */
+data class InjectResult(
+    val injected: Int,
+    val skipped: List<String>,
+)
+
+/**
+ * 原子写盘（换位后注入用）：同目录写 `<文件名>.tmp` 再 rename 覆盖，
+ * 与 [SchemeEnabled.writeEnabledCustomFile] 同口径。写盘中途失败时
+ * 原文件保持旧内容（不截断、不半写），tmp 删掉；返回 false 表示
+ * 写盘未完成（调用方记 skipped）。同一线程同步执行，不换线程/队列；
+ * tmp 名与启用表的 tmp 名（default.custom.yaml.tmp）不冲突。
+ */
+internal fun writeInjectFileAtomically(file: File, text: String): Boolean {
+    val parent = file.parentFile ?: return false
+    val tmpFile = File(parent, file.name + ".tmp")
+    return try {
+        tmpFile.writeText(text)
+        if (!tmpFile.renameTo(file)) {
+            tmpFile.delete()
+            false
+        } else {
+            true
+        }
+    } catch (_: Exception) {
+        tmpFile.delete()
+        false
+    }
+}
+
+/**
+ * 对本次解压出的根级方案文件做 T9 字段注入（只改 schema: 段内四键）。
+ *
+ * 契约：
+ * - 每个主干名对应 `dir/<主干>.schema.yaml`；解析不到 schema_id（无 schema: 段、
+ *   读失败）时记 skipped，不中断。
+ * - schema_id 不在三映射内时原样不动（不计 injected、不计 skipped）。
+ * - 映射键：段内有则替换值（保留原缩进、值加双引号），无则插到段尾
+ *   （用段内首个键的缩进，无则两空格）；其余行（含 options/speller）原样不动。
+ * - wanxiang_english 不写 candidateKind，段内已有则删行。
+ * - 写盘走 tmp＋rename 原子写：写盘失败记 skipped、不中断，且原文件内容不变。
+ */
+fun injectT9Fields(dir: File, filenameStems: List<String>): InjectResult {
+    var injected = 0
+    val skipped = mutableListOf<String>()
+    for (stem in filenameStems) {
+        val file = File(dir, "$stem.schema.yaml")
+        val disk = try {
+            parseSchemaFile(file)
+        } catch (_: Exception) {
+            null
+        }
+        if (disk == null) {
+            skipped.add(stem)
+            continue
+        }
+        val fields = T9_FIELD_INJECTIONS[disk.id] ?: continue
+        val ok = try {
+            injectSchemaFields(file, fields, disk.id == "wanxiang_english")
+        } catch (_: Exception) {
+            false
+        }
+        if (ok) injected++ else skipped.add(stem)
+    }
+    return InjectResult(injected, skipped)
+}
+
+/** 一项 options 段条目：name/key/keys/lock/value 与内置三文件逐方案旧值一致。 */
+private data class OptionItem(
+    val name: String,
+    val key: String,
+    val keys: String,
+    val lock: Boolean,
+    val value: Boolean,
+)
+
+/**
+ * options 段注入映射：开关到引擎的唯一桥。导入的上游包本来就没有
+ * options: 段，不补则英文方案的 ascii_mode 等开关再次脱节（2026-10-19
+ * 旧修在多目录下的复发）。t9i 取与 t9 相同的口径。
+ * wanxiang_mixedcode 不在映射内：上游无 switches 段，options 无桥可接；
+ * 内置适配源同样不写 options（见 tools/wanxiang-builtin/README.md）。
+ */
+private val OPTIONS_INJECTIONS: Map<String, List<OptionItem>> = mapOf(
+    "wanxiang_t9" to listOf(
+        OptionItem("traditional_chinese_enabled", "s2t", "[s2s, s2t, s2hk, s2tw]", false, false),
+        OptionItem("emoji_enabled", "emoji", "[emoji]", false, false),
+        OptionItem("ascii_mode_enabled", "ascii_mode", "[ascii_mode]", true, false),
+    ),
+    "wanxiang_lite" to listOf(
+        OptionItem("traditional_chinese_enabled", "s2t", "[s2s, s2t, s2hk, s2tw]", false, false),
+        OptionItem("emoji_enabled", "emoji", "[emoji]", false, false),
+        OptionItem("ascii_mode_enabled", "ascii_mode", "[ascii_mode]", true, false),
+    ),
+    "wanxiang_english" to listOf(
+        OptionItem("traditional_chinese_enabled", "s2t", "[s2s, s2t, s2hk, s2tw]", true, false),
+        OptionItem("emoji_enabled", "emoji", "[emoji]", false, false),
+        OptionItem("ascii_mode_enabled", "ascii_mode", "[ascii_mode]", false, false),
+    ),
+    "wanxiang_t9i" to listOf(
+        OptionItem("traditional_chinese_enabled", "s2t", "[s2s, s2t, s2hk, s2tw]", false, false),
+        OptionItem("emoji_enabled", "emoji", "[emoji]", false, false),
+        OptionItem("ascii_mode_enabled", "ascii_mode", "[ascii_mode]", true, false),
+    ),
+)
+
+/**
+ * 对本次解压出的根级方案文件做 options 段注入（只改顶格 options: 段）。
+ *
+ * 契约（与 [injectT9Fields] 同口径）：
+ * - schema_id 不在映射内时原样不动（不计 injected、不计 skipped）。
+ * - 无 options: 段时在文件尾追加整段；有则逐项比对：缺项补整项，
+ *   已有项的 lock/value 与旧值不符则纠正，key/keys 原样不动。
+ * - 已正确的文件不改写（幂等，不 churn mtime）。
+ * - 解析不到 schema_id 或写盘异常记 skipped，不中断；写盘走 tmp＋rename
+ *   原子写，失败时原文件内容不变。
+ */
+fun injectOptionsSegments(dir: File, filenameStems: List<String>): InjectResult {
+    var injected = 0
+    val skipped = mutableListOf<String>()
+    for (stem in filenameStems) {
+        val file = File(dir, "$stem.schema.yaml")
+        val disk = try {
+            parseSchemaFile(file)
+        } catch (_: Exception) {
+            null
+        }
+        if (disk == null) {
+            skipped.add(stem)
+            continue
+        }
+        val expected = OPTIONS_INJECTIONS[disk.id] ?: continue
+        val ok = try {
+            val lines = file.readText().split("\n")
+            val out = transformOptionsLines(lines, expected)
+            if (out != lines) writeInjectFileAtomically(file, out.joinToString("\n")) else true
+        } catch (_: Exception) {
+            false
+        }
+        if (ok) injected++ else skipped.add(stem)
+    }
+    return InjectResult(injected, skipped)
+}
+
+/**
+ * 纯行变换：对方案文件行做 options 段注入，返回新行（调用方比对后写盘）。
+ * 顶格 `options:` 行缺失时在尾部追加整段；已有时逐项补齐/纠正 lock/value，
+ * 未知条目与空行原样保留。实现为整段重建，不做行号算术。
+ */
+private fun transformOptionsLines(
+    lines: List<String>,
+    expected: List<OptionItem>,
+): List<String> {
+    val optionsIdx = lines.indexOfFirst { line ->
+        val firstNonWs = line.indexOfFirst { !it.isWhitespace() }
+        firstNonWs == 0 && line.trim() == "options:"
+    }
+    if (optionsIdx < 0) {
+        val out = lines.toMutableList()
+        // split 尾空行（文件以换行结尾时）会把追加段顶到空行之后，
+        // 属正常空行分隔，不影响 YAML 解析。
+        out.add("options:")
+        for (item in expected) out.addAll(optionItemLines(item))
+        return out
+    }
+    var blockEnd = lines.size
+    for (i in optionsIdx + 1 until lines.size) {
+        val line = lines[i]
+        if (line.isBlank()) continue
+        val firstNonWs = line.indexOfFirst { !it.isWhitespace() }
+        if (firstNonWs == 0) {
+            blockEnd = i
+            break
+        }
+    }
+    val expectedByName = expected.associateBy { it.name }
+    val out = mutableListOf<String>()
+    out.addAll(lines.subList(0, optionsIdx + 1))
+    val seen = mutableSetOf<String>()
+    var i = optionsIdx + 1
+    while (i < blockEnd) {
+        val line = lines[i]
+        val m = ITEM_NAME_REGEX.find(line)
+        if (m == null) {
+            out.add(line)
+            i++
+            continue
+        }
+        var j = i + 1
+        while (j < blockEnd && ITEM_NAME_REGEX.find(lines[j]) == null) j++
+        val name = m.groupValues[2].trim()
+        val itemLines = lines.subList(i, j)
+        val want = expectedByName[name]
+        if (want != null) {
+            seen.add(name)
+            out.addAll(correctOptionItemLines(itemLines, want))
+        } else {
+            out.addAll(itemLines)
+        }
+        i = j
+    }
+    for (item in expected) {
+        if (item.name !in seen) out.addAll(optionItemLines(item))
+    }
+    out.addAll(lines.subList(blockEnd, lines.size))
+    return out
+}
+
+private val ITEM_NAME_REGEX = Regex("""^(\s*)- name: (.+)$""")
+
+/** 纠正单条目内的 lock/value 行（保留原缩进；缺失则补在条目尾）。 */
+private fun correctOptionItemLines(
+    itemLines: List<String>,
+    want: OptionItem,
+): List<String> {
+    val out = itemLines.toMutableList()
+    val lockIdx = out.indexOfFirst { it.trim().startsWith("lock:") }
+    if (lockIdx >= 0) {
+        val indent = out[lockIdx].substringBefore("lock:")
+        out[lockIdx] = indent + "lock: " + want.lock
+    } else {
+        out.add("    lock: " + want.lock)
+    }
+    val valueIdx = out.indexOfFirst { it.trim().startsWith("value:") }
+    if (valueIdx >= 0) {
+        val indent = out[valueIdx].substringBefore("value:")
+        out[valueIdx] = indent + "value: " + want.value
+    } else {
+        out.add("    value: " + want.value)
+    }
+    return out
+}
+
+private fun optionItemLines(item: OptionItem): List<String> = listOf(
+    "  - name: " + item.name,
+    "    key: " + item.key,
+    "    keys: " + item.keys,
+    "    lock: " + item.lock,
+    "    value: " + item.value,
+)
+
+/**
+ * 改写单个方案文件的 schema: 段：映射键替换/插入，english 删 candidateKind。
+ * 返回 false 当且仅当找不到顶格 `schema:` 行或原子写盘失败（调用方记 skipped）；
+ * 写盘失败时原文件内容不变。行尾换行按原文保留（split/join 不增不减）。
+ * 已正确的文件不改写（幂等）。
+ */
+private fun injectSchemaFields(
+    file: File,
+    fields: Map<String, String>,
+    deleteCandidateKind: Boolean,
+): Boolean {
+    val lines = file.readText().split("\n")
+    val out = transformSchemaLines(lines, fields, deleteCandidateKind) ?: return false
+    if (out != lines && !writeInjectFileAtomically(file, out.joinToString("\n"))) return false
+    return true
+}
+
+/** 纯行变换：对方案文件行做 schema: 段注入，返回新行；找不到顶格 schema: 行返回 null。 */
+internal fun transformSchemaLines(
+    lines: List<String>,
+    fields: Map<String, String>,
+    deleteCandidateKind: Boolean,
+): List<String>? {
+    val schemaIdx = lines.indexOfFirst { line ->
+        val firstNonWs = line.indexOfFirst { !it.isWhitespace() }
+        firstNonWs == 0 && line.trim() == "schema:"
+    }
+    if (schemaIdx < 0) return null
+    var blockEnd = lines.size
+    for (i in schemaIdx + 1 until lines.size) {
+        val line = lines[i]
+        if (line.isBlank()) continue
+        val firstNonWs = line.indexOfFirst { !it.isWhitespace() }
+        if (firstNonWs == 0) {
+            blockEnd = i
+            break
+        }
+    }
+    val found = mutableSetOf<String>()
+    val newBlock = mutableListOf<String>()
+    var blockIndent: String? = null
+    for (i in schemaIdx + 1 until blockEnd) {
+        val line = lines[i]
+        if (line.isBlank()) {
+            newBlock.add(line)
+            continue
+        }
+        val firstNonWs = line.indexOfFirst { !it.isWhitespace() }
+        if (firstNonWs <= 0) {
+            newBlock.add(line)
+            continue
+        }
+        val colon = line.indexOf(':')
+        if (colon <= 0) {
+            newBlock.add(line)
+            continue
+        }
+        val key = line.substring(0, colon).trim()
+        if (blockIndent == null) blockIndent = line.substring(0, firstNonWs)
+        if (deleteCandidateKind && key == "candidateKind") continue
+        val value = fields[key]
+        if (value != null) {
+            found.add(key)
+            newBlock.add(line.substring(0, firstNonWs) + key + ": \"" + value + "\"")
+        } else {
+            newBlock.add(line)
+        }
+    }
+    val indent = blockIndent ?: "  "
+    for ((key, value) in fields) {
+        if (key !in found) newBlock.add(indent + key + ": \"" + value + "\"")
+    }
+    val out = mutableListOf<String>()
+    out.addAll(lines.subList(0, schemaIdx + 1))
+    out.addAll(newBlock)
+    out.addAll(lines.subList(blockEnd, lines.size))
+    return out
+}
+
+/** 导入失败种类（调用方据此 toast；DEPLOY_FAILED/DEPLOY_TIMEOUT 时调用方回滚指针＋镜像）。 */
+enum class ImportFailure {
+    NOT_ZIP,
+    TOO_LARGE,
+    NO_SCHEMA,
+    /** 怪包：重复/冲突/超长/超深/超条目——包本身有问题，与磁盘错误区分。 */
+    BAD_PACKAGE,
+    IO_ERROR,
+    DEPLOY_FAILED,
+    DEPLOY_TIMEOUT,
+}
+
+/** 导入结果：成功带新目录名、新方案 id、注入汇总；失败带种类与原始异常（可空）。 */
+sealed interface ImportOutcome {
+    data class Success(
+        val dirName: String,
+        val newSchemaIds: List<String>,
+        val injected: Int,
+        val injectSkipped: List<String>,
+    ) : ImportOutcome
+
+    data class Failed(
+        val failure: ImportFailure,
+        val cause: Throwable? = null,
+    ) : ImportOutcome
+}
+
+/**
+ * 存量修复：对目录内已有的根级方案文件补齐 schema: 字段与 options: 段
+ * （与导入注入同口径，仅写内容有变的文件）。只修传入的目录，不动 shared。
+ * 调用点：目录切换前、设置页加载当前目录时——覆盖导入前已落盘的旧目录。
+ */
+fun repairSchemeFiles(dir: File) {
+    val stems = dir.listFiles { f -> f.isFile && f.name.endsWith(".schema.yaml") }
+        ?.map { it.name.removeSuffix(".schema.yaml") }
+        ?: return
+    if (stems.isEmpty()) return
+    injectT9Fields(dir, stems)
+    injectOptionsSegments(dir, stems)
+}
+

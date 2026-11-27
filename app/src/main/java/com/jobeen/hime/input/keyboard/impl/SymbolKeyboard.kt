@@ -1,0 +1,613 @@
+package com.jobeen.hime.input.keyboard.impl
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.content.Intent
+import android.graphics.Color
+import android.graphics.drawable.ColorDrawable
+import android.graphics.drawable.StateListDrawable
+import android.view.Gravity
+import android.view.MotionEvent
+import android.view.View
+import android.view.inputmethod.EditorInfo
+import android.text.TextUtils
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+import com.jobeen.hime.base.feedback.InputFeedbacks
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.data.PunctuationMode
+import com.jobeen.hime.data.Symbol
+import com.jobeen.hime.input.keyboard.key.GridKeyboardView
+import com.jobeen.hime.input.keyboard.key.KeyActionListener
+import com.jobeen.hime.input.keyboard.key.KeyDef
+import com.jobeen.hime.input.keyboard.key.KeyIds
+import com.jobeen.hime.input.keyboard.key.KeyView
+import com.jobeen.hime.input.keyboard.key.KeyboardAction
+import com.jobeen.hime.input.keyboard.key.KeyboardPopup
+import com.jobeen.hime.input.keyboard.key.KeyboardRippleView
+import com.jobeen.hime.input.keyboard.key.SidePanelKeyView
+import com.jobeen.hime.input.keyboard.key.TextKeyView
+import com.jobeen.hime.input.keyboard.key.resolveSwipeReleaseForward
+import com.jobeen.hime.input.keyboard.key.shouldInterceptHorizontalSwipe
+import com.jobeen.hime.skin.model.KeyboardTypes
+import com.jobeen.hime.skin.symbol.BarSide
+import com.jobeen.hime.skin.symbol.BoardAutoReturn
+import com.jobeen.hime.skin.symbol.SymbolItem
+import com.jobeen.hime.skin.symbol.SymbolItemActionResolver
+import com.jobeen.hime.skin.symbol.SharedPrefsSymbolBarTypeStore
+import com.jobeen.hime.skin.symbol.SharedPrefsUserSymbolBarStore
+import com.jobeen.hime.skin.symbol.UserSymbolBarOps
+import com.jobeen.hime.skin.symbol.SubClassifiedBoardState
+import com.jobeen.hime.skin.symbol.SubClassifiedSymbols
+import com.jobeen.hime.skin.symbol.SymbolBarState
+import com.jobeen.hime.skin.symbol.SymbolBarTypeCycler
+import com.jobeen.hime.skin.symbol.SymbolGridResolver
+import com.jobeen.hime.skin.symbol.SymbolGridSpec
+import com.jobeen.hime.skin.symbol.SymbolParentCategory
+import com.jobeen.hime.skin.symbol.SymbolSubCategory
+import com.jobeen.hime.skin.symbol.UserSymbolBarStore
+import com.jobeen.hime.ui.SymbolBarSettingsActivity
+import splitties.dimensions.dp
+import splitties.views.dsl.core.lParams
+import splitties.views.dsl.core.matchParent
+import com.jobeen.hime.data.Symbol.Category
+
+@SuppressLint("ViewConstructor")
+class SymbolKeyboard(
+    context: Context,
+    private val colors: KeyboardColors.ColorScheme,
+) : FrameLayout(context), ISubCollectionPageable {
+
+    companion object {
+        const val NAME = "Symbol"
+        private const val COLUMNS = 5
+        private const val ROWS = 5
+
+        /** 左右滑翻页的最小横移（dp）；未达此距离只算点按／竖滚。 */
+        private const val SWIPE_MIN_DISTANCE_DP = 48
+
+        /**
+         * 侧栏列高几何（WO43 v7，纯函数，可 JVM 单测）：左侧竖栏占
+         * contentH 的 4/5，底部返回区占 1/5；每格高恒等于主行高
+         * （contentH/5，主格 5 行），与主行逐格对齐；格间无分割线
+         * （渲染层本就不画分割线）。返回区高取余数
+         * （contentH − sidePanelH），两区之和恒等于 contentH，
+         * 整除余数不留 1px 缝。
+         */
+        internal fun sidePanelGeometry(contentH: Int): Pair<Int, Int> {
+            val sidePanelH = contentH * 4 / 5
+            return sidePanelH to (contentH - sidePanelH)
+        }
+
+        /**
+         * 左侧竖栏项（WO43 v7，纯函数，可 JVM 单测）：用户符号
+         * （15sp、Variant.Alternative）＋末尾“自定义”入口（第 17 项，
+         * 12sp、Variant.Normal，点开符号设置页），与九宫格左竖栏
+         * 同口径；入口随列表一起滑，滑到底才看见。
+         */
+        internal fun buildSidePanelItemDefs(
+            displays: List<String>,
+        ): List<KeyDef> =
+            displays.map { display ->
+                KeyDef(
+                    appearance = KeyDef.Appearance.Text(
+                        displayText = display, textSize = 15f, percentWidth = 0.5f,
+                        margin = false, variant = KeyDef.Appearance.Variant.Alternative,
+                    ),
+                    behaviors = setOf(KeyDef.Behavior.Press(KeyboardAction.CommitAction(display))),
+                )
+            } + customEntryDef()
+
+        /** 左竖栏“自定义”入口（WO43 v7）：与九宫格左竖栏同口径（见 T9Keyboard.customEntryDef）。 */
+        internal fun customEntryDef(): KeyDef = KeyDef(
+            appearance = KeyDef.Appearance.Text(
+                displayText = customEntryLabel(),
+                textSize = 12f,
+                percentWidth = 0.5f,
+                margin = false,
+                variant = KeyDef.Appearance.Variant.Normal,
+            ),
+            behaviors = setOf(KeyDef.Behavior.Press(KeyboardAction.OpenSymbolBarSettingsAction)),
+        )
+        /** P1-7 附加父类标签：数字符号集／九宫格符号集（各一“全部”子类）。 */
+        private const val NUMERIC_PARENT_LABEL = "数字"
+        private const val T9_PARENT_LABEL = "九宫格"
+        private var categorys: List<Pair<Category, Array<String>>> = Symbol.Symbol
+
+        private fun keyDef(item: SymbolItem): KeyDef {
+            return KeyDef(
+                appearance = KeyDef.Appearance.Text(
+                    displayText = item.displayText, textSize = 18f,
+                    percentWidth = 1f / COLUMNS,
+                    variant = KeyDef.Appearance.Variant.Alternative,
+                ),
+                behaviors = setOf(
+                    KeyDef.Behavior.Press(SymbolItemActionResolver.resolve(item))
+                ),
+            )
+        }
+    }
+
+    override var keyActionListener: KeyActionListener? = null
+
+    /**
+     * 左侧竖栏（2026-11-12 符号栏重做，WO43 v7）：显示用户自定义符号列
+     * （默认 16 符号＋末尾“自定义”入口，共 17 项，随列表一起滑）；
+     * 一屏 4 格，每格高等于主行高（contentH/5），与主行逐格对齐，
+     * 格间无分割线；底部返回钮固定占一格（contentH/5）。
+     * 不再显示分类——分类切换走顶部栏的类型切换钮。
+     */
+    private val sidePanelKey = SidePanelKeyView(
+        context, colors,
+        KeyDef.Appearance.SidePannel(
+            rowSpan = 4, visableRow = 4, margin = false,
+            variant = KeyDef.Appearance.Variant.Alternative,
+            border = KeyDef.Appearance.Border.On,
+        ),
+        keepSelection = false,
+    )
+
+    private val gridView = GridKeyboardView(context, colors, COLUMNS, ROWS).apply {
+        onKeyAction = { action ->
+            keyActionListener?.onKeyAction(action)
+            // 板内提交：提交后自动返回；
+            // 分类切换的提交由侧栏内部拦截，不经过此处。
+            if (action is KeyboardAction.CommitAction) maybeAutoReturn()
+        }
+        onKeyPressed = { key -> triggerRipple(key) }
+    }
+
+    private val rippleView = KeyboardRippleView(context).apply {
+        id = generateViewId()
+        isClickable = false
+        isEnabled = false
+        isFocusable = false
+    }
+
+    private val returnKeyDef = KeyDef(
+        appearance = KeyDef.Appearance.Text(
+            displayText = "返回", textSize = 15f,
+            textStyle = android.graphics.Typeface.BOLD,
+            percentWidth = 1f,
+            variant = KeyDef.Appearance.Variant.Alternative,
+        ),
+        behaviors = setOf(KeyDef.Behavior.Press(KeyboardAction.ResumeAction)),
+        // 功能锚点（定稿五.6）：只登记不覆写
+        id = KeyIds.Symbol.SYM_RETURN,
+    )
+
+    private val sideReturnBtn =
+        TextKeyView(context, colors, returnKeyDef.appearance as KeyDef.Appearance.Text)
+
+    private val barState = SymbolBarState(SharedPrefsSymbolBarTypeStore(context))
+    private var barView: LinearLayout? = null
+    private var barSwitchBtn: TextView? = null
+    private val barPopup = KeyboardPopup(context)
+
+    /** 用户自定义符号（2026-11-12 符号栏重做）：竖栏数据源，设置页改动下次打开即生效。 */
+    private val userSymbolStore: UserSymbolBarStore = SharedPrefsUserSymbolBarStore(context)
+
+    /**
+     * 标点模式（WO30 §3(9) 续）：竖栏显示／提交按此换算；默认全角，
+     * 与九宫格竖栏同口径（T9Keyboard.state）；唯一写入方是
+     * updatePunctuationMode（KeyboardStateManager.switchTo 下发）。
+     */
+    private var punctuationMode: PunctuationMode = PunctuationMode.FullWidth
+
+    /**
+     * 二级面板数据源：皮肤定义二级表时用皮肤表，否则既有一级表
+     * 转二级（每父仅一“全部”子类，此时子条隐藏、行为与旧板一致）。
+     * P1-7：皮肤另声明 numericSymbols／t9Symbols 时各附加一父类
+     * （数字／九宫格，各一“全部”子类），顺序在既有父类之后；
+     * 空集不附加（不占侧栏位）。
+     */
+    private val twoStageSymbols: SubClassifiedSymbols =
+        SubClassifiedSymbols.fromSingleLevel(categorys)
+    private val boardState = SubClassifiedBoardState(twoStageSymbols)
+
+
+    /** 横向符号条（48dp 横条，子条之下、网格之上；无规格时隐藏）。 */
+    private val hStripView: LinearLayout = LinearLayout(context).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setBackgroundColor(colors.specialKeyBackground)
+        visibility = View.GONE
+    }
+
+    /** 二级子条（48dp 横条，栏条之下、网格之上；单子类时隐藏）。 */
+    private val subStripView: LinearLayout = LinearLayout(context).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setBackgroundColor(colors.specialKeyBackground)
+        visibility = View.GONE
+    }
+
+    /** 左侧竖栏项（用户自定义符号列；设置改动后由 rebuildSidePanelSymbols 重建）。 */
+    private var sidePanelItemDefs: List<KeyDef> = emptyList()
+
+    /** 左右滑判定用：翻页最小横移。 */
+    private val swipeMinDistancePx = context.dp(SWIPE_MIN_DISTANCE_DP).toFloat()
+    private var downX = 0f
+    private var downY = 0f
+    private var swipingHorizontally = false
+
+    /**
+     * 拦截瞬间锁存的横向位移（P-低1）：拦截时位移已越过 48dp 且横向
+     * 占优，翻页／切分类方向即已锁定；抬手时按它决议，不再按抬手
+     * 瞬间位移重判（否则回缩再抬手落入死区）。null＝本次手势未拦截。
+     */
+    private var swipeLatchedDx: Float? = null
+
+    init {
+        sideReturnBtn.borderStroke = KeyboardManager.Keyboard.KeyBorderStroke.isEnabled(context)
+        sideReturnBtn.hMargin = 0
+        sideReturnBtn.vMargin = 0
+        sideReturnBtn.setOnClickListener {
+            keyActionListener?.onKeyAction(KeyboardAction.ResumeAction)
+        }
+        sideReturnBtn.onPressedChanged = { key ->
+            if (key.isPressed) triggerRipple(key)
+        }
+
+        isClickable = true
+
+        rebuildSidePanelSymbols()
+
+        sidePanelKey.setOnItemActionListener { action ->
+            if (action is KeyboardAction.OpenSymbolBarSettingsAction) {
+                // “自定义”入口就地处理：直接起符号设置页，不下发引擎、
+                // 不进服务分发（与 T9Keyboard.onAction 同口径）。
+                val intent = Intent(context, SymbolBarSettingsActivity::class.java)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                runCatching { context.startActivity(intent) }
+            } else if (action is KeyboardAction.CommitAction) {
+                // 竖栏符号：点按提交，提交后自动返回（与网格／横条同口径）。
+                dispatchBoardCommit(action.text)
+            } else {
+                keyActionListener?.onKeyAction(action)
+            }
+        }
+        rebuildSubStrip()
+        rebuildHorizontalStrip()
+
+
+        addView(sidePanelKey, lParams(0, matchParent))
+        addView(sideReturnBtn, lParams(0, matchParent))
+        addView(gridView, lParams(0, matchParent))
+        addView(subStripView, lParams(matchParent, 0))
+        addView(hStripView, lParams(matchParent, 0))
+        barView?.let { addView(it, lParams(matchParent, 0)) }
+        addView(rippleView, LayoutParams(matchParent, matchParent))
+    }
+
+    private fun categoryLabels(): List<String> = categorys.map { it.first.label }
+
+    private fun applyCategory(label: String) {
+        val index = boardState.parentLabels.indexOf(label)
+        if (index < 0) return
+        boardState.selectParent(index)
+        gridView.setItems(boardState.visibleItems.map { keyDef(it) })
+        // 2026-11-12：竖栏不再显示分类，无需 selectIndex；分类切换
+        // 只走顶部栏类型切换钮。
+        barSwitchBtn?.text = label
+        rebuildSubStrip()
+    }
+
+    /**
+     * 二级集合翻页（P1-5）：当前子类按页翻；页内无更多时
+     * 返回 false（窗口层空操作，不换父类）。翻页后只换网格，
+     * 父类／子类选中与子条不动。
+     */
+    override fun pageSubCollection(forward: Boolean): Boolean {
+        val changed = if (forward) boardState.nextPage() else boardState.prevPage()
+        if (changed) gridView.setItems(boardState.visibleItems.map { keyDef(it) })
+        return changed
+    }
+
+    /**
+     * 左右滑切分类（WO30 §3(5)）：
+     * 翻页（pageSubCollection）到端无动作时才走到这里；到端停，
+     * 不循环绕回。与顶栏按钮同款：先记 barState.currentType 再
+     * applyCategory（网格＋切换钮文案＋子条一起换）。
+     */
+    fun swipeCategory(forward: Boolean): Boolean {
+        val changed = if (forward) boardState.nextParent() else boardState.prevParent()
+        if (changed) {
+            val label = boardState.parentLabels[boardState.parentIndex]
+            barState.switchType(label)
+            applyCategory(label)
+        }
+        return changed
+    }
+
+    /**
+     * 左右滑翻页（施工单 18，与 emoji 板同款接线）：横向位移达到
+     * 翻页最小距离（48dp）且横向占优时才拦截（子键收 ACTION_CANCEL，
+     * 点按不触发）；未达翻页距离的横向小拖动不拦截、仍归子键点按
+     * （I-M2，见 EmojiKeyboard 同款注释）；竖向位移归网格滚动，
+     * 不拦截；抬手时按拦截瞬间锁存的方向翻页（P-低1，不再按抬手
+     * 瞬间位移重判）；翻页到端时改切分类（WO30 §3(5)），首／末分类
+     * 到端才无动作。
+     */
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onInterceptTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                downX = event.x
+                downY = event.y
+                swipingHorizontally = false
+                swipeLatchedDx = null
+                return false
+            }
+            MotionEvent.ACTION_MOVE -> {
+                if (!swipingHorizontally) {
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    if (shouldInterceptHorizontalSwipe(dx, dy, swipeMinDistancePx)) {
+                        swipingHorizontally = true
+                        swipeLatchedDx = dx
+                        return true
+                    }
+                }
+                return swipingHorizontally
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                swipingHorizontally = false
+                swipeLatchedDx = null
+                return false
+            }
+        }
+        return super.onInterceptTouchEvent(event)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_UP -> {
+                if (swipingHorizontally) {
+                    swipingHorizontally = false
+                    val dx = event.x - downX
+                    val dy = event.y - downY
+                    val latchedDx = swipeLatchedDx
+                    swipeLatchedDx = null
+                    resolveSwipeReleaseForward(latchedDx, dx, dy, swipeMinDistancePx)?.let { forward ->
+                        // WO30 §3(5)：先翻页；到端无动作时改切分类，
+                        // 首／末分类到端才无动作（不循环绕回）。
+                        if (!pageSubCollection(forward)) {
+                            swipeCategory(forward)
+                        }
+                    }
+                    return true
+                }
+            }
+            MotionEvent.ACTION_CANCEL -> {
+                swipingHorizontally = false
+                swipeLatchedDx = null
+                return true
+            }
+        }
+        return super.onTouchEvent(event)
+    }
+
+    /**
+     * 二级子条重建：当前父类子类少于 2 个时隐藏（既有一级表
+     * 转二级的常态，板行为与旧板一致）；否则横排子类格，格内
+     * 居中标签＋右上角标（badgeText，无角标时不画）；点格切
+     * 子类（只换网格，不动父类选中）；选中格以按压色标示。
+     */
+    private fun rebuildSubStrip() {
+        val subs = boardState.currentParent?.subCategories.orEmpty()
+        if (subs.size < 2) {
+            subStripView.visibility = View.GONE
+            subStripView.removeAllViews()
+            return
+        }
+        subStripView.visibility = View.VISIBLE
+        subStripView.removeAllViews()
+        subs.forEachIndexed { index, sub ->
+            val cell = FrameLayout(context).apply {
+                setBackgroundColor(
+                    if (index == boardState.subIndex) colors.specialKeyPressed
+                    else Color.TRANSPARENT,
+                )
+                setOnClickListener {
+                    if (boardState.selectSub(index)) {
+                        gridView.setItems(boardState.visibleItems.map { keyDef(it) })
+                        rebuildSubStrip()
+                    }
+                }
+            }
+            val label = TextView(context).apply {
+                gravity = Gravity.CENTER
+                setTextSize(15f)
+                setTextColor(colors.specialKeyText)
+                maxLines = 1
+                ellipsize = TextUtils.TruncateAt.END
+                text = sub.label
+            }
+            cell.addView(
+                label,
+                FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+            sub.badgeText?.let { badge ->
+                // S12：角标字号／颜色按皮肤（未写沿用旧 9／specialKeyText；
+                // 选中格用高亮色，未写高亮时沿用常规色）。
+                val badgeSelected = index == boardState.subIndex
+                val badgeView = TextView(context).apply {
+                    gravity = Gravity.CENTER
+                    setTextSize(9f)
+                    setTextColor(
+                        if (badgeSelected) {
+                            colors.specialKeyText
+                        } else {
+                            colors.specialKeyText
+                        },
+                    )
+                    text = badge
+                }
+                cell.addView(
+                    badgeView,
+                    FrameLayout.LayoutParams(
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        FrameLayout.LayoutParams.WRAP_CONTENT,
+                        Gravity.TOP or Gravity.END,
+                    ),
+                )
+            }
+            subStripView.addView(
+                cell,
+                LinearLayout.LayoutParams(
+                    0, LinearLayout.LayoutParams.MATCH_PARENT, 1f,
+                ),
+            )
+        }
+    }
+
+    /**
+     * 横向符号条重建：皮肤 v3 死壳删除后恒无规格，恒隐藏
+     * （旧板行为不变）。
+     */
+    private fun rebuildHorizontalStrip() {
+        // 皮肤 v3 死壳删除后横向符号条恒无规格，恒隐藏。
+        hStripView.visibility = View.GONE
+        hStripView.removeAllViews()
+    }
+
+
+    /**
+     * 左侧竖栏重建（2026-11-12 符号栏重做，WO43 v7）：显示用户自定义符号列
+     * （默认 16 符号＋末尾“自定义”入口，共 17 项），点格提交。init 与 onAttach
+     * 都调用——板实例复用时设置改动下次打开符号面板即生效。WO30 §3(9) 续：
+     * 显示与提交都按标点模式换算（与九宫格竖栏同口径）；「、」半角出「､」
+     * （U+FF64，WO33 核实补入换算表）、全角回「、」。
+     */
+    private fun rebuildSidePanelSymbols() {
+        val displays = UserSymbolBarOps.sidePanelSymbols(
+            userSymbolStore.load().symbols,
+            punctuationMode,
+        )
+        sidePanelItemDefs = buildSidePanelItemDefs(displays)
+        sidePanelKey.updateItems(sidePanelItemDefs)
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        val tw = MeasureSpec.getSize(widthMeasureSpec)
+        val th = MeasureSpec.getSize(heightMeasureSpec)
+        val sw = (tw * 0.15f).toInt()
+        val gw = tw - sw
+        // 接线轮 R5：栏可见时占顶 48dp，其余内容整体下移并压缩；
+        // 栏隐藏时 barH=0，与旧布局完全一致。子条同口径占顶 48dp。
+        val barH = if (barView?.visibility == View.VISIBLE) context.dp(48) else 0
+        val subH = if (subStripView.visibility == View.VISIBLE) context.dp(48) else 0
+        val hH = if (hStripView.visibility == View.VISIBLE) context.dp(48) else 0
+        val contentH = th - barH - subH - hH
+        // WO43 v7：侧栏 4/5、返回区 1/5（见 sidePanelGeometry）。
+        val (sidePanelH, returnRegionH) = sidePanelGeometry(contentH)
+        sidePanelKey.measure(mES(sw, MeasureSpec.EXACTLY), mES(sidePanelH, MeasureSpec.EXACTLY))
+        sideReturnBtn.measure(
+            mES(sw, MeasureSpec.EXACTLY), mES(returnRegionH, MeasureSpec.EXACTLY)
+        )
+        gridView.measure(mES(gw, MeasureSpec.EXACTLY), mES(contentH, MeasureSpec.EXACTLY))
+        subStripView.measure(mES(tw, MeasureSpec.EXACTLY), mES(subH, MeasureSpec.EXACTLY))
+        hStripView.measure(mES(tw, MeasureSpec.EXACTLY), mES(hH, MeasureSpec.EXACTLY))
+        barView?.measure(mES(tw, MeasureSpec.EXACTLY), mES(barH, MeasureSpec.EXACTLY))
+        // 同 EmojiKeyboard：波纹层补 measure/layout，否则宽高恒 0、
+        // 波纹从不显示（L1）
+        rippleView.measure(mES(tw, MeasureSpec.EXACTLY), mES(th, MeasureSpec.EXACTLY))
+        setMeasuredDimension(tw, th)
+    }
+
+    override fun onLayout(changed: Boolean, l: Int, t: Int, r: Int, b: Int) {
+        val sw = ((r - l) * 0.15f).toInt()
+        val barH = if (barView?.visibility == View.VISIBLE) context.dp(48) else 0
+        val subH = if (subStripView.visibility == View.VISIBLE) context.dp(48) else 0
+        val hH = if (hStripView.visibility == View.VISIBLE) context.dp(48) else 0
+        val contentH = (b - t) - barH - subH - hH
+        // WO43 v7：与 onMeasure 同一口径（见 sidePanelGeometry）。
+        val sidePanelH = sidePanelGeometry(contentH).first
+        barView?.layout(0, 0, r - l, barH)
+        subStripView.layout(0, barH, r - l, barH + subH)
+        hStripView.layout(0, barH + subH, r - l, barH + subH + hH)
+        val top = barH + subH + hH
+        sidePanelKey.layout(0, top, sw, top + sidePanelH)
+        sideReturnBtn.layout(0, top + sidePanelH, sw, top + contentH)
+        gridView.layout(sw, top, r - l, top + contentH)
+        rippleView.layout(0, 0, r - l, b - t)
+    }
+
+    private fun mES(size: Int, mode: Int) = MeasureSpec.makeMeasureSpec(size, mode)
+
+    override fun name(): String = NAME
+    override fun updateSpaceKeyText(text: String) {}
+    override fun updateDynamicTexts(values: Map<String, String>) {}
+    override fun updatePunctuationMode(mode: PunctuationMode) {
+        // 与九宫格同口径（T9Keyboard.updatePunctuationMode）：模式变了
+        // 才重建竖栏（init 与 onAttach 的重建不受影响）；本板是
+        // FrameLayout 而非 BaseKeyboard，IKeyboard 的该方法无超类实现可调。
+        val changed = mode != punctuationMode
+        punctuationMode = mode
+        if (changed) rebuildSidePanelSymbols()
+    }
+    override fun updateEditorInfo(info: EditorInfo, empty: Boolean, isComposing: Boolean) {}
+
+    override fun setRippleEnabled(enabled: Boolean) {
+        rippleView.rippleEnabled = enabled
+        rippleView.visibility = if (enabled) View.VISIBLE else View.INVISIBLE
+    }
+
+    private fun triggerRipple(key: KeyView) {
+        val keyLoc = IntArray(2)
+        val boardLoc = IntArray(2)
+        key.getLocationOnScreen(keyLoc)
+        getLocationOnScreen(boardLoc)
+        val cx = keyLoc[0] + key.width / 2f - boardLoc[0]
+        val cy = keyLoc[1] + key.height / 2f - boardLoc[1]
+        rippleView.startRipple(cx, cy, key)
+    }
+
+    /**
+     * 板内提交（审计 G）：提交先转发（窗口层透传服务层上屏），
+     * 再自动返回（板锁已删，提交恒返回）。
+     */
+    private fun dispatchBoardCommit(text: String) {
+        keyActionListener?.onKeyAction(KeyboardAction.CommitAction(text))
+        maybeAutoReturn()
+    }
+
+    private fun maybeAutoReturn() {
+        if (BoardAutoReturn.shouldReturnAfterCommit(KeyboardTypes.SYMBOLIC)) {
+            keyActionListener?.onKeyAction(KeyboardAction.BoardCommitReturnAction)
+        }
+    }
+
+    override fun onAttach() {
+        reset()
+        // 2026-11-12：竖栏符号每附着重建（设置改动下次打开符号面板即生效）。
+        rebuildSidePanelSymbols()
+        requestLayout()
+    }
+
+    override fun onDetach() {
+        rippleView.cancelRipple()
+        barPopup.dismiss()
+    }
+
+    fun reset() {
+        // 接线轮 R5：类型记忆恢复（存过且仍在父类表内时），否则首类。
+        val restored = barState.currentType
+        if (restored != null && boardState.parentLabels.contains(restored)) {
+            applyCategory(restored)
+        } else {
+            boardState.selectParent(0)
+            gridView.setItems(boardState.visibleItems.map { keyDef(it) })
+            // 2026-11-12：竖栏不再显示分类，无需 selectIndex。
+            barSwitchBtn?.text = boardState.parentLabels.firstOrNull()
+                ?: categorys.first().first.label
+            rebuildSubStrip()
+        }
+        sidePanelKey.resetPosition()
+    }
+}

@@ -1,0 +1,711 @@
+package com.jobeen.hime.input.panel
+
+import android.animation.ValueAnimator
+import android.annotation.SuppressLint
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.RectF
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.LinearGradient
+import android.graphics.Paint
+import android.graphics.Shader
+import android.view.MotionEvent
+import android.view.View
+import com.jobeen.hime.R
+import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.engine.data.EngineMessage
+import com.jobeen.hime.input.panel.toolbar.CustomButtonSlot
+import com.jobeen.hime.input.panel.toolbar.CustomDisplayKind
+import com.jobeen.hime.input.panel.toolbar.EffectiveToolbarButton
+import com.jobeen.hime.input.panel.toolbar.ToolbarBackground
+import com.jobeen.hime.input.panel.toolbar.ToolbarRenderer
+import com.jobeen.hime.input.panel.toolbar.ToolbarToggleState
+import com.jobeen.hime.input.panel.toolbar.ToolbarUserStore
+import com.jobeen.hime.input.panel.toolbar.voiceInputEnabled
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.skin.icon.MaterialSymbols
+import com.jobeen.hime.input.panel.toolbar.ToolbarConfig
+import com.jobeen.hime.input.panel.toolbar.ToolbarRendererResources
+import com.jobeen.hime.skin.model.SkinAction
+import com.jobeen.hime.skin.runtime.KeyActionMapping
+import java.io.File
+import kotlin.math.abs
+import kotlin.math.max
+
+@SuppressLint("UseCompatLoadingForDrawables")
+class KawaiiPanelView(context: Context) : View(context) {
+
+    var currentRenderer: IRenderer
+    var scrollX = 0f
+    var onTap: ((KawaiiPanel.TouchResult?) -> Unit)? = null
+    var onExpandChanged: ((Boolean, List<EngineMessage.Candidate>) -> Unit)? = null
+    var isExpanded: Boolean = false
+        private set
+
+    var recording: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            currentRenderer.recording = value
+            invalidate()
+        }
+
+    /**
+     * 工具栏隐藏：只藏中间按钮区，首尾固定槽与候选渲染不受影响；
+     * 条区仍在（条高不归零，见窗口层）。标志存在 View 层，
+     * 绘制与触摸前经 syncToolbarHiddenToRenderer 同步到当前渲染器。
+     */
+    var toolbarHidden: Boolean = false
+        set(value) {
+            if (field == value) return
+            field = value
+            (currentRenderer as? ToolbarRenderer)?.toolbarHidden = value
+            // WO52 5.2 门禁：验证码提示条画在工具栏中央区，工具栏隐藏
+            // 时提示条无处显示，同步给剪贴板监听侧的门禁。
+            com.jobeen.hime.data.manager.ClipboardManager.toolbarVisible = !value
+            invalidate()
+        }
+
+    /**
+     * 渲染器在状态切换时常新建（init 块内直接赋值，故 currentRenderer
+     * 不能带自定义 setter）：新建实例的隐藏标志默认关，绘制与触摸
+     * 前在此统一从 View 层同步，隐藏不因渲染器重建而丢失。
+     */
+    private fun syncToolbarHiddenToRenderer() {
+        val renderer = currentRenderer as? ToolbarRenderer ?: return
+        if (renderer.toolbarHidden != toolbarHidden) renderer.toolbarHidden = toolbarHidden
+    }
+
+    fun collapse() {
+        if (!isExpanded) return
+        isExpanded = false
+        onExpandChanged?.invoke(false, emptyList())
+        invalidate()
+    }
+
+    fun setExpanded(expanded: Boolean) {
+        if (isExpanded == expanded) return
+        isExpanded = expanded
+        if (expanded) {
+            val candidates = (currentRenderer as? ComposingRenderer)?.candidates ?: return
+            onExpandChanged?.invoke(true, candidates)
+        } else {
+            onExpandChanged?.invoke(false, emptyList())
+        }
+        invalidate()
+    }
+
+    private val paints = Paints(context)
+
+    // 背景渐变缓存：只在尺寸/颜色变化时重建，onDraw 内零分配
+    private val bgGradPaint = Paint()
+    private var bgGradW = -1
+    private var bgGradH = -1
+    private var bgGradColor = 0
+    private var bgGradKeyboardBg = 0
+    /**
+     * 栏背景全局开关（2026-10-29 外观轮）：共享背景＝栏不画
+     * 自有底、窗口背景横跨键盘＋栏；磨砂＝栏底半透明叠加
+     * （窗口背景柔和透出，非逐像素实时模糊，零热路径开销）。
+     * refreshTheme 内读取偏好缓存，onDraw 只读缓存字段。
+     */
+    private var barSharedBackground: Boolean = false
+    private var barBlurAlpha: Int = 255
+
+    /**
+     * 用户覆盖工具栏的栏背景（工具栏编辑轮）：非 null 时 onDraw
+     * 以它代替换渐变底（纯色＝实色矩形，透明＝不画底，图片＝
+     * 居中裁剪铺满；图片解码失败则回落渐变底，永不空白）。
+     * 生效栏切换回默认／皮肤时清回 null。
+     */
+    private var userBarBackground: ToolbarBackground? = null
+    private var userBarBitmap: Bitmap? = null
+    private val userBarColorPaint = Paint()
+
+    /**
+     * 自定义按钮手势机（工具栏编辑轮，仅自定义钮生效，池钮
+     * 走既有点击路、行为零变化）：
+     * - DOWN 命中自定义钮 → 记钮＋ 500ms 长按待发；
+     * - MOVE 累计位移 ＞8dp → 取消长按、点按失效；主导轴 ≥36dp
+     *   （与按键滑动阈值同口径）→ 发对应方向滑动动作、只发一次；
+     * - UP 未发过动作且未失效 → 点按；300ms 内同钮再点且有
+     *   双击绑定 → 发双击，否则再发一次点按（点按立即发，不
+     *   为等双击拖 300ms；无双击绑定时双击即两次点按）。
+     * 录音态不发任何自定义动作（与 handleUp 的录音门同口径）。
+     */
+    private var customDown: com.jobeen.hime.input.panel.toolbar.ToolbarCustomButton? = null
+    private var customGestureDone: Boolean = false
+    private var customTapInvalid: Boolean = false
+    private var lastCustomTapId: String? = null
+    private var lastCustomTapTime: Long = 0L
+    private val customLongPressRunnable = Runnable {
+        val def = customDown ?: return@Runnable
+        if (fireCustom(def, CustomButtonSlot.LONG_PRESS)) {
+            customGestureDone = true
+        }
+    }
+
+    /** 自定义槽位执行：无绑定／录音态／转译失败皆静默（失败记日志，只记元数据）。 */
+    private fun fireCustom(
+        def: com.jobeen.hime.input.panel.toolbar.ToolbarCustomButton,
+        slot: CustomButtonSlot,
+    ): Boolean {
+        if (recording) return false
+        val binding = def.bindings[slot] ?: return false
+        val runtime = runCatching {
+            KeyActionMapping.toRuntime(SkinAction.Command(binding.action, binding.value))
+        }.onFailure { error ->
+            DiagLog.e(
+                "toolbar", "toolbar_custom_action_failed",
+                mapOf(
+                    "slot" to slot.jsonName,
+                    "action" to binding.action.formatName,
+                    "errorClass" to error.javaClass.simpleName,
+                ),
+            )
+        }.getOrNull() ?: return false
+        val renderer = currentRenderer as? ToolbarRenderer ?: return false
+        renderer.pressCx = lastTouchX
+        renderer.pressCy = height / 2f
+        renderer.pressRadiusMax = height * 0.55f
+        renderer.pressRadius = 0f
+        startPressAnimation(renderer)
+        onTap?.invoke(KawaiiPanel.TouchResult.CustomKeyAction(runtime))
+        return true
+    }
+
+    private fun clearCustomGesture() {
+        longPressHandler.removeCallbacks(customLongPressRunnable)
+        customDown = null
+        customGestureDone = false
+        customTapInvalid = false
+    }
+
+    /**
+     * 用户覆盖工具栏应用（init＋refreshTheme 后调用，用户胜过
+     * 皮肤；无用户配置则清覆盖、回落既有皮肤／默认路）。
+     * 皮肤 id 取当前快照，无快照＝内置主题态（builtin 键）。
+     * 图片解码上限最长边 256px；失败记日志、该钮回落文字
+     * （图片钮 display 为空时画空白，与缺图标既有行为一致）。
+     */
+    private fun applyUserToolbar(renderer: ToolbarRenderer) {
+        userBarBitmap?.recycle()
+        userBarBitmap = null
+        userBarBackground = null
+        val skinId = ToolbarUserStore.BUILTIN_SKIN_KEY
+        val file = File(context.filesDir, ToolbarUserStore.FILE_NAME)
+        val loaded = ToolbarUserStore.load(file)
+        if (loaded.corrupt) {
+            DiagLog.e(
+                "toolbar", "toolbar_user_load_failed",
+                mapOf("errorClass" to (loaded.errorClass ?: "unknown")),
+            )
+        }
+        val resolved = ToolbarUserStore.resolve(skinId, loaded.data)
+        if (resolved == null) {
+            renderer.clearUserCenter()
+            return
+        }
+        val imageDir = File(context.filesDir, ToolbarUserStore.IMAGE_DIR)
+        val items = resolved.buttons.map { button ->
+            when (button) {
+                is EffectiveToolbarButton.Pool -> ToolbarRenderer.UserCenterItem.Pool(button.action)
+                is EffectiveToolbarButton.Custom -> {
+                    val def = button.def
+                    val bitmap = if (def.kind == CustomDisplayKind.IMAGE) {
+                        val name = ToolbarUserStore.sanitizeImageFile(def.imageFile)
+                        if (name == null) null else decodeToolbarImage(File(imageDir, name), def.id)
+                    } else null
+                    ToolbarRenderer.UserCenterItem.Custom(def, bitmap)
+                }
+            }
+        }
+        // 按按钮图标覆盖：字符串值（内置资产／符号名）原样传渲染层；
+        // 上传图片值（image:<basename>）在此解码成 Drawable 传过去，
+        // 解码失败（文件丢了／坏了）时该项不传、按钮回落默认图标。
+        // 只处理列内池钮的覆盖，自定义钮图标走定义本身、悬空项忽略。
+        val stringIconOverrides = mutableMapOf<String, String>()
+        val drawableIconOverrides = mutableMapOf<String, Drawable>()
+        for (item in items) {
+            val pool = item as? ToolbarRenderer.UserCenterItem.Pool ?: continue
+            val id = ToolbarConfig.POOL.find { it.action == pool.action }?.id ?: continue
+            val iconId = resolved.iconOverrides[id] ?: continue
+            if (iconId.startsWith(ToolbarUserStore.IMAGE_ICON_PREFIX)) {
+                val name = ToolbarUserStore.sanitizeImageFile(
+                    iconId.removePrefix(ToolbarUserStore.IMAGE_ICON_PREFIX),
+                )
+                val bitmap = if (name == null) null else decodeToolbarImage(
+                    File(imageDir, name), id,
+                )
+                if (bitmap != null) {
+                    drawableIconOverrides[id] = BitmapDrawable(context.resources, bitmap)
+                }
+            } else if (iconId.isNotBlank()) {
+                stringIconOverrides[id] = iconId
+            }
+        }
+        renderer.updateUserCenter(items, stringIconOverrides, drawableIconOverrides)
+        userBarBackground = resolved.background
+        val bg = resolved.background
+        if (bg is ToolbarBackground.Image) {
+            val name = ToolbarUserStore.sanitizeImageFile(bg.file)
+            userBarBitmap = if (name == null) null else decodeToolbarImage(
+                File(imageDir, name), "background",
+            )
+        }
+        invalidate()
+    }
+
+    /**
+     * 状态切换后重压用户覆盖层：状态渲染器每次新建（只含皮肤／
+     * 默认），须在此复用 applyUserToolbar 压上用户栏，否则用户
+     * 工具栏在第一次状态切换后即消失、直到主题刷新才恢复。
+     * 非 ToolbarRenderer 态（组字／预测用 ComposingRenderer）不动。
+     */
+    fun reapplyUserToolbar() {
+        (currentRenderer as? ToolbarRenderer)?.let { applyUserToolbar(it) }
+    }
+
+    private fun decodeToolbarImage(file: File, id: String): Bitmap? {
+        return runCatching {
+            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+            BitmapFactory.decodeFile(file.absolutePath, bounds)
+            if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+            var sample = 1
+            while (max(bounds.outWidth, bounds.outHeight) / sample > 256) sample *= 2
+            val opts = BitmapFactory.Options().apply { inSampleSize = sample }
+            BitmapFactory.decodeFile(file.absolutePath, opts)
+        }.onFailure { error ->
+            DiagLog.w(
+                "toolbar", "toolbar_image_decode_failed",
+                mapOf("id" to id, "errorClass" to error.javaClass.simpleName),
+            )
+        }.getOrNull()
+    }
+    private var lastTouchX = 0f
+    private var lastTouchY = 0f
+    private var isScrolling = false
+    private val screenDensity = resources.displayMetrics.density
+
+    init {
+        paints.updateColors(context)
+        paints.applyDensity(screenDensity)
+        val hPad = KeyboardManager.Keyboard.Padding.getHorizontalDp(context).toFloat()
+        currentRenderer = ToolbarRenderer(
+            ToolbarRendererResources(
+                context.getDrawable(R.drawable.ic_keyboard_menu),
+                context.getDrawable(R.drawable.ic_keyboard_arrow_back),
+                context.getDrawable(R.drawable.ic_keyboard_clipboard),
+                context.getDrawable(R.drawable.ic_keyboard_keyboard_close),
+                context.getDrawable(R.drawable.ic_keyboard_trash),
+                context.getDrawable(R.drawable.ic_toolbar_emoji),
+                context.getDrawable(R.drawable.ic_toolbar_select_all),
+                context.getDrawable(R.drawable.ic_toolbar_copy),
+                context.getDrawable(R.drawable.ic_toolbar_paste),
+                context.getDrawable(R.drawable.ic_keyboard_search),
+                traditionalChinese = context.getDrawable(R.drawable.ic_keyboard_traditional_ch),
+                voice = context.getDrawable(R.drawable.ic_keyboard_voice),
+                voicePlugin = context.getDrawable(R.drawable.ic_keyboard_tune),
+            ),
+            hPad,
+            centerActions = ToolbarConfig.DEFAULT_ACTIONS,
+            centerIconOverrides = emptyMap(),
+            // Symbol 名解析接线（参考项）：中央按钮 icon 不是
+            // 包内资产 id 时查 Material Symbols 注册表。
+            symbolIconProvider = { name ->
+                MaterialSymbols.drawable(
+                    context, name, (24f * screenDensity).toInt().coerceAtLeast(1),
+                )
+            },
+            // 开关启用判定（E6）：与菜单网格同口径。
+            toggleActive = { action -> ToolbarToggleState.isActive(context, action) },
+            // 语音入口可见判定（H2-13）：总开关关时工具栏语音键隐藏。
+            voiceEnabled = { voiceInputEnabled(context) },
+        ).also { renderer ->
+            // 其后用户覆盖层再压一层（有用户配置则胜出，无则不动既有路）。
+            // P4：锁定通知样式解析用当前配色方案（与 refreshTheme 同步）。
+            renderer.scheme = KeyboardColors.resolve(context)
+            applyUserToolbar(renderer)
+        }
+    }
+
+    fun refreshTheme(type: String? = null) {
+        paints.updateColors(context, type)
+        // 字号随皮肤切换即时生效（updateColors 只同步字号变量，
+        // 实际 Paint 字号由 applyDensity 写；此前 refreshTheme 不刷
+        // 密度，皮肤字号字段须追加这一行）。
+        paints.applyDensity(resources.displayMetrics.density)
+        // 全局样式已删：栏共用背景／栏模糊是纯全局值，无主题／皮肤来源，取默认值。
+        barSharedBackground = false
+        barBlurAlpha = 255
+        // 工具栏配置可能刚被设置页改过、或皮肤刚应用/切换：长驻
+        // 渲染器在此重抉择（有皮肤构成用皮肤，否则回落出厂默认）。
+        // 其后用户覆盖层再压一层（工具栏编辑轮，分层：用户＞皮肤＞默认）。
+        (currentRenderer as? ToolbarRenderer)?.let { renderer ->
+            renderer.updateCenterActions(ToolbarConfig.DEFAULT_ACTIONS, emptyMap())
+            // P4：锁定通知样式解析用当前配色方案（主题变化时同步；
+            // G1：有类型样式集时取类型色板）。
+            renderer.scheme = panelColorScheme(context, type)
+            applyUserToolbar(renderer)
+        }
+        invalidate()
+    }
+
+    fun updateHorizontalPadding(hPadDp: Float) {
+        when (val r = currentRenderer) {
+            is ToolbarRenderer -> r.horizontalPaddingDp = hPadDp
+            is ComposingRenderer -> r.horizontalPaddingDp = hPadDp
+        }
+        invalidate()
+    }
+
+    override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+        setMeasuredDimension(
+            MeasureSpec.getSize(widthMeasureSpec),
+            MeasureSpec.getSize(heightMeasureSpec),
+        )
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        if (width <= 0 || height <= 0) return
+        syncToolbarHiddenToRenderer()
+        // 用户自定义栏背景（工具栏编辑轮）优先于渐变底；透明＝不画底。
+        val userBg = userBarBackground
+        if (userBg is ToolbarBackground.Transparent) {
+            // 不画底，窗口背景直接透出。
+        } else if (userBg is ToolbarBackground.Color) {
+            userBarColorPaint.color = userBg.argb
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), userBarColorPaint)
+        } else if (userBg is ToolbarBackground.Image && userBarBitmap != null) {
+            val bitmap = userBarBitmap!!
+            val scale = max(
+                width.toFloat() / bitmap.width,
+                height.toFloat() / bitmap.height,
+            )
+            val w = bitmap.width * scale
+            val h = bitmap.height * scale
+            val dst = RectF((width - w) / 2f, (height - h) / 2f, (width + w) / 2f, (height + h) / 2f)
+            canvas.drawBitmap(bitmap, null, dst, null)
+        } else if (!barSharedBackground) {
+            // 横条区背景（审计 B 项）：仅组字渲染器态用区样式背景，
+            // 工具栏态仍用面板底（区样式只属于候选区）。
+            val bgColor = if (currentRenderer is ComposingRenderer) {
+                paints.candidateStripBg ?: paints.bgPaint.color
+            } else {
+                paints.bgPaint.color
+            }
+            val kbBg = paints.keyboardBackground
+            if (width != bgGradW || height != bgGradH || bgColor != bgGradColor || kbBg != bgGradKeyboardBg) {
+                bgGradPaint.set(paints.bgPaint)
+                bgGradPaint.shader = LinearGradient(
+                    0f, 0f, 0f, height.toFloat(),
+                    intArrayOf(bgColor, bgColor, kbBg),
+                    floatArrayOf(0f, 0.6f, 1f),
+                    Shader.TileMode.CLAMP,
+                )
+                bgGradW = width
+                bgGradH = height
+                bgGradColor = bgColor
+                bgGradKeyboardBg = kbBg
+            }
+            bgGradPaint.alpha = barBlurAlpha
+            canvas.drawRect(0f, 0f, width.toFloat(), height.toFloat(), bgGradPaint)
+        }
+        currentRenderer.draw(canvas, width, height, paints, scrollX, isExpanded, screenDensity)
+    }
+
+    private var pressAnimator: ValueAnimator? = null
+    private var expandLongPressed = false
+    /** 候选菜单长按已发（审计 I 项）：与 expandLongPressed 同理，抬手不补点选。 */
+    private var menuLongPressed = false
+    private var dragTotalX = 0f
+    private var dragTotalY = 0f
+
+    // 当前手势的指针 id：只认第一根落指的手指，其他手指的事件不干扰本手势
+    private var activePointerId = -1
+
+    // 延迟触发的工具栏动作（Palette 300ms / CloseKeyboard 100ms）：
+    // 用具名 Runnable 以便取消——新按下、输入结束、View 分离时必须清掉，
+    // 否则过期的点击会在错误的状态下迟到触发
+    private var delayedPalette: Runnable? = null
+    private var delayedClose: Runnable? = null
+
+    fun cancelDelayedTaps() {
+        delayedPalette?.let { removeCallbacks(it) }
+        delayedClose?.let { removeCallbacks(it) }
+        delayedPalette = null
+        delayedClose = null
+    }
+
+    override fun onDetachedFromWindow() {
+        cancelDelayedTaps()
+        longPressHandler.removeCallbacks(longPressRunnable)
+        clearCustomGesture()
+        // 工具栏按压扩散动画同为本 View 自有资源：不取消会在分离后
+        // 继续驱动已脱窗 View 的重绘（§6#6）
+        pressAnimator?.cancel()
+        pressAnimator = null
+        // 只 cancel 会把渲染器状态冻结在中间值（pressRadius>0 即被
+        // ToolbarRenderer 绘制），重挂后留下一个静止的半透明按压圆：
+        // 与动画一并把渲染器状态直接清零
+        (currentRenderer as? ToolbarRenderer)?.let {
+            it.pressRadius = 0f
+            it.pressAlpha = 0
+        }
+        clearStripPressed()
+        super.onDetachedFromWindow()
+    }
+    private val longPressHandler = Handler(Looper.getMainLooper())
+    private val longPressRunnable = Runnable {
+        val result = currentRenderer.hitTest(
+            lastTouchX, lastTouchY, width, height, scrollX, isExpanded, screenDensity,
+        )
+        if (result is KawaiiPanel.TouchResult.ExpandCandidates || result is KawaiiPanel.TouchResult.CollapseCandidates) {
+            expandLongPressed = true
+            onTap?.invoke(KawaiiPanel.TouchResult.LongPressExpand)
+        } else if (result is KawaiiPanel.TouchResult.ToolbarAction && result.action is PanelAction.AddPhrase) {
+            expandLongPressed = true
+            onTap?.invoke(KawaiiPanel.TouchResult.LongPressClearPhrases)
+        } else if (result is KawaiiPanel.TouchResult.SelectCandidate) {
+            // 候选菜单（审计 I 项）：皮肤 v3 死壳删除后菜单恒为空，
+            // 长按候选无动作（旧行为）。
+        }
+    }
+
+    private fun isRecordingAllowed(result: KawaiiPanel.TouchResult?): Boolean {
+        return when (result) {
+            is KawaiiPanel.TouchResult.ToolbarAction -> result.action is PanelAction.CloseKeyboard
+
+            is KawaiiPanel.TouchResult.CollapseCandidates -> true
+            is KawaiiPanel.TouchResult.ClosePredictions -> true
+            else -> false
+        }
+    }
+
+    private fun startPressAnimation(renderer: ToolbarRenderer) {
+        pressAnimator?.cancel()
+        // 峰值 alpha 160：120 时素白、落日两套浅色主题的涟漪混合色与
+        // 面板底对比只有约 2.3 / 1.9（低于 3:1）；提到 160 并配合墨色
+        // 取各主题 keyText 后三套分别为约 7.6 / 5.8 / 4.1（复算口径
+        // 见 KeyboardThemePresets 各主题 toolbarPressed 注释）
+        renderer.pressAlpha = 160
+        renderer.pressRadius = 0f
+        pressAnimator = ValueAnimator.ofFloat(0f, renderer.pressRadiusMax).apply {
+            duration = 300
+            addUpdateListener {
+                renderer.pressRadius = animatedValue as Float
+                invalidate()
+            }
+            start()
+        }
+    }
+
+    fun playToolbarPressAt(x: Float, y: Float) {
+        val renderer = currentRenderer as? ToolbarRenderer ?: return
+        renderer.hitTest(x, y, width, height, scrollX, isExpanded, screenDensity)
+        startPressAnimation(renderer)
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    override fun onTouchEvent(event: MotionEvent): Boolean {
+        syncToolbarHiddenToRenderer()
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                // 已有手指在进行手势时，第二根手指不重启手势
+                if (activePointerId != -1) return true
+                activePointerId = event.getPointerId(0)
+                cancelDelayedTaps()
+                lastTouchX = event.getX(0)
+                lastTouchY = event.getY(0)
+                dragTotalX = 0f
+                dragTotalY = 0f
+                isScrolling = false
+                expandLongPressed = false
+                menuLongPressed = false
+                if (!recording) longPressHandler.postDelayed(longPressRunnable, 500)
+                // 自定义钮 DOWN 探针（仅自定义钮建手势态，池钮不动既有路）。
+                val customHit = (currentRenderer as? ToolbarRenderer)?.userCenterHit(
+                    event.getX(0), width, screenDensity,
+                ) as? ToolbarRenderer.UserCenterItem.Custom
+                if (customHit != null) {
+                    customDown = customHit.def
+                    customGestureDone = false
+                    customTapInvalid = false
+                    longPressHandler.postDelayed(customLongPressRunnable, 500)
+                }
+                // 横条按压反馈（审计 I 项）：DOWN 命中候选即置位，
+                // 渲染器当帧起画按压底；非候选命中（展开钮等）不置位。
+                (currentRenderer as? ComposingRenderer)?.let { renderer ->
+                    val hit = renderer.hitTest(
+                        event.getX(0), event.getY(0), width, height, scrollX, isExpanded, screenDensity,
+                    )
+                    if (hit is KawaiiPanel.TouchResult.SelectCandidate && hit.index >= 0) {
+                        renderer.pressedIndex = hit.index
+                        invalidate()
+                    }
+                }
+            }
+
+            MotionEvent.ACTION_MOVE -> {
+                val idx = event.findPointerIndex(activePointerId)
+                if (idx < 0) return true
+                val ex = event.getX(idx)
+                val ey = event.getY(idx)
+                val dx = ex - lastTouchX
+                val dy = ey - lastTouchY
+                lastTouchX = ex
+                lastTouchY = ey
+                dragTotalX += dx
+                dragTotalY += dy
+                // 长按取消按累计位移判定（dragTotal 即相对按下点的实际位移）：
+                // 旧实现用单步位移，慢速小步拖动每步都达不到阈值，手已滑走长按仍触发
+                if (abs(dragTotalX) + abs(dragTotalY) > 8 * screenDensity) {
+                    longPressHandler.removeCallbacks(longPressRunnable)
+                    // 自定义钮同理：位移超 8dp 即取消长按、点按失效（滑动另判）。
+                    if (customDown != null) {
+                        longPressHandler.removeCallbacks(customLongPressRunnable)
+                        customTapInvalid = true
+                    }
+                }
+                // 自定义钮滑动：主导轴位移 ≥36dp（与按键滑动阈值同口径）发
+                // 对应方向动作、只发一次；无该方向绑定则不发、不改态。
+                val customDef = customDown
+                if (customDef != null && !customGestureDone &&
+                    max(abs(dragTotalX), abs(dragTotalY)) >= 36 * screenDensity
+                ) {
+                    val slot = if (abs(dragTotalX) >= abs(dragTotalY)) {
+                        if (dragTotalX < 0) CustomButtonSlot.SWIPE_LEFT else CustomButtonSlot.SWIPE_RIGHT
+                    } else {
+                        if (dragTotalY < 0) CustomButtonSlot.SWIPE_UP else CustomButtonSlot.SWIPE_DOWN
+                    }
+                    if (fireCustom(customDef, slot)) {
+                        customGestureDone = true
+                        longPressHandler.removeCallbacks(customLongPressRunnable)
+                    }
+                }
+                if (currentRenderer !is ComposingRenderer) return true
+                if (isScrolling || (abs(dragTotalX) > 8 * screenDensity && abs(dragTotalX) >= abs(
+                        dragTotalY
+                    ))
+                ) {
+                    isScrolling = true
+                    // 滑成滚动即取消按压（按压底不跟手走）。
+                    clearStripPressed()
+                    val renderer = currentRenderer as ComposingRenderer
+                    scrollX = (scrollX + dx).coerceIn(-renderer.maxScrollX, 0f)
+                    invalidate()
+                }
+            }
+
+            MotionEvent.ACTION_UP -> {
+                // 与 CustomGestureView 同一守卫：双指同压时被追踪手指已以
+                // POINTER_UP 收尾过，剩余手指的 ACTION_UP 不得再命中一次
+                if (activePointerId == event.getPointerId(0)) {
+                    activePointerId = -1
+                    handleUp(event.x, event.y)
+                }
+            }
+
+            MotionEvent.ACTION_POINTER_UP -> {
+                // 被追踪的手指先抬起（还有其他手指在按）时同样结束手势
+                if (event.getPointerId(event.actionIndex) == activePointerId) {
+                    val idx = event.actionIndex
+                    activePointerId = -1
+                    handleUp(event.getX(idx), event.getY(idx))
+                }
+            }
+
+            MotionEvent.ACTION_CANCEL -> {
+                activePointerId = -1
+                cancelDelayedTaps()
+                longPressHandler.removeCallbacks(longPressRunnable)
+                clearCustomGesture()
+                clearStripPressed()
+                parent.requestDisallowInterceptTouchEvent(false)
+            }
+        }
+        return true
+    }
+
+    /** 横条按压清零（审计 I 项）：抬手／取消／滑动／分离时调用。 */
+    private fun clearStripPressed() {
+        val renderer = currentRenderer as? ComposingRenderer ?: return
+        if (renderer.pressedIndex != -1) {
+            renderer.pressedIndex = -1
+            invalidate()
+        }
+    }
+
+    /** 主动抬起的统一收尾（坐标取抬起的那根手指） */
+    private fun handleUp(upX: Float, upY: Float) {
+        clearStripPressed()
+        longPressHandler.removeCallbacks(longPressRunnable)
+        parent.requestDisallowInterceptTouchEvent(false)
+        // 自定义钮手势收尾（优先于既有路：本手势起于自定义钮时，
+        // 既有 hitTest 路不跑，避免池钮动作误发）。
+        val customDef = customDown
+        if (customDef != null) {
+            val done = customGestureDone
+            val invalid = customTapInvalid
+            clearCustomGesture()
+            if (recording) return
+            if (done || invalid) return
+            lastTouchX = upX
+            lastTouchY = upY
+            val now = SystemClock.uptimeMillis()
+            val doubleTap = lastCustomTapId == customDef.id && now - lastCustomTapTime < 300
+            if (doubleTap && customDef.bindings.containsKey(CustomButtonSlot.DOUBLE_TAP)) {
+                lastCustomTapId = null
+                fireCustom(customDef, CustomButtonSlot.DOUBLE_TAP)
+            } else {
+                lastCustomTapId = customDef.id
+                lastCustomTapTime = now
+                fireCustom(customDef, CustomButtonSlot.TAP)
+            }
+            return
+        }
+        if (expandLongPressed || menuLongPressed) return
+        if (!isScrolling) {
+            val result = currentRenderer.hitTest(
+                upX, upY, width, height, scrollX, isExpanded, screenDensity,
+            )
+            if (recording && !isRecordingAllowed(result)) return
+            if (currentRenderer is ToolbarRenderer && result != null) {
+                val action = (result as? KawaiiPanel.TouchResult.ToolbarAction)?.action
+                val isClipAction =
+                    action is PanelAction.ClipTab || action is PanelAction.AddPhrase || action is PanelAction.ClearClipboard || action is PanelAction.ClearPhrases
+                val animateAfterRender =
+                    action is PanelAction.SwitchKeyboard || action is PanelAction.CursorMove
+                if (!isClipAction && !animateAfterRender) {
+                    startPressAnimation(currentRenderer as ToolbarRenderer)
+                }
+                if (result is KawaiiPanel.TouchResult.ToolbarAction && result.action is PanelAction.Palette) {
+                    val r = Runnable { onTap?.invoke(result) }
+                    delayedPalette = r
+                    postDelayed(r, 300L)
+                    return
+                }
+            }
+            val delayedAction =
+                result is KawaiiPanel.TouchResult.ToolbarAction && result.action is PanelAction.CloseKeyboard
+            if (delayedAction) {
+                val r = Runnable { onTap?.invoke(result) }
+                delayedClose = r
+                postDelayed(r, 100L)
+            } else {
+                onTap?.invoke(result)
+            }
+            if (result is KawaiiPanel.TouchResult.ToolbarAction && (result.action is PanelAction.SwitchKeyboard || result.action is PanelAction.CursorMove)) {
+                post { playToolbarPressAt(result.tapX, result.tapY) }
+            }
+        }
+    }
+}

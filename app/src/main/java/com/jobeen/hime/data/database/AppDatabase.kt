@@ -1,0 +1,479 @@
+package com.jobeen.hime.data.database
+
+import android.content.Context
+import androidx.core.content.edit
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.TypeConverters
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
+
+@Database(
+    entities = [
+        CandidateSorting::class, CandidatePrefer::class, PhraseRecord::class,
+        AIProvider::class, AIProviderModel::class, AISystemPrompt::class, AIUserPrompt::class,
+        AIInstruction::class, AIConversation::class, AIMessage::class,
+    ],
+    version = 20,
+    exportSchema = true,
+)
+@TypeConverters(Converters::class)
+abstract class AppDatabase : RoomDatabase() {
+
+    abstract fun candidateSortingDao(): CandidateSortingDao
+
+    abstract fun candidatePreferDao(): CandidatePreferDao
+
+    abstract fun phraseDao(): PhraseDao
+
+    abstract fun aiProviderDao(): AiProviderDao
+
+    abstract fun aiProviderModelDao(): AiProviderModelDao
+
+    abstract fun aiSystemPromptDao(): AiSystemPromptDao
+
+    abstract fun aiUserPromptDao(): AiUserPromptDao
+
+    abstract fun aiInstructionDao(): AiInstructionDao
+
+    abstract fun aiConversationDao(): AiConversationDao
+
+    abstract fun aiMessageDao(): AiMessageDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: AppDatabase? = null
+
+        fun getInstance(context: Context): AppDatabase {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: build(context.applicationContext, "ime_database")
+                    .also { INSTANCE = it }
+                // 注意：不要加 fallbackToDestructiveMigration() —— 漏写 Migration 时宁可启动崩溃（fail-fast，
+                // 发布前真机测试会先暴露），也不要静默清空用户的剪贴板/常用语/选词偏好。每次 bump version
+                // 都必须写 Migration（无结构变更时写空迁移，见 MIGRATION_7_8）。
+            }
+        }
+
+        /**
+         * 以指定库名新建实例（不走单例缓存）：迁移仪器测试以测试专用
+         * 库名走同一条迁移链验证，避免在真机上触碰生产库文件。
+         * 生产代码只用 [getInstance]。
+         */
+        fun createWithName(context: Context, name: String): AppDatabase =
+            build(context.applicationContext, name)
+
+        private fun build(context: Context, name: String): AppDatabase =
+            Room.databaseBuilder(context, AppDatabase::class.java, name)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6, MIGRATION_6_7, MIGRATION_7_8, MIGRATION_8_9, MIGRATION_9_10, MIGRATION_10_11, MIGRATION_11_12, MIGRATION_12_13, MIGRATION_13_14, MIGRATION_14_15, MIGRATION_15_16, MIGRATION_16_17, MIGRATION_17_18, MIGRATION_18_19, MIGRATION_19_20)
+                .addCallback(VACUUM_CALLBACK)
+                .addCallback(AI_SEED_CALLBACK)
+                .build()
+
+        /**
+         * AI 种子回调（WO52 9.1）：新库建表后播种（onCreate 只在库文件
+         * 首次创建时跑一次）。升级库走 MIGRATION_15_16 播种；播种失败
+         * 只记日志不抛——AiRepository.ensureSeeded 会在首次访问时补种，
+         * 首启不因种子失败而崩。
+         */
+        private val AI_SEED_CALLBACK = object : RoomDatabase.Callback() {
+            override fun onCreate(db: SupportSQLiteDatabase) {
+                super.onCreate(db)
+                runCatching { AiSeeds.insertAll(db) }
+                    .onFailure { timber.log.Timber.w(it, "AI seeds insert onCreate failed") }
+            }
+        }
+
+        private const val MAINTENANCE_PREFS = "db_maintenance"
+        private const val KEY_VACUUM_V10_DONE = "vacuum_after_v10_done"
+        private const val KEY_VACUUM_CLIP_DONE = "vacuum_after_clipboard_split_done"
+        /** 生产库名：v10 VACUUM 标记的兼容读与按库分键都以它为准 */
+        private const val PRODUCTION_DB_NAME = "ime_database"
+
+        /**
+         * 全部 VACUUM 执行的串行锁（v10 与拆库两条路径共用同一咽喉
+         * [vacuumAndMark]）：把「查标记→执行→落标记」收成临界区，
+         * 消除并发首跑时多个调用方同时看到未完成标记、各自跑一遍
+         * VACUUM 的 check-then-act 窗口。可重入：拆库路径持锁时调
+         * vacuumAndMark 会同线程再次取它。与 SQLiteOpenHelper 监
+         * 视器的锁序全局统一为「helper 监视器 → vacuumLock」：
+         * onOpen 回调在监视器内取本锁，拆库路径因此先开库后取锁
+         * （见 [vacuumAfterClipboardSplitOnce]），不得反序。
+         */
+        private val vacuumLock = java.util.concurrent.locks.ReentrantLock()
+
+        /**
+         * 剪贴板拆库后主库空闲页的一次性 VACUUM（清点 S10 定论的收敛
+         * 形态）：旧剪贴板行在拆库迁移时已从主库整表删除，但全文还留在
+         * 主库文件的空闲页与 WAL 里，而主库会随云备份外带。由
+         * ClipboardManager 的常规访问路径每次调用、完成标记未落时才
+         * 真正执行（同步 VACUUM 一次＋一个完成标记，此后每次只是
+         * 一次偏好读）。原补跑装置的三套标记（REDO_V2 强制重跑、失败
+         * 24 小时退避、按库分键）、空间预检与异步派发已一并删除——
+         * 拆库迁移本体亦已随清点 Q2 退场，现行设备的迁移早已完成，
+         * 这里只剩物理擦除这一件事；失败不落标记，下次访问重试。
+         */
+        fun vacuumAfterClipboardSplitOnce() {
+            val prefs = com.jobeen.hime.base.util.appContext
+                .getSharedPreferences(MAINTENANCE_PREFS, Context.MODE_PRIVATE)
+            if (prefs.getBoolean(KEY_VACUUM_CLIP_DONE, false)) return
+            // 先开库、后拿 vacuumLock（锁序与 onOpen 路径统一，见锁注释）
+            val db = getInstance(com.jobeen.hime.base.util.appContext)
+                .openHelper.writableDatabase
+            vacuumLock.lock()
+            try {
+                // 锁内复查：保证整个进程只有第一个真正执行
+                if (prefs.getBoolean(KEY_VACUUM_CLIP_DONE, false)) return
+                vacuumAndMark(db, prefs, KEY_VACUUM_CLIP_DONE)
+            } finally {
+                vacuumLock.unlock()
+            }
+        }
+
+        /**
+         * VACUUM + 落标记 + 截断 WAL 的统一实现。顺序是关键：
+         * 标记必须紧随 VACUUM 成功立即落盘——wal_checkpoint 会返回
+         * 结果行，只能用 query 读掉（execSQL 执行返回行的语句在多
+         * 个 Android 版本上会抛异常）；旧写法把标记放在 checkpoint
+         * 之后、同一 runCatching 内，checkpoint 一抛错标记永远写不
+         * 上，每次打开库都重跑 VACUUM、WAL 也永远截不断。
+         * checkpoint 失败只记日志：主文件已被 VACUUM 重建，标记
+         * 不应因此缺失。
+         */
+        private fun vacuumAndMark(
+            db: SupportSQLiteDatabase,
+            prefs: android.content.SharedPreferences,
+            doneKey: String,
+        ): Boolean {
+            // 全部 VACUUM 经同一把锁串行化（v10 打开回调与拆库补跑
+            // 两条路径）：同一时刻只有一个 VACUUM 在跑，不会互相
+            // 抢库锁把对方打成失败
+            vacuumLock.lock()
+            try {
+                return runCatching {
+                    db.execSQL("VACUUM")
+                    prefs.edit { putBoolean(doneKey, true) }
+                    runCatching {
+                        db.query("PRAGMA wal_checkpoint(TRUNCATE)").use { it.moveToFirst() }
+                    }.onFailure { timber.log.Timber.w(it, "wal_checkpoint(TRUNCATE) failed") }
+                    true
+                }.onFailure {
+                    timber.log.Timber.w(it, "VACUUM failed; will retry")
+                }.getOrDefault(false)
+            } finally {
+                vacuumLock.unlock()
+            }
+        }
+
+        /**
+         * v10 VACUUM 完成标记按库名分键：本回调挂在 [build] 上，生产库
+         * 与 createWithName 的测试库共用——共用一个全局键时，测试库打开
+         * 也会置位生产标记（反之生产先跑完也会让测试库误以为已跑），
+         * 两边各记各的后互不污染。
+         */
+        private fun vacuumV10DoneKey(dbName: String): String =
+            "${KEY_VACUUM_V10_DONE}_$dbName"
+
+        /**
+         * 一次性 VACUUM：v10 迁移只把 candidate_prefers.context 的值清空，
+         * 旧输入片段仍留在数据库空闲页中（迁移在事务内、无法执行 VACUUM）。
+         * 库打开后（不在事务中）补跑一次 VACUUM 重建文件彻底擦除，成功后
+         * 落标记，之后每次打开只是一次偏好读检查。
+         * 兼容读：生产库此前用无后缀的旧键记账，已跑过的设备旧键为
+         * true——直接认账并回填分键，不重复跑一次 VACUUM；旧键只对
+         * 生产库名生效，测试库不读、也永不写旧键。
+         */
+        private val VACUUM_CALLBACK = object : RoomDatabase.Callback() {
+            override fun onOpen(db: SupportSQLiteDatabase) {
+                super.onOpen(db)
+                val prefs = com.jobeen.hime.base.util.appContext
+                    .getSharedPreferences(MAINTENANCE_PREFS, Context.MODE_PRIVATE)
+                val dbName = db.path?.let { java.io.File(it).name }
+                    ?.takeIf { it.isNotEmpty() } ?: return
+                val doneKey = vacuumV10DoneKey(dbName)
+                if (prefs.getBoolean(doneKey, false)) return
+                if (dbName == PRODUCTION_DB_NAME &&
+                    prefs.getBoolean(KEY_VACUUM_V10_DONE, false)
+                ) {
+                    prefs.edit { putBoolean(doneKey, true) }
+                    return
+                }
+                // VACUUM 重建主文件后旧页还可能残留在 WAL 里，vacuumAndMark 一并截断
+                vacuumAndMark(db, prefs, doneKey)
+            }
+        }
+
+        private val MIGRATION_1_2: Migration = Migration(
+            startVersion = 1,
+            endVersion = 2,
+        ) { db ->
+            db.execSQL(
+                "CREATE TABLE IF NOT EXISTS `clipboard_records` (" +
+                    "`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, " +
+                    "`text` TEXT NOT NULL, " +
+                    "`timestamp` INTEGER NOT NULL, " +
+                    "`cloud` INTEGER NOT NULL)"
+            )
+        }
+
+        private val MIGRATION_2_3: Migration = Migration(
+            startVersion = 2,
+            endVersion = 3,
+        ) { db ->
+            db.execSQL("ALTER TABLE `clipboard_records` ADD COLUMN `deleted` INTEGER NOT NULL DEFAULT 0")
+        }
+
+        private val MIGRATION_3_4: Migration = Migration(
+            startVersion = 3,
+            endVersion = 4,
+        ) { db ->
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `candidate_prefers` (
+                    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    `text` TEXT NOT NULL,
+                    `context` TEXT NOT NULL,
+                    `click_count` INTEGER NOT NULL DEFAULT 1,
+                    `created_at` INTEGER NOT NULL,
+                    `updated_at` INTEGER NOT NULL
+                )
+                """
+            )
+        }
+
+        private val MIGRATION_4_5: Migration = Migration(
+            startVersion = 4,
+            endVersion = 5,
+        ) { db ->
+            // 主键从自增 id 改为 text：同结构搬数据，不要 DROP 后重建白白丢掉用户选词偏好
+            db.execSQL(
+                """
+                CREATE TABLE `candidate_prefers_new` (
+                    `text` TEXT NOT NULL PRIMARY KEY,
+                    `context` TEXT NOT NULL,
+                    `click_count` INTEGER NOT NULL DEFAULT 1,
+                    `created_at` INTEGER NOT NULL,
+                    `updated_at` INTEGER NOT NULL
+                )
+                """
+            )
+            db.execSQL(
+                """
+                INSERT INTO `candidate_prefers_new` (text, context, click_count, created_at, updated_at)
+                SELECT text,
+                    (SELECT context FROM candidate_prefers o2
+                     WHERE o2.text = o.text ORDER BY updated_at DESC LIMIT 1),
+                    SUM(click_count), MIN(created_at), MAX(updated_at)
+                FROM candidate_prefers o GROUP BY text
+                """
+            )
+            db.execSQL("DROP TABLE IF EXISTS `candidate_prefers`")
+            db.execSQL("ALTER TABLE `candidate_prefers_new` RENAME TO `candidate_prefers`")
+        }
+
+        private val MIGRATION_5_6: Migration = Migration(
+            startVersion = 5,
+            endVersion = 6,
+        ) { db ->
+            db.execSQL("ALTER TABLE `clipboard_records` ADD COLUMN `deletedAt` INTEGER NOT NULL DEFAULT 0")
+        }
+
+        private val MIGRATION_6_7: Migration = Migration(
+            startVersion = 6,
+            endVersion = 7,
+        ) { db ->
+            db.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS `phrase_records` (
+                    `id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+                    `text` TEXT NOT NULL,
+                    `label` TEXT NOT NULL,
+                    `createdAt` INTEGER NOT NULL
+                )
+                """
+            )
+        }
+
+        // v8 仅随包名改版 bump，无结构变更；空迁移避免 fallbackToDestructiveMigration 清库
+        private val MIGRATION_7_8: Migration = Migration(
+            startVersion = 7,
+            endVersion = 8,
+        ) { _ -> }
+
+        // v9：与 ClipboardDatabase v2 同步——ClipboardRecord 实体共用，旧主库里的
+        // clipboard_records 残表也要补 pinned 列，否则实体 schema 校验不过（fail-fast 崩）
+        private val MIGRATION_8_9: Migration = Migration(
+            startVersion = 8,
+            endVersion = 9,
+        ) { db ->
+            db.execSQL("ALTER TABLE `clipboard_records` ADD COLUMN `pinned` INTEGER NOT NULL DEFAULT 0")
+        }
+
+        // v10：清空历史遗留的 candidate_prefers.context（旧版本存了光标前 20 字的输入片段，
+        // 该列从未被读取）。结构不变，只擦内容；列保留以兼容旧备份与 Room 实体。
+        // 注意：SQLite 空闲页不会被立即覆写，彻底擦除需另行 VACUUM。
+        private val MIGRATION_9_10: Migration = Migration(
+            startVersion = 9,
+            endVersion = 10,
+        ) { db ->
+            db.execSQL("UPDATE `candidate_prefers` SET `context` = ''")
+        }
+
+        // v11：phrase_records 新增 sortOrder（常用语拖动排序），回填
+        // -createdAt 使既有顺序（新建在前）不变；主库里的 clipboard_records
+        // 残表与独立库共用同一实体，列必须同步加上（残表数据已迁走，
+        // 无需回填）
+        private val MIGRATION_10_11: Migration = Migration(
+            startVersion = 10,
+            endVersion = 11,
+        ) { db ->
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `sortOrder` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("UPDATE `phrase_records` SET `sortOrder` = -`createdAt`")
+            db.execSQL("ALTER TABLE `clipboard_records` ADD COLUMN `sortOrder` INTEGER NOT NULL DEFAULT 0")
+        }
+
+        // v12：phrase_records 新增 pinned（常用语置顶，与剪贴板同语义），默认未置顶
+        private val MIGRATION_11_12: Migration = Migration(
+            startVersion = 11,
+            endVersion = 12,
+        ) { db ->
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `pinned` INTEGER NOT NULL DEFAULT 0")
+        }
+
+        // v13：与 ClipboardDatabase v4 同步——ClipboardRecord 实体共用，实体
+        // 新增了 text 唯一索引，主库里的 clipboard_records 残表必须配套建
+        // 同名索引，否则 Room identity 校验不过（fail-fast 崩）。步骤与
+        // ClipboardDatabase.MIGRATION_3_4 严格同规：先清软删行，再按
+        // 「pinned 优先、timestamp 最新、id 最大」EXISTS 去重，最后建
+        // 唯一索引。残表数据本已迁去独立库，这里多为空表/少量残行，
+        // 但 SQL 按全表口径写，老设备上的任何存量都不例外。
+        private val MIGRATION_12_13: Migration = Migration(
+            startVersion = 12,
+            endVersion = 13,
+        ) { db ->
+            db.execSQL("DELETE FROM clipboard_records WHERE deleted = 1")
+            db.execSQL(
+                "DELETE FROM clipboard_records WHERE EXISTS (" +
+                    "SELECT 1 FROM clipboard_records other " +
+                    "WHERE other.text = clipboard_records.text AND (" +
+                    "other.pinned > clipboard_records.pinned OR " +
+                    "(other.pinned = clipboard_records.pinned AND other.timestamp > clipboard_records.timestamp) OR " +
+                    "(other.pinned = clipboard_records.pinned AND other.timestamp = clipboard_records.timestamp AND other.id > clipboard_records.id)))"
+            )
+            db.execSQL(
+                "CREATE UNIQUE INDEX IF NOT EXISTS `index_clipboard_records_text` ON `clipboard_records` (`text`)"
+            )
+        }
+
+        // v14：剪贴板残表退役（清点 D20）。clipboard_records 的数据早已
+        // 迁去独立库 ClipboardDatabase，主库残表为空表却逼着实体每次
+        // 变更在主库再复制一份影子迁移（v9/v11/v13 均为此）。本版起
+        // 实体从 AppDatabase 摘除、残表整表 DROP；此后剪贴板实体变更
+        // 只动独立库一侧。历史迁移中对残表的操作（1_2 建表、8_9 /
+        // 10_11 加列、12_13 建索引）保留在链上不动——低版本直升设备
+        // 仍要顺链走到这里把表删掉。
+        private val MIGRATION_13_14: Migration = Migration(
+            startVersion = 13,
+            endVersion = 14,
+        ) { db ->
+            db.execSQL("DROP TABLE IF EXISTS `clipboard_records`")
+        }
+
+        // v15：常用语输入码（WO52 6.1）。phrase_records 加 5 列：
+        // shortcut（输入码，TEXT NOT NULL DEFAULT ''）、category、
+        // tags、variables（JSON 数组串）、lastUsedAt（自动排序键，
+        // 0＝从未使用）；shortcut 建独立查询索引
+        // `index_phrase_records_shortcut`（与 Room 按实体 @Index 生成
+        // 的名称一致）。纯加列＋建索引，旧行数据一字不动。
+        private val MIGRATION_14_15: Migration = Migration(
+            startVersion = 14,
+            endVersion = 15,
+        ) { db ->
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `shortcut` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `category` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `tags` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `variables` TEXT NOT NULL DEFAULT ''")
+            db.execSQL("ALTER TABLE `phrase_records` ADD COLUMN `lastUsedAt` INTEGER NOT NULL DEFAULT 0")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_phrase_records_shortcut` ON `phrase_records` (`shortcut`)")
+        }
+
+        // v16：AI 七表（WO52 9.1）。建表＋索引 SQL 取自 Room 生成的
+        // schema（`app/schemas/.../AppDatabase/17.json` 的 createSql，
+        // 与本库 @Entity 声明逐项对过；AIMessage 无 updatedAt 列——
+        // 实体声明即无，不要补）。随后播种（AiSeeds.insertAll，
+        // INSERT OR IGNORE，可重复跑）：DeepSeek 服务商＋模型、系统
+        // 提示词 5 条、用户提示词 3 条、指令 4 条。旧表数据不动。
+        private val MIGRATION_15_16: Migration = Migration(
+            startVersion = 15,
+            endVersion = 16,
+        ) { db ->
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIConversation` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `isTitleUserEdited` INTEGER NOT NULL, `systemPromptID` TEXT, `providerID` TEXT, `modelID` TEXT, `snapshotJSON` TEXT, PRIMARY KEY(`id`))")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIConversation_updatedAt` ON `AIConversation` (`updatedAt`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIInstruction` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `detail` TEXT NOT NULL, `systemPromptID` TEXT, `userPromptID` TEXT, `providerID` TEXT, `sort` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_AIInstruction_name` ON `AIInstruction` (`name`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIMessage` (`id` TEXT NOT NULL, `conversationId` TEXT, `role` TEXT NOT NULL, `status` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `originalInput` TEXT, `renderedRequest` TEXT, `userPromptName` TEXT, `content` TEXT NOT NULL, `tokenEstimate` INTEGER NOT NULL, `usageJSON` TEXT, `errorCategory` TEXT, `requestID` TEXT, `regenerationOfID` TEXT, `isSuperseded` INTEGER NOT NULL, `configSnapshotJSON` TEXT, PRIMARY KEY(`id`), FOREIGN KEY(`conversationId`) REFERENCES `AIConversation`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE )")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_conversationId` ON `AIMessage` (`conversationId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_sequence` ON `AIMessage` (`sequence`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_status` ON `AIMessage` (`status`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIProvider` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `type` TEXT NOT NULL, `sort` INTEGER NOT NULL, `isDefault` INTEGER NOT NULL, `isEnabled` INTEGER NOT NULL, `isBuiltIn` INTEGER NOT NULL, `builtInCanBeDelete` INTEGER NOT NULL, `baseURL` TEXT NOT NULL, `apiPath` TEXT NOT NULL, `apiToken` TEXT NOT NULL, `requestTimeout` REAL NOT NULL, `maxOutputTokens` INTEGER NOT NULL, `contextWindow` INTEGER NOT NULL, `temperature` REAL, `presencePenalty` REAL, `frequencyPenalty` REAL, `customParametersJSON` TEXT, `defaultModelId` TEXT, PRIMARY KEY(`id`), FOREIGN KEY(`defaultModelId`) REFERENCES `AIProviderModel`(`id`) ON UPDATE NO ACTION ON DELETE SET NULL DEFERRABLE INITIALLY DEFERRED)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIProvider_defaultModelId` ON `AIProvider` (`defaultModelId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIProvider_sort` ON `AIProvider` (`sort`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIProviderModel` (`id` TEXT NOT NULL, `providerId` TEXT, `displayName` TEXT NOT NULL, `modelID` TEXT NOT NULL, `sort` INTEGER NOT NULL, `isEnabled` INTEGER NOT NULL, PRIMARY KEY(`id`), FOREIGN KEY(`providerId`) REFERENCES `AIProvider`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIProviderModel_providerId` ON `AIProviderModel` (`providerId`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AISystemPrompt` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `iconName` TEXT NOT NULL, `purpose` TEXT NOT NULL, `body` TEXT NOT NULL, `generationOverridesJSON` TEXT, `sort` INTEGER NOT NULL, `isDefault` INTEGER NOT NULL, `isEnabled` INTEGER NOT NULL, `isBuiltIn` INTEGER NOT NULL, `builtInCanBeDelete` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_AISystemPrompt_name` ON `AISystemPrompt` (`name`)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIUserPrompt` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `iconName` TEXT NOT NULL, `purpose` TEXT NOT NULL, `templateBody` TEXT NOT NULL DEFAULT '{{input}}', `sort` INTEGER NOT NULL, `isDefault` INTEGER NOT NULL, `isEnabled` INTEGER NOT NULL, `isBuiltIn` INTEGER NOT NULL, `builtInCanBeDelete` INTEGER NOT NULL, PRIMARY KEY(`id`))")
+            db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS `index_AIUserPrompt_name` ON `AIUserPrompt` (`name`)")
+            AiSeeds.insertAll(db)
+        }
+
+        // v17：脚本四表（WO52 8.1）已随脚本功能删除而退役：本段改
+        // 为空迁移，只保链连续（低版本直升设备仍要顺链走到 v19）。
+        // 16→17 不再建表、不播种；既有 v17/v18 库里的四表在升版
+        // 后成孤表（见 MIGRATION_18_19 注释）。
+        private val MIGRATION_16_17: Migration = Migration(
+            startVersion = 16,
+            endVersion = 17,
+        ) { _ -> }
+
+        // v18：AIMessage 外键改 deferred（L-33）。SQLite 不支持改列／
+        // 改外键，整表重建：新表按 18.json 的 createSql（17.json
+        // 原样加 DEFERRABLE INITIALLY DEFERRED 后缀），复制数据、
+        // 删旧表、改名、重建 3 个索引。旧行数据一字不动。
+        private val MIGRATION_17_18: Migration = Migration(
+            startVersion = 17,
+            endVersion = 18,
+        ) { db ->
+            db.execSQL("CREATE TABLE IF NOT EXISTS `AIMessage_new` (`id` TEXT NOT NULL, `conversationId` TEXT, `role` TEXT NOT NULL, `status` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `originalInput` TEXT, `renderedRequest` TEXT, `userPromptName` TEXT, `content` TEXT NOT NULL, `tokenEstimate` INTEGER NOT NULL, `usageJSON` TEXT, `errorCategory` TEXT, `requestID` TEXT, `regenerationOfID` TEXT, `isSuperseded` INTEGER NOT NULL, `configSnapshotJSON` TEXT, PRIMARY KEY(`id`), FOREIGN KEY(`conversationId`) REFERENCES `AIConversation`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)")
+            db.execSQL("INSERT INTO `AIMessage_new` (`id`, `conversationId`, `role`, `status`, `sequence`, `createdAt`, `originalInput`, `renderedRequest`, `userPromptName`, `content`, `tokenEstimate`, `usageJSON`, `errorCategory`, `requestID`, `regenerationOfID`, `isSuperseded`, `configSnapshotJSON`) SELECT `id`, `conversationId`, `role`, `status`, `sequence`, `createdAt`, `originalInput`, `renderedRequest`, `userPromptName`, `content`, `tokenEstimate`, `usageJSON`, `errorCategory`, `requestID`, `regenerationOfID`, `isSuperseded`, `configSnapshotJSON` FROM `AIMessage`")
+            db.execSQL("DROP TABLE IF EXISTS `AIMessage`")
+            db.execSQL("ALTER TABLE `AIMessage_new` RENAME TO `AIMessage`")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_conversationId` ON `AIMessage` (`conversationId`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_sequence` ON `AIMessage` (`sequence`)")
+            db.execSQL("CREATE INDEX IF NOT EXISTS `index_AIMessage_status` ON `AIMessage` (`status`)")
+        }
+
+        // v19：脚本功能删除——四表实体已从 @Database 摘除。本段只
+        // 升版（空迁移）：Room 校验只看实体表，既有库文件里的旧
+        // 脚本四表成孤表、可正常打开，不阻塞启动；此处不做 DROP——
+        // 表名写进迁移 SQL 会在源码留残留名，且孤表无任何代码再
+        // 读写。将来如需清库内旧数据，再由一次带 DROP 的迁移处理。
+        private val MIGRATION_18_19: Migration = Migration(
+            startVersion = 18,
+            endVersion = 19,
+        ) { _ -> }
+
+        // v20：AI apiToken 改密文列（2.4）。列名／类型不变（仍为
+        // TEXT NOT NULL），Room 身份哈希与 v19 相同——本段是空迁移
+        // （只升版，见 MIGRATION_7_8 口径）。真正的形态转换不在
+        // 迁移里做：迁移只有 SupportSQLiteDatabase，读行要 db.query()，
+        // 主机迁移执行测试的 CliSupportSQLiteDatabase 不支持 query
+        // （见其 KDoc），且 Keystore 在升级事务里不可靠；改由
+        // AiRepository 在首次读到旧明文时加密回写（CAS 防覆盖），读侧
+        // 对旧明文直通、写侧一律加密，任一步失败都不丢配置。
+        private val MIGRATION_19_20: Migration = Migration(
+            startVersion = 19,
+            endVersion = 20,
+        ) { _ -> }
+    }
+}

@@ -1,0 +1,81 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime
+
+import com.jobeen.hime.data.backup.BackupManager
+import com.jobeen.hime.data.backup.RestoreJournal
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 磁盘回滚覆盖判定（D-S2）：快照里缺段、且 journal 显示该段已被
+ * 失败还原写过的，列入 uncovered。纯函数，可主机单测。
+ * Room 两库与 prefs 在快照里恒有，永不缺段——判定只看输入统计条件段
+ * （皮肤库段已随皮肤 v3 死壳删除）。
+ */
+class BackupRollbackCoverageTest {
+
+    private fun uncovered(
+        completed: Set<String>,
+        inputStats: Boolean = true,
+    ): List<String> = BackupManager.uncoveredSectionsForRollback(
+        completedSections = completed,
+        snapshotHasInputStats = inputStats,
+    )
+
+    @Test
+    fun nothingCompleted_uncoveredEmpty() {
+        assertTrue(uncovered(emptySet()).isEmpty())
+        assertTrue(
+            uncovered(emptySet(), inputStats = false)
+                .isEmpty(),
+        )
+    }
+
+    @Test
+    fun allCompletedAndAllInSnapshot_uncoveredEmpty() {
+        val all = setOf(
+            RestoreJournal.SECTION_CLIPBOARD,
+            RestoreJournal.SECTION_APPDB,
+            RestoreJournal.SECTION_PREFS,
+            RestoreJournal.SECTION_INPUT_STATS,
+        )
+        assertTrue(uncovered(all).isEmpty())
+    }
+
+    @Test
+    fun completedInputStatsButSnapshotLacksIt_uncovered() {
+        val result = uncovered(
+            setOf(RestoreJournal.SECTION_INPUT_STATS),
+            inputStats = false,
+        )
+        assertEquals(listOf(RestoreJournal.SECTION_INPUT_STATS), result)
+    }
+
+    @Test
+    fun missingSnapshotSectionButNotCompleted_notUncovered() {
+        // 快照里没有、失败还原也没写过：什么都没丢，不列入。
+        val result = uncovered(
+            setOf(RestoreJournal.SECTION_CLIPBOARD),
+            inputStats = false,
+        )
+        assertTrue(result.isEmpty())
+    }
+
+    @Test
+    fun multipleUncovered_allListed() {
+        val result = uncovered(
+            setOf(
+                RestoreJournal.SECTION_INPUT_STATS,
+            ),
+            inputStats = false,
+        )
+        assertEquals(
+            listOf(
+                RestoreJournal.SECTION_INPUT_STATS,
+            ),
+            result,
+        )
+    }
+}

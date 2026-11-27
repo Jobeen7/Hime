@@ -1,0 +1,170 @@
+package com.jobeen.hime.data.keyboard.theme
+
+import android.graphics.Color
+
+object KeyboardThemePresets {
+
+    @Volatile
+    var customThemes: List<KeyboardTheme> = emptyList()
+        private set
+
+    fun setCustomThemes(themes: List<KeyboardTheme>) {
+        customThemes = themes
+    }
+
+    val Amoled = KeyboardTheme(
+        id = "amoled",
+        name = "暗夜",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.rgb(58, 58, 60),
+            keyPressed = Color.rgb(72, 72, 74),
+            // 皮肤深色按键无描边（键面纯色＋间距分隔），描边清零。
+            keyBorderStroke = Color.argb(0, 0, 0, 0),
+            specialKeyBackground = Color.rgb(58, 58, 60),
+            specialKeyPressed = Color.rgb(72, 72, 74),
+            specialKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            accentKeyBackground = Color.rgb(156, 130, 74),
+            accentKeyPressed = Color.rgb(72, 72, 74),
+            // 2026-11-05：内置描边全部去掉，回车强调键描边亦清零。
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(255, 255, 255),
+            specialKeyText = Color.rgb(255, 255, 255),
+            accentKeyText = Color.rgb(255, 255, 255),
+            // 皮肤深色次要文字（九键数字角标）#FFFFFF66。
+            altText = Color.argb(102, 255, 255, 255),
+            // 皮肤深色键盘底 #00000003，近纯黑。
+            background = Color.rgb(0, 0, 0),
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                // 与键盘底同黑，否则候选条与键区之间出一道深灰接缝；
+                // 皮肤工具栏/候选面板底同样是 #00000003。
+                background = Color.rgb(0, 0, 0),
+                toolbarText = Color.rgb(255, 255, 255),
+                toolbarActived = Color.rgb(10, 132, 255), // #0A84FF，与长按弹窗高亮同值（BaseKeyboard 的 LONG_PRESS_HIGHLIGHT_BLUE）
+                toolbarIcon = Color.rgb(255, 255, 255),
+                // 工具栏按压是半透明涟漪（峰值 alpha 160，见
+                // KawaiiPanelView.startPressAnimation）叠在面板底 22 灰上，
+                // 取键面 pressed 的 72 灰混合后对比仅 1.33、肉眼不可辨；
+                // 取 specialKeyText 纯白，混合后约 7.6:1
+                toolbarPressed = Color.rgb(255, 255, 255),
+                candidateBackground = Color.argb(220, 22, 22, 22),
+                candidateText = Color.rgb(255, 255, 255),
+                candidateIndex = Color.rgb(130, 130, 130),
+                candidateDivider = Color.argb(120, 130, 130, 130),
+                selectedCandidateText = Color.rgb(35, 200, 145),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.rgb(22, 22, 22),
+                textColor = Color.rgb(255, 255, 255),
+                secondaryTextColor = Color.rgb(120, 120, 120),
+            ),
+            toastBackground = Color.rgb(36, 36, 38),
+            toastText = Color.rgb(245, 245, 247),
+        ),
+    )
+
+    val Light = KeyboardTheme(
+        id = "light",
+        name = "素白",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.rgb(255, 255, 255),
+            keyPressed = Color.rgb(230, 230, 230),
+            // 2026-11-05：内置描边全部去掉（含回车强调键），三项描边透明。
+            keyBorderStroke = Color.argb(0, 0, 0, 0),
+            specialKeyText = Color.rgb(60, 60, 65),
+            specialKeyBackground = Color.rgb(255, 255, 255),
+            specialKeyPressed = Color.rgb(230, 230, 230),
+            specialKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            accentKeyBackground = Color.rgb(156, 130, 74),
+            accentKeyPressed = Color.rgb(140, 114, 62),
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(0, 0, 0),
+            accentKeyText = Color.rgb(255, 255, 255),
+            altText = Color.rgb(120, 120, 125),
+            background = Color.rgb(225, 226, 231),
+            surfaceStyle = KeyboardColors.SurfaceStyle.Raised,
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                background = Color.rgb(225, 226, 231),
+                toolbarText = Color.rgb(20, 20, 20),
+                toolbarActived = Color.rgb(10, 132, 255), // #0A84FF，与长按弹窗高亮同值（BaseKeyboard 的 LONG_PRESS_HIGHLIGHT_BLUE）
+                toolbarIcon = Color.rgb(80, 80, 85),
+                candidateBackground = Color.rgb(255, 255, 255),
+                candidateText = Color.rgb(20, 20, 20),
+                candidateIndex = Color.rgb(120, 120, 125),
+                candidateDivider = Color.argb(100, 140, 140, 145),
+                selectedCandidateText = Color.rgb(35, 200, 145),
+                // 同暗夜：涟漪叠在面板底 225 灰上，230 与底几乎同色
+                // （混合后约 1.0:1、不可见）；墨色取正文 keyText 纯黑、
+                // 峰值 alpha 160，混合后约 5.8:1（alpha 120 时用深灰
+                // 60,60,65 只有约 2.3:1，低于 3:1）
+                toolbarPressed = Color.rgb(0, 0, 0),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.rgb(255, 255, 255),
+                textColor = Color.rgb(20, 20, 20),
+                secondaryTextColor = Color.rgb(130, 130, 135),
+            ),
+            toastBackground = Color.rgb(45, 45, 48),
+            toastText = Color.rgb(255, 255, 255),
+        ),
+    )
+
+    val Sunset = KeyboardTheme(
+        id = "sunset",
+        name = "落日",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.rgb(245, 238, 230),
+            keyPressed = Color.rgb(230, 215, 200),
+            // 2026-11-05：内置描边全部去掉（含回车强调键），三项描边透明。
+            keyBorderStroke = Color.argb(0, 0, 0, 0),
+            specialKeyBackground = Color.rgb(245, 238, 230),
+            specialKeyPressed = Color.rgb(230, 215, 200),
+            specialKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            accentKeyBackground = Color.rgb(242, 100, 25),
+            accentKeyPressed = Color.rgb(220, 85, 15),
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(50, 40, 35),
+            specialKeyText = Color.rgb(120, 100, 90),
+            accentKeyText = Color.rgb(255, 255, 255),
+            altText = Color.rgb(140, 120, 110),
+            background = Color.rgb(250, 245, 240),
+            surfaceStyle = KeyboardColors.SurfaceStyle.Raised,
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                background = Color.rgb(242, 235, 228),
+                toolbarText = Color.rgb(50, 40, 35),
+                toolbarActived = Color.rgb(10, 132, 255), // #0A84FF，与长按弹窗高亮同值（BaseKeyboard 的 LONG_PRESS_HIGHLIGHT_BLUE）
+                toolbarIcon = Color.rgb(120, 100, 90),
+                candidateBackground = Color.rgb(255, 255, 255),
+                candidateText = Color.rgb(50, 40, 35),
+                candidateIndex = Color.rgb(140, 120, 110),
+                candidateDivider = Color.argb(100, 220, 200, 185),
+                selectedCandidateText = Color.rgb(35, 200, 145),
+                // 同上：原值与面板底 242,235,228 几乎同色（混合后约
+                // 1.1:1）；墨色取正文 keyText 50,40,35、峰值 alpha 160，
+                // 混合后约 4.1:1（暖灰 120,100,90 在 alpha 120 时只有
+                // 约 1.9:1，低于 3:1）
+                toolbarPressed = Color.rgb(50, 40, 35),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.rgb(245, 238, 230),
+                textColor = Color.rgb(50, 40, 35),
+                secondaryTextColor = Color.rgb(120, 100, 90),
+            ),
+            toastBackground = Color.rgb(60, 50, 45),
+            toastText = Color.rgb(255, 255, 255),
+        ),
+    )
+
+    val Monet = KeyboardTheme(
+        id = MonetPalette.ID,
+        name = "莫奈色",
+        colors = MonetPalette.LightFallback,
+    )
+
+    val ALL: List<KeyboardTheme>
+        get() = listOf(
+            Amoled,
+            Light,
+            Sunset,
+            Monet,
+        ) + customThemes
+}

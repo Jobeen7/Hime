@@ -1,0 +1,128 @@
+package com.jobeen.hime.data.database
+
+import android.content.Context
+import androidx.room.Database
+import androidx.room.Room
+import androidx.room.RoomDatabase
+import androidx.room.TypeConverters
+
+/**
+ * 剪贴板历史独立数据库（文件 clipboard_database）。
+ *
+ * 从 ime_database 拆出的原因：云备份规则只能按文件排除。剪贴板历史含用户复制过的
+ * 敏感文本，必须排除在系统云备份之外；而常用语/选词偏好等留在 ime_database 照常备份。
+ * 旧数据当年由 ClipboardManager 一次性迁入（迁移本体已随清点 Q2 退场，
+ * 现行设备早已迁完）；ime_database 侧的同名残表已于 AppDatabase v14 DROP。
+ */
+@Database(
+    entities = [ClipboardRecord::class, ClipboardGroup::class],
+    version = 6,
+    exportSchema = true,
+)
+@TypeConverters(Converters::class)
+abstract class ClipboardDatabase : RoomDatabase() {
+
+    abstract fun clipboardDao(): ClipboardDao
+
+    companion object {
+        @Volatile
+        private var INSTANCE: ClipboardDatabase? = null
+
+        /** v2：新增 pinned（置顶）列，默认 0。 */
+        private val MIGRATION_1_2 = object : androidx.room.migration.Migration(1, 2) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE clipboard_records ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
+        /** v3：新增 sortOrder（拖动排序）列，回填 -timestamp 使既有顺序不变。 */
+        private val MIGRATION_2_3 = object : androidx.room.migration.Migration(2, 3) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE clipboard_records ADD COLUMN sortOrder INTEGER NOT NULL DEFAULT 0"
+                )
+                db.execSQL("UPDATE clipboard_records SET sortOrder = -timestamp")
+            }
+        }
+
+        /**
+         * v4：text 唯一索引。建索引前必须先收敛存量，否则同 text 重复行
+         * 会让 CREATE UNIQUE INDEX 直接失败、迁移永不完成：
+         * 1. 软删行整表物理清除——与现行 purge 口径一致（删除已改物理删，
+         *    墓碑行原靠首访清理在迁移外清、该清理已随 Q2 退场）；
+         *    提前到迁移内是因为唯一索引覆盖全表行，墓碑行与有效行同
+         *    text 同样撞约束，不清建不了索引；
+         * 2. 有效行按 text 去重：删掉「存在严格更优行」的行，保留口径与
+         *    dedupeClipboardByText 严格一致（pinned 优先、timestamp
+         *    最新、id 最大）。每组的最大行永不满足删除条件，去重结果
+         *    与求值顺序无关；
+         * 3. 建唯一索引（名称与 Room 按实体 @Index 生成的保持一致）。
+         *
+         * 注意（历史）：本实体当年与 AppDatabase 共用，ime_database 的
+         * 同名旧表曾须配套建此索引；残表已于 AppDatabase v14 DROP，
+         * 实体自此只属本库（清点 D20）。
+         */
+        private val MIGRATION_3_4 = object : androidx.room.migration.Migration(3, 4) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL("DELETE FROM clipboard_records WHERE deleted = 1")
+                db.execSQL(
+                    "DELETE FROM clipboard_records WHERE EXISTS (" +
+                        "SELECT 1 FROM clipboard_records other " +
+                        "WHERE other.text = clipboard_records.text AND (" +
+                        "other.pinned > clipboard_records.pinned OR " +
+                        "(other.pinned = clipboard_records.pinned AND other.timestamp > clipboard_records.timestamp) OR " +
+                        "(other.pinned = clipboard_records.pinned AND other.timestamp = clipboard_records.timestamp AND other.id > clipboard_records.id)))"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_clipboard_records_text` ON `clipboard_records` (`text`)"
+                )
+            }
+        }
+
+        /** v5：自定义分组（H2-4）：新建 clipboard_groups 表；clipboard_records 加 groupId 列（默认 0 = 未分组）。 */
+        private val MIGRATION_4_5 = object : androidx.room.migration.Migration(4, 5) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "CREATE TABLE IF NOT EXISTS `clipboard_groups` (`id` INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, `name` TEXT NOT NULL, `sortOrder` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL)"
+                )
+                db.execSQL(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS `index_clipboard_groups_name` ON `clipboard_groups` (`name`)"
+                )
+                db.execSQL(
+                    "ALTER TABLE clipboard_records ADD COLUMN groupId INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
+        /** v6：收藏（WO52 5.3）：clipboard_records 加 isFavorite 列（默认 0 = 未收藏）。 */
+        private val MIGRATION_5_6 = object : androidx.room.migration.Migration(5, 6) {
+            override fun migrate(db: androidx.sqlite.db.SupportSQLiteDatabase) {
+                db.execSQL(
+                    "ALTER TABLE clipboard_records ADD COLUMN isFavorite INTEGER NOT NULL DEFAULT 0"
+                )
+            }
+        }
+
+        fun getInstance(context: Context): ClipboardDatabase {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: build(context.applicationContext, "clipboard_database")
+                    .also { INSTANCE = it }
+            }
+        }
+
+        /**
+         * 以指定库名新建实例（不走单例缓存）：迁移仪器测试以测试专用
+         * 库名走同一条迁移链验证，避免在真机上触碰生产库文件。
+         * 生产代码只用 [getInstance]。
+         */
+        fun createWithName(context: Context, name: String): ClipboardDatabase =
+            build(context.applicationContext, name)
+
+        private fun build(context: Context, name: String): ClipboardDatabase =
+            Room.databaseBuilder(context, ClipboardDatabase::class.java, name)
+                .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4, MIGRATION_4_5, MIGRATION_5_6)
+                .build()
+    }
+}

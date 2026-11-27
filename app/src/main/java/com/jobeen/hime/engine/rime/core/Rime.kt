@@ -1,0 +1,991 @@
+// SPDX-License-Identifier: Apache-2.0
+
+package com.jobeen.hime.engine.rime.core
+
+import com.jobeen.hime.engine.event.KeyModifiers
+import com.jobeen.hime.engine.rime.data.DataManager
+import com.jobeen.hime.engine.rime.data.opencc.OpenCCDictManager
+import com.jobeen.hime.engine.rime.data.userdict.UserDictManager
+import com.jobeen.hime.base.util.PinYinUtil
+import com.jobeen.hime.base.util.appContext
+import com.jobeen.hime.base.util.isStorageAvailable
+import com.jobeen.hime.data.manager.isDeployWindow
+import com.jobeen.hime.engine.data.CommandSymbol
+import com.jobeen.hime.engine.data.EngineMessage
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicBoolean
+import timber.log.Timber
+
+class Rime : RimeApi, RimeLifecycleOwner {
+    private val lifecycleRegistry = RimeLifecycleRegistry()
+
+    override val lifecycle get() = lifecycleRegistry
+
+    override val messageFlow = messageFlow_.asSharedFlow()
+
+    override val isReady: Boolean
+        get() = lifecycle.currentState == RimeLifecycle.State.READY
+
+    @Volatile
+    override var schemaCached = RimeSchema(".default")
+        private set
+
+    @Volatile
+    override var statusCached = StatusProto()
+        private set
+
+    @Volatile
+    override var compositionCached = CompositionProto()
+        private set
+
+    @Volatile
+    override var hasMenu: Boolean = false
+        private set
+
+    @Volatile
+    override var paging: Boolean = false
+        private set
+
+    /** STARTING 阶段收到 finalize 时的延迟执行：独立作用域 + 防重复排队标记 */
+    private val deferredFinalizeScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val deferredFinalizeScheduled = AtomicBoolean(false)
+
+    /** STOPPING 阶段收到 startup 时的延迟执行标记：停机完成时由 finalize 末尾消费并重走 startup */
+    private val startupPending = AtomicBoolean(false)
+
+    /** 每次 startup() 递增：延迟 finalize 执行前比对，防止误停「排队之后又被重启好」的新一代引擎 */
+    private val startupGeneration = java.util.concurrent.atomic.AtomicInteger(0)
+
+    private val dispatcher = RimeDispatcher(
+        object : RimeDispatcher.RimeController {
+            override fun nativeStartup() {
+                startRime(false)
+
+                lifecycleRegistry.emitState(RimeLifecycle.State.READY)
+            }
+
+            override fun nativeFinalize() {
+                shutdown()
+            }
+        },
+        onStartupFailed = {
+            // 启动失败：生命周期打回 STOPPED，让 whenReady 的等待方立即以
+            // RimeStoppedException 失败（而不是在 STARTING 永久挂起），
+            // 且后续 startup() 可以重试
+            lifecycleRegistry.emitState(RimeLifecycle.State.STOPPED)
+        },
+    )
+
+    init {
+        if (lifecycle.currentState != RimeLifecycle.State.STOPPED) {
+            throw IllegalStateException("Rime has already been created!")
+        }
+        // 登记活跃实例，供 companion 的 runOnRimeMain 派发定位（本类在进程内
+        // 由 RimeDaemon 单例式持有一个实例）
+        activeInstance = this
+    }
+
+    /**
+     * 派发到 rime-main 并等待结果的统一入口。
+     *
+     * 排空翻译：dispatcher 停机/启动失败排空队列时，被丢弃任务的等待方
+     * 以 CancellationException 收尾（见 RimeDispatcher 的 cancel＋补 run）。
+     * 但等待方协程自身的 Job 并未被取消，它只是所等的任务被丢弃；
+     * CancellationException 若原样冒泡，消息消费者与引擎 jobs 消费者
+     * 的 catch (CancellationException) { throw e } 会把整条永生消费
+     * 循环杀掉且无人重启（[snapshotOnRimeMain] 的 onFailure 也按取消
+     * 原样上抛，同样会穿透消息消费者）。故在此单点收口：捕获
+     * CancellationException 后，若调用方自身 Job 仍存活，说明取消
+     * 来自被等待的任务被排空，转抛 [RimeStoppedException]，由各调用
+     * 方按普通单条失败处理（与 [whenReady] 在引擎停机时抛同一异常的
+     * 既有口径一致）；调用方自身 Job 已取消（真取消、或外层
+     * withTimeoutOrNull 到期取消了本协程）则原样抛
+     * CancellationException，取消/超时语义不被吞。
+     */
+    private suspend fun <T> withRimeContext(block: suspend () -> T): T {
+        val callerContext = currentCoroutineContext()
+        callerContext.ensureActive()
+        val callerJob = callerContext[Job]
+        return try {
+            withContext(dispatcher) { block() }
+        } catch (e: CancellationException) {
+            if (callerJob?.isActive == true) {
+                // 本转抛点只来自任务被 dispatcher 排空丢弃（停机或启动
+                // 失败），引擎此时可能早已就绪过，文案用丢弃语义而非
+                // 默认的「就绪前停止」（见 RimeStoppedException）
+                throw RimeStoppedException(
+                    "task dropped by dispatcher stop/startup-failure"
+                ).also { runCatching { it.initCause(e) } }
+            }
+            throw e
+        } catch (e: IllegalStateException) {
+            // 停机竞态下 dispatcher.dispatch 抛 IllegalStateException
+            // （"Dispatcher is not in running state!"）：调用方约定的
+            // 停机异常是 RimeStoppedException，不是 dispatcher 的
+            // IllegalStateException（E-M7）。只转未就绪态下的那一种——
+            // 块内在就绪态自抛的 IllegalStateException 保持原样。
+            if (callerJob?.isActive == true &&
+                lifecycle.currentState != RimeLifecycle.State.READY
+            ) {
+                throw RimeStoppedException(
+                    "rime dispatcher stopped"
+                ).also { runCatching { it.initCause(e) } }
+            }
+            throw e
+        }
+    }
+
+    /**
+     * 消息消费者的补取专用通道：名义 2 秒超时（与 dispatcher stop 的
+     * 排空上限对齐），但只对已被取走执行的补取有效——任务还在
+     * dispatcher 队列里排队时，超时唤不醒等待方（其 continuation 要
+     * 等任务被取走、或停机排空时才以取消完成），实际收尾时长取决于
+     * 队列推进。引擎正在停机时补取任务会被排空丢弃并以取消收尾，
+     * 等待方不会永久挂起堵死消息消费者；放弃补取后按原消息继续
+     * （各调用点本就容忍补取失败）。
+     */
+    private suspend fun <T> snapshotOnRimeMain(block: suspend () -> T): T? =
+        // 部署窗口内不向 rime-main 排队：部署占着 rime-main 时补取要等
+        // 最长 2 秒才超时，逐条 Schema/Option 消息堵住分发线程；直接
+        // 返回 null 等价于补取超时后的既有回落（保留旧缓存、原消息
+        // 转发），只是省掉等待。部署窗口判定见 isDeployWindow。
+        if (isDeployWindow()) null
+        else runCatching {
+            kotlinx.coroutines.withTimeoutOrNull(SNAPSHOT_TIMEOUT_MS) {
+                withRimeContext { block() }
+            }
+        }.onFailure { e ->
+            // 取消不能吞：调用方协程被取消时必须立即中止（超时返回
+            // null 是 withTimeoutOrNull 的内部语义、不经这里）；吞掉
+            // 取消会让消息消费者在作用域已取消后继续跑完整条处理
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            Timber.w(e, "Failed to refresh snapshot on rime-main")
+        }.getOrNull()
+
+    /**
+     * 把 [block] 派发到 rime-main 执行并等待结果：[runOnRimeMain] 的实例侧
+     * 入口。RimeApi 各 suspend 方法本身就走这条串行线，但接口之外的 native
+     * 入口（如 RimeConfig.openSchema）没有现成通道，补此一处统一派发。
+     */
+    suspend fun <T> dispatchToRimeMain(block: suspend RimeApi.() -> T): T =
+        withRimeContext { block(this@Rime) }
+
+    override suspend fun isEmpty(): Boolean = withRimeContext {
+        getCurrentSchema() == ".default"
+    }
+
+    override suspend fun deploy() = withRimeContext {
+        shutdown()
+        try {
+            startRime(true)
+        } catch (t: Throwable) {
+            // H-1（2026-11-13 复查）：转换失败不得走静默死路——抛错
+            // 之前先把部署结果合成一条 native Deploy Failure 消息、
+            // 走正常失败通道（DeployRunTracker 记失败、pendingRedeploy
+            // 标补跑、失败通知投递），再由 onNativeRestartFailed 打回
+            // STOPPED 并重抛。消息经 notificationQueue（trySend，
+            // 不挂起、不抛错）：即使引擎随后停机，分发线程仍独立、
+            // 失败通道不受影响。Failure 先于 STOPPED 发出——
+            // onNativeRestartFailed 之后 lifecycle 已是 STOPPED，
+            // withRimeContext 会把后续异常转写，消息仍须在此之前入队。
+            // 转换失败仍不报成功：本处只补失败信号，不改抛错本身。
+            runCatching {
+                handleMessage(
+                    RimeMessage.MessageType.Deploy.ordinal,
+                    arrayOf<Any>("failure"),
+                )
+            }.onFailure { emitError ->
+                Timber.w(emitError, "Failed to emit synthetic deploy Failure")
+            }
+            onNativeRestartFailed(t)
+        }
+    }
+
+    /**
+     * native 重启失败的收尾（E-S2）：只打回 STOPPED 不够——dispatcher
+     * 的消费循环仍在跑，下一次 startup() 的 compareAndSet 失败、
+     * nativeStartup 永不执行，引擎卡死在 STARTING、全部按键永久挂起。
+     * 状态不能停留在 READY（上层会以为引擎可用、实际每次调用都打到
+     * 已关闭的 native），打回 STOPPED 让状态与实际一致；停机异步发到
+     * 另一作用域：本函数跑在 rime-main 任务内，同步 stop() 会等自己的
+     * 任务结束（最长 2 秒超时），异步停机让循环在当前任务结束后退出、
+     * 走 finally 的 nativeFinalize（二次 finalize 经核实是幂等的：
+     * JoinMaintenanceThread 有 valid 守卫，StopService／Registry::Clear／
+     * UnloadModules 均可重入）并排空队列，等待方以 RimeStoppedException
+     * 收尾。startup() 入口另有防御性 stop()，任何来源的残余循环都能自愈。
+     */
+    private fun onNativeRestartFailed(t: Throwable): Nothing {
+        lifecycleRegistry.emitState(RimeLifecycle.State.STOPPED)
+        deferredFinalizeScope.launch { dispatcher.stop() }
+        throw t
+    }
+
+    override suspend fun joinMaintenanceThread() {
+        withContext(Dispatchers.IO) {
+            Companion.joinMaintenanceThread()
+        }
+    }
+
+    override suspend fun syncUserData(): Boolean =
+        withRimeContext { Companion.syncUserData() }
+
+    override suspend fun getUserDictList(): List<String> = withRimeContext {
+        UserDictManager.getUserDictList().toList()
+    }
+
+    override suspend fun importUserDictLive(dictName: String, textFile: String): Int =
+        withRimeContext { UserDictManager.importUserDictLive(dictName, textFile) }
+
+    override suspend fun exportUserDictLive(dictName: String, textFile: String): Int =
+        withRimeContext { UserDictManager.exportUserDictLive(dictName, textFile) }
+
+    override suspend fun processKey(value: Int, modifiers: UInt, isVirtual: Boolean): Boolean =
+        withRimeContext { processKeyInner(value, modifiers.toInt(), isVirtual) }
+
+    override suspend fun processKey(
+        value: KeyValue,
+        modifiers: KeyModifiers,
+        isVirtual: Boolean,
+    ): Boolean = withRimeContext { processKeyInner(value.value, modifiers.toInt(), isVirtual) }
+
+    override suspend fun emitCommit(text: String) = withRimeContext {
+        // 与 native Commit 的产生点（processKeyInner→emitResponse）同
+        // 在 rime-main 上、经同一 handleMessage 入队：本调用与相邻按键
+        // 任务在 dispatcher 单线程上串行执行，trySend 的先后即两条
+        // Commit 的分发先后，不存在跨队列超车。
+        // 第二个参数是直送标记（见 CommitTextMessage.direct）：本路
+        // 借道只为排序，下游不得按打字上屏记账。标记不放 CommitProto
+        // 本体——它由 JNI 按固定构造签名 (Ljava/lang/String;)V 创建
+        // （jni_env.h），加字段会使 JNI 构造查找失败
+        handleMessage(
+            RimeMessage.MessageType.Commit.ordinal,
+            arrayOf(CommitProto(text), true),
+        )
+    }
+
+    override suspend fun emitKey(value: Int, modifiers: Int, isVirtual: Boolean) =
+        withRimeContext {
+            // 与 emitCommit 同产生点：本调用与相邻按键任务在 dispatcher
+            // 单线程上串行执行，trySend 的先后即消息分发先后。参数形态
+            // 与 processKeyInner 的未处理按键回送（见其 handleMessage
+            // 调用）逐项一致，nativeCreate 按 (Int, Int, Boolean) 还原
+            handleMessage(
+                RimeMessage.MessageType.Key.ordinal,
+                arrayOf(value, modifiers, isVirtual),
+            )
+        }
+
+    override suspend fun simulateKeySequence(sequence: String): Boolean = withRimeContext {
+        if (Companion.simulateKeySequence(sequence)) {
+            val commit = getCommit()
+            val input = Companion.getRawInput()
+            if (!commit.text.isNullOrEmpty() || input.isNotEmpty()) {
+                emitResponse { commit }
+                true
+            } else {
+                emitResponse { CommitProto(sequence) }
+                false
+            }
+        } else {
+            false
+        }
+    }
+
+    override suspend fun selectCandidate(idx: Int, global: Boolean): Boolean = withRimeContext {
+        Companion.selectCandidate(idx, global).also { emitResponse() }
+    }
+
+    override suspend fun deleteCandidate(idx: Int, global: Boolean): Boolean = withRimeContext {
+        Companion.deleteCandidate(idx, global).also { emitResponse() }
+    }
+
+    override suspend fun changeCandidatePage(backward: Boolean): Boolean = withRimeContext {
+        Companion.changeCandidatePage(backward).also { emitResponse() }
+    }
+
+    override suspend fun highlightCandidate(index: Int, onCurrentPage: Boolean): Boolean =
+        withRimeContext {
+            Companion.highlightCandidate(index, onCurrentPage).also { emitResponse() }
+        }
+
+    override suspend fun moveCursorPos(position: Int) = withRimeContext {
+        setCaretPos(position)
+        emitResponse()
+    }
+
+    override suspend fun setInput(input: String, emit: Boolean) = withRimeContext {
+        Companion.setInput(input).also {
+            if (emit) {
+                emitResponse()
+            }
+        }
+    }
+
+    override suspend fun appendInput(input: String, emit: Boolean) = withRimeContext {
+        Companion.appendInput(input).also {
+            if (emit) {
+                emitResponse()
+            }
+        }
+    }
+
+    override suspend fun availableSchemata(): Array<SchemaItem> =
+        withRimeContext { getAvailableSchemaList() }
+
+    override suspend fun enabledSchemata(): Array<SchemaItem> =
+        withRimeContext { getSelectedSchemaList() }
+
+    override suspend fun setEnabledSchemata(schemaIds: Array<String>) =
+        withRimeContext { selectSchemas(schemaIds) }
+
+    override suspend fun selectedSchemata(): Array<SchemaItem> = withRimeContext { getSchemaList() }
+
+    override suspend fun selectedSchemaId(): String = withRimeContext { getCurrentSchema() }
+
+    override suspend fun selectSchema(schemaId: String) = withRimeContext {
+        Companion.selectSchema(schemaId).also {
+            val schema = RimeSchema(getCurrentSchema())
+            // 切方案的同步点回写缓存：此前 schemaCached 只靠 Schema 通知在
+            // 通知分发线程异步回写，其间的 sendJob 读 candidateKind 会读到
+            // 旧方案的值（通知路径本身随后仍会以同一 id 再刷新一次）
+            schemaCached = schema
+            schema.applyOptions(this@Rime)
+        }
+    }
+
+    override suspend fun currentSchema(): RimeSchema = withRimeContext {
+        RimeSchema(getCurrentSchema())
+    }
+
+    override suspend fun commitComposition(): Boolean =
+        withRimeContext { Companion.commitComposition().also { if (it) emitResponse() } }
+
+    override suspend fun commitCurrentSelection(append: String): Boolean =
+        withRimeContext { Companion.commitCurrentSelection(append).also { if (it) emitResponse() } }
+
+    override suspend fun clearComposition() = withRimeContext {
+        Companion.clearComposition().also { emitResponse() }
+    }
+
+    override suspend fun freeContext() = withRimeContext {
+        Companion.freeContext().also { emitResponse() }
+    }
+
+    override suspend fun getRawInput(): String = withRimeContext { Companion.getRawInput() }
+
+    override suspend fun getInputConfirmedPosition(): Int =
+        withRimeContext { Companion.getInputConfirmedPosition() }
+
+    override suspend fun t9PinyinList(): String = withRimeContext { Companion.t9PinyinList() }
+
+    override suspend fun t9SetPinyin(pinyin: String): Boolean =
+        withRimeContext {
+            Companion.t9SetPinyin(pinyin).also { if (it) emitResponse() }
+        }
+
+    override suspend fun setRuntimeOption(option: String, value: Boolean) = withRimeContext {
+        setOption(option, value)
+    }
+
+    override suspend fun getRuntimeOption(option: String): Boolean = withRimeContext {
+        getOption(option)
+    }
+
+    override suspend fun getCandidates(startIndex: Int, limit: Int): Array<CandidateProto> =
+        withRimeContext { Companion.getCandidates(startIndex, limit) }
+
+    private fun startRime(fullCheck: Boolean) {
+        // OpenCC 文本词典先同步转成 .ocd2 再 bootstrap：异步转换与
+        // 部署并发时 librime 会先加载旧 .ocd2，新词典要到下次部署
+        // 才生效（方案更新后繁简转换沿用旧词典一整代）
+        // 转换失败时部署不得报成功（E-L2）：旧 .ocd2 仍在盘上，本次部署
+        // 沿用旧词典却无任何失败信号。仅 fullCheck（部署）路径抛错——
+        // 普通启动仍用旧词典起键盘，不因一本繁简词典损坏整机无键盘。
+        if (!OpenCCDictManager.buildOpenCCDict() && fullCheck) {
+            throw IllegalStateException("OpenCC dictionary conversion failed")
+        }
+        val sharedDataDir = DataManager.sharedDataDir.absolutePath
+        val userDataDir = DataManager.userDataDir.absolutePath
+        Timber.d("Starting rime: shared=$sharedDataDir user=$userDataDir fullCheck=$fullCheck")
+
+        val info = appContext.packageManager.getPackageInfo(appContext.packageName, 0)
+        val versionName = info.versionName ?: "1.0"
+
+        bootstrap(sharedDataDir, userDataDir, versionName, fullCheck)
+    }
+
+    private fun processKeyInner(value: Int, modifiers: Int, isVirtual: Boolean): Boolean {
+        val handled = processKey(value, modifiers)
+        emitResponse()
+        if (!handled) {
+            handleMessage(RimeMessage.MessageType.Key.ordinal, arrayOf(value, modifiers, isVirtual))
+        }
+        return handled
+    }
+
+    private fun emitResponse(commit: (() -> CommitProto)? = null) {
+        // 一次 JNI 快照取代三次往返（commit + context + bulk 首屏）：
+        // 快照内 commit/context/bulk 同批取，
+        // bulk 的 highlighted 直接取自同批 context（此前由 Kotlin 侧从
+        // context 转交，不再重复取 context）。自定义 commit 传入时
+        // （如 simulateKeySequence 已先取 commit），快照的 commit 被
+        // 丢弃——此时 native 侧已无待取 commit（先取已消费），快照
+        // 读回空 commit 无副作用。
+        val snapshot = getSnapshotAfterKey()
+        val c = commit?.invoke() ?: (snapshot[0] as CommitProto)
+        val context = snapshot[1] as ContextProto
+        val bulkCandidates = snapshot[2] as Array<Any>
+        if (c.text?.isNotEmpty() == true) {
+            handleMessage(RimeMessage.MessageType.Commit.ordinal, arrayOf(c))
+        }
+        // 不再单独调 getStatus()：其结果无人消费，isComposing 由 context.input 推导
+        handleMessage(
+            RimeMessage.MessageType.Status.ordinal, arrayOf(
+                StatusProto(
+                    isComposing = !context.input.isEmpty()
+                )
+            )
+        )
+        //候选词列表：候选页为空且输入非空时合成原始输入直出（上游前端的无候选兜底，避免输入卡死）。但组字中含未解析的原
+        //始数字段（九宫格 T9 翻转态）时不合成提交、保留组字——翻
+        //转态下拼出的将是整串原始按键数字被写进输入框（第十六
+        //批，判定见 hasUnresolvedDigitSegment）；落入下方正常路径
+        //照常分发组字（胶囊显示原始数字）与空候选
+        // 候选参数：bulk 三元组＋同批快照的方案 page_size（B-P-1/P-2：
+        // native 分页末页判定与下标重映射用；与 bulk 同批取，不另调 native）。
+        val candidateParams = arrayOf<Any>(
+            bulkCandidates[0], bulkCandidates[1], bulkCandidates[2], context.menu.pageSize,
+        )
+        if (context.menu.pageSize <= 0 && context.input.isNotEmpty() && !context.input.startsWith(
+                CommandSymbol
+            ) && !hasUnresolvedDigitSegment(context.composition.syllables)
+        ) {
+            val commitText = StringBuilder()
+            var confirmedProto: SyllableProto? = null
+            context.composition.syllables.forEachIndexed { index, proto ->
+                if (confirmedProto != null) {
+                    val cp = confirmedProto
+                    if (cp.textSyllableStart >= 0 && cp.textSyllableEnd >= 0 && cp.textSyllableStart <= index && index <= cp.textSyllableEnd) {
+                        return@forEachIndexed
+                    }
+                }
+                if (proto.text.isNotEmpty()) {
+                    confirmedProto = proto
+                    commitText.append(proto.text)
+                    return@forEachIndexed
+                }
+                commitText.append(proto.rawInput)
+            }
+            Companion.clearComposition()
+            handleMessage(
+                RimeMessage.MessageType.Commit.ordinal, arrayOf(CommitProto(commitText.toString()))
+            )
+            handleComposition(CompositionProto())
+            handleMessage(
+                RimeMessage.MessageType.Candidate.ordinal,
+                candidateParams
+            )
+            return
+        }
+        handleComposition(context.composition)
+        handleMessage(
+            RimeMessage.MessageType.Candidate.ordinal,
+            candidateParams
+        )
+    }
+
+    private fun handleComposition(composition: CompositionProto) {
+        // C-L-18：T9 组字串直接取同一快照的 composition.preedit——
+        // 原先的 native t9Preedit 只是同一会话 composition.preedit
+        // 的直读（与快照同源同值），重读一遍是多余往返；T9 与非 T9
+        // 方案至此同口径。音节表（DynamicPreedit 的拼写段）不受影响。
+        val effective = composition
+        // 组字缓存首行同步赋值：emitResponse 的正常分支与「候选页为空→
+        // 合成空组字」特殊分支都经此处，赋值对象即本轮真正分发的组字，
+        // 与组字产生同步完成。此前靠 CompositionMessage 在通知分发线程
+        // 异步回写，其间读 compositionCached 的 sendJob 会读到上一轮组字。
+        compositionCached = effective
+        handleMessage(
+            RimeMessage.MessageType.InlinePreedit.ordinal, arrayOf(effective.preedit ?: "")
+        )
+        handleMessage(
+            RimeMessage.MessageType.DynamicPreedit.ordinal, arrayOf(effective)
+        )
+        handleMessage(RimeMessage.MessageType.Composition.ordinal, arrayOf(effective))
+    }
+
+    /**
+     * 消息处理点：由 [dispatchMessage] 在通知分发队列上串行调用，各缓存都在
+     * 本处理点同步赋值（补取 await 完成后才继续分发给 UI），不另起异步任务
+     * 回写——否则处理点之后触发的 sendJob 可能读到上一轮缓存（组字缓存同
+     * 口径，见 [handleComposition]）。其中一切 librime native 读取
+     * （getStatus / RimeSchema 构造 / 方案列表查询）都不在分发线程直调，
+     * 一律经 [withRimeContext] 回到 rime-main 补取，使全部 native 调用串行于
+     * rime-main 一条线，关闭其与 finalize 的 UAF 窗口。补取失败（引擎停止
+     * 中等）保留旧缓存并原样分发，不丢消息。
+     *
+     * @return 实际分发的消息：Schema 消息在补到完整方案条目时以其替换原始
+     * 消息（原始串只有 id/name），其余消息原样返回。
+     */
+    private suspend fun handleRimeMessage(it: RimeMessage<*>): RimeMessage<*> {
+        when (it) {
+            is RimeMessage.SchemaMessage -> {
+                val snapshot = snapshotOnRimeMain {
+                    val status = getStatus()
+                    val schema = RimeSchema(it.data.id)
+                    val item = cachedSchemaList().firstOrNull { s -> s.id == it.data.id }
+                    Triple(status, schema, item)
+                }
+                if (snapshot != null) {
+                    statusCached = snapshot.first
+                    schemaCached = snapshot.second
+                    val item = snapshot.third
+                    EngineMessageConverter.applySchemaKind(item?.kind ?: it.data.kind)
+                    if (item != null) return RimeMessage.SchemaMessage(item)
+                }
+                return it
+            }
+
+            is RimeMessage.OptionMessage -> {
+                snapshotOnRimeMain {
+                    val status = getStatus()
+                    statusCached = status
+                    updateSchemaCached(status)
+                }
+                return it
+            }
+
+            is RimeMessage.DeployMessage -> {
+                // OpenCC 词典构建已前移到 startRime 的 bootstrap 之前
+                // 同步执行（见彼处），这里不再异步补触发——异步构建赶
+                // 不上本次部署，纯属重复转换
+                if (it.data == RimeMessage.DeployMessage.State.Success) {
+                    invalidateSchemaListCache()
+                }
+                return it
+            }
+
+            // 组字缓存不在这里回写：已改为在 handleComposition 产生处同步赋值
+            is RimeMessage.CompositionMessage -> return it
+
+            is RimeMessage.CandidateMenuMessage -> {
+                paging = it.data.pageNumber != 0
+                hasMenu = it.data.candidates.isNotEmpty()
+                return it
+            }
+
+            is RimeMessage.CandidateListMessage -> {
+                hasMenu = it.data.candidates.isNotEmpty()
+                return it
+            }
+
+            is RimeMessage.StatusMessage -> {
+                // emitResponse 发来的 StatusMessage 是稀疏增量：只携带
+                // isComposing，其余字段都是数据类默认值（schemaId=""、
+                // isAsciiMode=true 等）。整表覆盖会把全量缓存冲成默认值，
+                // 故以当前缓存为基底合并，只采纳增量真正携带的字段；
+                // schemaId 等未出现在增量里的字段保持原值。
+                statusCached = statusCached.copy(isComposing = it.data.isComposing)
+                val status = statusCached
+                // 稀疏增量的 schemaId 恒为空、不触发重建（每键都走此路，
+                // 不能每键都往 rime-main 跑一趟）；真携带了新 id 时，
+                // RimeSchema 构造走 native，同样派发到 rime-main 补取。
+                if (status.schemaId.isNotBlank() && status.schemaId != schemaCached.schemaId) {
+                    snapshotOnRimeMain { updateSchemaCached(status) }
+                }
+                return it
+            }
+
+            else -> return it
+        }
+    }
+
+    /**
+     * 按状态中的 schemaId 重建方案缓存（RimeSchema 构造走 native）：
+     * 调用方必须已在 rime-main 上（见 [handleRimeMessage] 的补取路径）。
+     */
+    private fun updateSchemaCached(status: StatusProto) {
+        val schemaId = status.schemaId
+        if (schemaId.isNotBlank() && schemaId != schemaCached.schemaId) {
+            // 状态消息中的 schemaId 即为权威当前方案，同步重建缓存即可，
+            // 与 SchemaMessage 分支保持一致，避免异步 currentSchema() 的竞态/乱序。
+            schemaCached = RimeSchema(schemaId)
+        }
+    }
+
+    fun startup() {
+        if (!appContext.isStorageAvailable()) {
+            Timber.w("Skip starting rime: storage not available!")
+            return
+        }
+        if (lifecycle.currentState != RimeLifecycle.State.STOPPED) {
+            // 停机进行中收到的启动请求不能丢弃：否则停机完成后引擎
+            // 一直停着、调用方须自己重试。只登记一次，停机完成时
+            // 由 finalize 末尾消费并重走 startup（自带 STOPPED 守门，
+            // 与并发启动竞态时后到的直接跳过）。STARTING 期不登记：
+            // 启动已在进行中，本次请求即它本身。
+            if (lifecycle.currentState == RimeLifecycle.State.STOPPING) {
+                if (startupPending.compareAndSet(false, true)) {
+                    Timber.i("Rime startup() deferred until stopping completes")
+                }
+            } else {
+                Timber.w("Skip starting rime: not at stopped state!")
+            }
+            return
+        }
+        registerMessageHandler(::handleRimeMessage)
+        startupGeneration.incrementAndGet()
+        lifecycleRegistry.emitState(RimeLifecycle.State.STARTING)
+        // 部署失败打回 STOPPED 时 dispatcher 可能仍在跑（见
+        // onNativeRestartFailed）：STOPPED 态本应无活循环，先停掉残余
+        // 循环再启动，否则 start() 的 compareAndSet 失败、nativeStartup
+        // 永不执行、引擎卡死在 STARTING。已停时 stop() 是空操作。
+        dispatcher.stop()
+        dispatcher.start()
+    }
+
+    fun finalize() {
+        when (lifecycle.currentState) {
+            RimeLifecycle.State.READY -> {
+                lifecycleRegistry.emitState(RimeLifecycle.State.STOPPING)
+                Timber.i("Rime finalize()")
+                dispatcher.stop().let {
+                    if (it.isNotEmpty()) {
+                        Timber.w("${it.size} job(s) didn't get a chance to run!")
+                    }
+                }
+                lifecycleRegistry.emitState(RimeLifecycle.State.STOPPED)
+                unregisterMessageHandler(::handleRimeMessage)
+                // 消费停机期间登记的启动请求（见 startup()）：若并发启动
+                // 已先跑到 STARTING，本次重走 startup 会自带守门跳过。
+                if (startupPending.compareAndSet(true, false)) {
+                    startup()
+                }
+            }
+            RimeLifecycle.State.STARTING -> {
+                // 启动尚未完成时收到的停止请求不能丢弃：否则会话已全部销毁、
+                // 引擎却继续跑到 READY 无人持有（泄漏）。排队到就绪后立即执行。
+                if (deferredFinalizeScheduled.compareAndSet(false, true)) {
+                    Timber.i("Rime finalize() deferred until startup completes")
+                    val scheduledGeneration = startupGeneration.get()
+                    deferredFinalizeScope.launch {
+                        try {
+                            lifecycle.whenReady { }
+                            // 排队期间引擎若已被「停掉又重启」成新一代，本次停止
+                            // 意图只针对旧一代，不能误停刚重启好的引擎
+                            if (startupGeneration.get() != scheduledGeneration) {
+                                Timber.i("Deferred finalize superseded by a newer startup; skipped")
+                                return@launch
+                            }
+                            finalize()
+                        } catch (e: kotlinx.coroutines.CancellationException) {
+                            throw e
+                        } catch (e: Exception) {
+                            // 引擎在就绪前已被其它路径停掉，停止请求已达成，无需再做
+                            Timber.w(e, "Deferred finalize aborted")
+                        } finally {
+                            deferredFinalizeScheduled.set(false)
+                        }
+                    }
+                }
+            }
+            // STOPPING 时已有 finalize 在执行，本次请求由它覆盖；STOPPED 时无事可做
+            else -> Timber.w("Skip stopping rime: not at ready state!")
+        }
+    }
+
+    companion object {
+        /** 消息补取的等待上限：与 RimeDispatcher.stop() 的排空上限对齐 */
+        private const val SNAPSHOT_TIMEOUT_MS = 2_000L
+
+        // 消息流不丢消息：这里走的是 Schema/Option/Deploy 等状态消息，
+        // 丢一条 Deploy 成功或 Schema 变更，部署等待方会永久挂起、
+        // 守护进程的部署通知也会缺失。旧配置 DROP_OLDEST 在收集方卡顿时
+        // 直接把最旧的未消费消息扔掉。现为 SUSPEND 语义，且全部分发都经
+        // notificationQueue 的单线程消费者串行完成（见 dispatchMessage），
+        // 缓冲满时消费者原地挂起等位，保证送达且全局有序。
+        private val messageFlow_ = MutableSharedFlow<RimeMessage<*>>(
+            extraBufferCapacity = 64,
+            onBufferOverflow = BufferOverflow.SUSPEND,
+        )
+
+        private val messageEmitScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() +
+                Dispatchers.IO.limitedParallelism(1),
+        )
+
+        // 处理器为 suspend 且返回实际分发消息：消息处理点要在 rime-main
+        // 补取快照后才继续分发（见 handleRimeMessage），分发必须 await 它
+        private val rimeMessageHandlers =
+            CopyOnWriteArrayList<suspend (RimeMessage<*>) -> RimeMessage<*>>()
+
+        /** 当前活跃实例（进程内单例式持有一台 Rime），供 [runOnRimeMain] 定位派发目标 */
+        @Volatile
+        private var activeInstance: Rime? = null
+
+        /**
+         * 把 [block] 派发到 rime-main 执行并等待结果，供 RimeApi 接口之外
+         * 的 native 入口调用方使用（典型：RimeConfig.openSchema）。调用方
+         * 线程（如引擎 jobs 线程、设置页协程）直调这类入口会绕开 rime-main
+         * 串行线，与 finalize 形成 UAF 窗口。没有活跃实例（引擎未创建）或
+         * 引擎已停止时抛 IllegalStateException，由调用方按既有口径降级。
+         */
+        suspend fun <T> runOnRimeMain(block: suspend RimeApi.() -> T): T {
+            val instance = activeInstance
+                ?: throw IllegalStateException("Rime has not been created!")
+            return instance.dispatchToRimeMain(block)
+        }
+
+        /**
+         * librime 通知（schema/option/deploy）的待处理队列。通知回调发生在
+         * librime 的调用栈里（维护线程或 API 调用途中），旧实现同步在回调里
+         * 做消息转换与分发，而转换（getSchemaList）和处理器（getStatus）
+         * 又会回调 JNI 取状态——在 librime 操作中途重入其 API。改为回调
+         * 只入队，由 [messageEmitScope] 的单线程消费者按 FIFO 顺序在
+         * native 调用栈之外完成转换与分发。引擎自产消息（按键响应等，
+         * 见 [handleMessage]）也入同一队列，使两类消息全局有序。
+         */
+        private val notificationQueue =
+            kotlinx.coroutines.channels.Channel<Pair<Int, Array<Any>>>(
+                kotlinx.coroutines.channels.Channel.UNLIMITED,
+            )
+
+        init {
+            System.loadLibrary("rime_jni")
+        }
+
+        init {
+            messageEmitScope.launch {
+                for ((type, params) in notificationQueue) {
+                    try {
+                        dispatchMessage(type, params)
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Throwable) {
+                        Timber.w(e, "Failed to dispatch rime notification")
+                    }
+                }
+            }
+        }
+
+        @JvmStatic
+        external fun bootstrap(
+            sharedDir: String, userDir: String, versionName: String, fullCheck: Boolean
+        )
+
+        @JvmStatic
+        external fun shutdown()
+
+        @JvmStatic
+        external fun joinMaintenanceThread()
+
+        /**
+         * librime 用户数据同步（WO52 3.1c）：JNI 导出已存在
+         * （rime_engine.cc:511），Kotlin 侧此前无声明、无调用方。
+         * 只许经 rime-main 调用（见 [RimeApi.syncUserData]），不直调。
+         */
+        @JvmStatic
+        external fun syncUserData(): Boolean
+
+        @JvmStatic
+        external fun processKey(keycode: Int, mask: Int): Boolean
+
+        @JvmStatic
+        external fun commitComposition(): Boolean
+
+        @JvmStatic
+        external fun commitCurrentSelection(append: String): Boolean
+
+        @JvmStatic
+        external fun clearComposition()
+
+        @JvmStatic
+        external fun freeContext()
+
+        @JvmStatic
+        external fun getCommit(): CommitProto
+
+        @JvmStatic
+        external fun getStatus(): StatusProto
+
+        @JvmStatic
+        external fun setOption(option: String, value: Boolean)
+
+        @JvmStatic
+        external fun getOption(option: String): Boolean
+
+        @JvmStatic
+        external fun getSchemaList(): Array<SchemaItem>
+
+        // 方案列表缓存：Schema 通知在 rime-main 补取时只需按 id 查一条，
+        // 此前每次都走 JNI 全量拉取。本函数走 native，只许在 rime-main 上
+        // 调用。部署成功后方案集可能变化，届时由通知处理失效缓存
+        @Volatile
+        private var schemaListCache: Array<SchemaItem>? = null
+
+        fun cachedSchemaList(): Array<SchemaItem> =
+            schemaListCache ?: getSchemaList().also { schemaListCache = it }
+
+        fun invalidateSchemaListCache() {
+            schemaListCache = null
+        }
+
+        @JvmStatic
+        external fun getCurrentSchema(): String
+
+        @JvmStatic
+        external fun selectSchema(schemaId: String): Boolean
+
+        @JvmStatic
+        external fun simulateKeySequence(keySequence: String): Boolean
+
+        @JvmStatic
+        external fun getRawInput(): String
+
+        @JvmStatic
+        external fun setInput(keySequence: String): Boolean
+
+        @JvmStatic
+        external fun appendInput(keySequence: String): Boolean
+
+        @JvmStatic
+        external fun setCaretPos(caretPos: Int)
+
+        @JvmStatic
+        external fun selectCandidate(index: Int, global: Boolean): Boolean
+
+        @JvmStatic
+        external fun deleteCandidate(index: Int, global: Boolean): Boolean
+
+        @JvmStatic
+        external fun changeCandidatePage(backward: Boolean): Boolean
+
+        /**
+         * 候选高亮（WO52 1.1）：只移动高亮、不提交；onCurrentPage=true
+         * 为页内下标（highlight_candidate_on_current_page），false 为
+         * 全局下标（highlight_candidate）。
+         */
+        @JvmStatic
+        external fun highlightCandidate(index: Int, onCurrentPage: Boolean): Boolean
+
+        @JvmStatic
+        external fun getAvailableSchemaList(): Array<SchemaItem>
+
+        @JvmStatic
+        external fun getSelectedSchemaList(): Array<SchemaItem>
+
+        @JvmStatic
+        external fun selectSchemas(schemaIds: Array<String>): Boolean
+
+        @JvmStatic
+        external fun getCandidates(startIndex: Int, limit: Int): Array<CandidateProto>
+
+        /**
+         * 一次 JNI 取回按键响应全量：[commit, context, bulk] 三元数组。
+         * 供 emitResponse 一次往返取代三次；getCommit 各自保留
+         * （simulateKeySequence 仍直调 getCommit）。
+         */
+        @JvmStatic
+        external fun getSnapshotAfterKey(): Array<Any>
+
+        @JvmStatic
+        external fun getInputConfirmedPosition(): Int
+
+        /**
+         * T9 拼音列表（WO52 1.5，自研 native 插件）：当前未解析数字段
+         * 的首音节候选项，以单个空格连接；无组字／无未解析段时为空串。
+         * API 面与对端 RimeNative.t9PinyinList 相同。
+         */
+        @JvmStatic
+        external fun t9PinyinList(): String
+
+        /**
+         * T9 定拼音（WO52 1.5）：把 pinyin 钉为当前未解析段的首音节
+         * 后重算候选；pinyin 不在候选项内时返回 false、会话不动。
+         */
+        @JvmStatic
+        external fun t9SetPinyin(pinyin: String): Boolean
+
+        /**
+         * librime 通知回调的 JNI 入口：只把原始消息入队后立即返回，
+         * 不在 native 调用栈里做任何转换/分发（见 [notificationQueue]）。
+         */
+        @JvmStatic
+        fun handleNativeNotification(type: Int, params: Array<Any>) {
+            notificationQueue.trySend(type to params)
+        }
+
+        @JvmStatic
+        fun handleMessage(type: Int, params: Array<Any>) {
+            // 引擎自产消息（按键响应等）与原生通知共用同一队列、同一单线程
+            // 消费者分发，保证两类消息全局有序。旧实现由调用方线程（rime-main）
+            // 同步直分发，与通知分发线程并发，顺序无法保证。
+            notificationQueue.trySend(type to params)
+        }
+
+        /**
+         * 只由 [notificationQueue] 的单线程消费者调用：转换、处理器回调与
+         * 写入 [messageFlow_] 在此串行完成。缓冲满时在本线程内挂起补发，
+         * 后续消息仍在队列中排队——不会像旧实现另起协程补发那样被后续
+         * 消息超车，也不会丢弃。
+         */
+        private suspend fun dispatchMessage(type: Int, params: Array<Any>) {
+            // nativeCreate 只做原始数据记录（不在本线程调 native）；处理器
+            // 在其内部把快照派发到 rime-main 补取并 await，返回实际分发
+            // 的消息后才写入消息流，保证缓存与 UI 分发严格同序
+            var message = RimeMessage.nativeCreate(type, params)
+            rimeMessageHandlers.forEach { handler -> message = handler.invoke(message) }
+            if (!messageFlow_.tryEmit(message)) {
+                messageFlow_.emit(message)
+            }
+        }
+
+        private fun registerMessageHandler(
+            handler: suspend (RimeMessage<*>) -> RimeMessage<*>,
+        ) {
+            if (handler !in rimeMessageHandlers) {
+                rimeMessageHandlers.add(handler)
+            }
+        }
+
+        private fun unregisterMessageHandler(
+            handler: suspend (RimeMessage<*>) -> RimeMessage<*>,
+        ) {
+            rimeMessageHandlers.remove(handler)
+        }
+    }
+}
+
+/**
+ * 组字中是否存在「未解析的原始数字段」：某段尚未成词（text 为
+ * 空）、原始输入含数字、且拼写未解析出任何字母（spelling 为空
+ * 或全数字）。
+ *
+ * 只有九宫格 T9 的组字能命中：T9 按键送进引擎的是数字码，纯数
+ * 字串打到候选变空的长度时引擎翻转——组字回落成原始数字、拼
+ * 写为空（见 review16/verify-digit-commit 的主机实测）。lite /
+ * english 的键盘层数字走 CommitAction 直提、从不进组字，其组
+ * 字原始输入只有字母，本判定恒假、原直出行为不变。
+ *
+ * emitResponse 的「无候选直出」兜底据此收紧：命中时不合成提
+ * 交、保留组字（翻转那一按不再把整串数字写进输入框，用户可
+ * 继续编辑或退格删）。
+ */
+internal fun hasUnresolvedDigitSegment(syllables: Array<SyllableProto>): Boolean =
+    syllables.any { proto ->
+        proto.text.isEmpty() &&
+            proto.rawInput.any { it.isDigit() } &&
+            proto.spelling.none { it.isLetter() }
+    }

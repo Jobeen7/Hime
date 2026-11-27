@@ -1,0 +1,929 @@
+package com.jobeen.hime.input
+
+import android.annotation.SuppressLint
+import android.content.Intent
+import android.inputmethodservice.InputMethodService
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import com.jobeen.hime.data.manager.CandidateManager
+import com.jobeen.hime.data.manager.KeyboardManager
+import com.jobeen.hime.engine.EngineFactory
+import com.jobeen.hime.engine.IEngine
+import com.jobeen.hime.engine.event.KeyEvent
+import com.jobeen.hime.engine.event.KeyModifiers
+import com.jobeen.hime.input.keyboard.key.KeyboardAction
+import com.jobeen.hime.input.keyboard.key.KeyActionListener
+import com.jobeen.hime.input.keyboard.window.KeyboardStateManager
+import com.jobeen.hime.input.ImeInputMethodService
+import com.jobeen.hime.R
+import com.jobeen.hime.base.speech.SherpaSpeechClient
+import com.jobeen.hime.base.speech.VoiceUndoLedger
+import com.jobeen.hime.base.util.appScope
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.skin.model.SnippetExpander
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+
+class KeyActionListener(
+    private val service: InputMethodService,
+) : KeyActionListener {
+
+    private val engine: IEngine? get() = EngineFactory.current()
+
+    /**
+     * 统一会话门控（WO38 E1-9）：延迟分发的纪元复检走本门。同步按键
+     * 按下即分发、恒为当前会话，不经门控；门控只拦跨会话延迟分发
+     * （本文件内即 CombineAction 的延迟分发）。长按连发的按下戳
+     * 不在本文件内，见 [InputKeyGate] 的已知缺口。
+     */
+    private val inputKeyGate = InputKeyGate()
+
+    override fun onKeyAction(action: KeyboardAction) {
+        // P4 分段探针（分发段）：起点标记；门控关时 stageStart 返回 -1，
+        // 末尾 noteStage 即 no-op。早返回路径（MultiReturnAction 取不到
+        // 输入连接）不产生样本——该路径本就不走到引擎分发。
+        val dispatchStart = com.jobeen.hime.skin.perf.PerfMonitor.stageStart()
+        when (action) {
+            is KeyboardAction.KeySequenceAction -> {
+                engine?.processKey(service, action.asKeyEvent())
+            }
+
+            is KeyboardAction.KeyCodeAction -> {
+                engine?.processKey(service, action.asKeyEvent())
+            }
+
+            is KeyboardAction.ClearAction -> {
+                // 上滑清空组字：藏态随组字清空而失效（Reset 同步清
+                // 编辑器组字区），复位藏态，免 stale 藏态让下一次
+                // 组字中下滑跳过藏步直走账本。
+                TypedUndoLedger.clearComposingSpanHidden()
+                engine?.clear(service)
+            }
+
+            is KeyboardAction.CommitAction -> {
+                commitOrPair(action.text)
+            }
+
+            is KeyboardAction.BackspaceAction -> {
+                // 剪贴板搜索态：退格先问面板（删查询/吞掉），不归引擎才删拼音或文档
+                val intercepted = (service as? ImeInputMethodService)?.keyboardWindow
+                    ?.panel?.handleClipSearchBackspace(
+                        com.jobeen.hime.input.keyboard.window.KeyboardStateManager.isComposingNow
+                    ) == true
+                if (!intercepted) {
+                    engine?.processKey(
+                        service, KeyEvent.CodeEvent(
+                            KeyEvent.CodeEvent.keyCode("DEL"), KeyModifiers.Empty
+                        )
+                    )
+                }
+            }
+
+            // 向前删除（deleteForward，Wave-4 遗留缺口补齐）：
+            // 引擎侧 ForwardDelete 全语义（组字删编码右侧、选区／
+            // 光标右侧整体删、右侧无物空操作），本分支只做接应。
+            is KeyboardAction.DeleteForwardAction -> {
+                engine?.deleteForward(service)
+            }
+
+            // 删除选中文本（#deleteText）：仅删当前选区；无选区
+            // 空操作，绝不回退为退格；组字中禁行（选区与组字
+            // 重叠，连接侧删除会损坏组字态，见 DeleteTextPolicy）。
+            // 读选区与提交皆经当前输入连接（与剪贴板动作同口径，
+            // 不走短语桥虚拟连接）；连接异常只记元数据，不崩溃。
+            //
+            // 清字入账：删除成功即把「被清掉的这段」连同删除点前的
+            // 锚点记进 ClearedTextLedger，下滑撤销据此原样送回，不再
+            // 依赖 Ctrl+Z——污染会话内 Ctrl+Z 已被拦（防清掉的组字
+            // 复活），不记账的话清掉的已上屏文字就没有任何地方可回。
+            // 锚点必须在删除**之前**现读：删完光标已落在删除点，
+            // 那时读到的前文才是恢复时要核对的位置。
+            is KeyboardAction.DeleteTextAction -> {
+                try {
+                    val ic = service.currentInputConnection
+                    val selected = runCatching { ic?.getSelectedText(0) }.getOrNull()
+                    if (ic != null && DeleteTextPolicy.shouldDelete(
+                            KeyboardStateManager.isComposingNow, selected,
+                        )
+                    ) {
+                        // 有选区时 getTextBeforeCursor 取的是选区之前的
+                        // 文本（与 VoiceUndoLedger 同口径），正是删除点
+                        // 紧邻的前文；取失败按空锚点记（恢复走严判）。
+                        val anchor = runCatching {
+                            ic.getTextBeforeCursor(ClearedTextLedger.ANCHOR_CHARS, 0)?.toString()
+                        }.getOrNull().orEmpty()
+                        if (ic.commitText("", 1)) {
+                            ClearedTextLedger.record(selected?.toString().orEmpty(), anchor, ic)
+                        }
+                    }
+                } catch (ex: Exception) {
+                    DiagLog.w(
+                        "keymap", "delete_text_failed",
+                        mapOf("error" to ex.javaClass.simpleName),
+                    )
+                }
+            }
+
+            // RIME 选项翻转（rimeOption）：引擎侧异步读现值取反；
+            // 三态以上选项不适用，不持久化（见 SkinAction 文档）。
+            is KeyboardAction.ToggleRimeOptionAction -> {
+                engine?.toggleRuntimeOption(action.option)
+            }
+
+            // 模板文本上屏（snippet）：日期展开后字面提交；光标位
+            // 在全文上屏后按标记后单元数向左移（DPAD 步进）。
+            // 顺序残余：上屏与移光标走引擎两条通道（actions/jobs），
+            // 正常路径上屏先行；极端交错下光标位需真机复核。
+            is KeyboardAction.SnippetAction -> {
+                val expanded = SnippetExpander.expand(action.template)
+                engine?.commit(expanded.text)
+                repeat(expanded.cursorUnitsFromEnd) {
+                    engine?.moveCursor(service, -1)
+                }
+            }
+
+            // 子动作间停顿（delay，combine 专用）：分发线程有界
+            // 阻塞；毫秒上限解析期已钳（≤1000ms），此处不二次钳制。
+            // 2026-11-16 N8：单发 DelayAction 不再睡分发线程——
+            // combine 之外的裸 delay 后面没有待分发的动作，睡
+            // 眠只会白白阻塞主线程；combine 内的 delay 由
+            // dispatchCombine 改走 appScope 非阻塞延时（见下）。
+            is KeyboardAction.DelayAction -> {
+                // No-op：combine 专用，见 dispatchCombine。
+            }
+
+            // 回车精简决策：软回车键不再经 processKey 的状态键
+            // 旧路径（图标变换、force 旁路、空探针均已删）。字段
+            // 属性在分发时点由当前编辑框信息映射（框架属性，
+            // 无信息时按单行＋未声明动作计）；组字中由引擎串行
+            // job 执行时点现读原始输入判定，不在此处预判。
+            // 显式绑定的 MultiReturnAction 不走本分支，原样不动。
+            is KeyboardAction.ReturnAction -> {
+                engine?.processEnter(
+                    service,
+                    EnterFieldBoundary.fromEditorInfo(service.currentInputEditorInfo),
+                    isLongPress = action.force,
+                    hasDedicatedNewlineKey = action.hasDedicatedNewlineKey,
+                )
+            }
+
+            is KeyboardAction.SpaceAction -> {
+                engine?.processKey(
+                    service, KeyEvent.CodeEvent(
+                        KeyEvent.CodeEvent.keyCode("SPACE"), KeyModifiers.Empty
+                    )
+                )
+            }
+
+            is KeyboardAction.CursorMoveAction -> {
+                engine?.moveCursor(service, action.direction)
+            }
+
+            is KeyboardAction.LangSwitchAction -> {
+                @SuppressLint("NewApi") service.switchToNextInputMethod(false)
+            }
+
+            // 中英切换（纠正 2，2026-11-01 定）：#中英切换 =
+            // RIME ascii_mode 翻转，与菜单 ascii 开关同款逻辑——
+            // 只翻偏好（引擎侧经偏好应用跟随），绝不切键盘类型。
+            // 布局切换是另一机制（keyboardType 动作，见
+            // SwitchKeyboardTypeAction），两者并存、互不替代。
+            is KeyboardAction.ToggleAsciiModeAction -> {
+                CandidateManager.setAsciiModeEnabled(
+                    service,
+                    !CandidateManager.isAsciiModeEnabled(service),
+                )
+            }
+
+            // 键盘类型切换（纠正 2 新增，与中英切换并存的独立
+            // 机制）：皮肤绑定 keyboardType 时切类型（含自定义名），
+            // 经类型状态入口（含内置回退，永不空白）；窗口层
+            // transformed 直通至此，不拦截。
+            is KeyboardAction.SwitchKeyboardTypeAction -> {
+                KeyboardStateManager.switchKeyboardType(action.type)
+            }
+
+            is KeyboardAction.SelectSchema -> {
+                engine?.selectSchema(action.schemaId)
+            }
+
+            // ShowInputMethodPickerAction 不在此处理：它在
+            // KeyboardWindowView.transformed 里被拦截（弹方案选择框）
+            // 并返回 null，永远到不了本监听——原先这里的分支不可达，
+            // 已删除，避免误以为请求系统输入法选择器是生效路径
+
+            is KeyboardAction.SelectCandidatePinYin -> {
+                engine?.selectCandidatePinYin(action.pinYin)
+            }
+
+            is KeyboardAction.PageCandidatesAction -> {
+                engine?.pageCandidates(action.backward)
+            }
+
+            is KeyboardAction.UndoAction -> {
+                // 组字中下滑藏 span（2026-11-05 藏 span 解）：组字中＋
+                // 内嵌开那一格 .17 是空操作——先藏起编辑器侧组字
+                // span（组字串移出编辑器显示，Rime 组字状态不动，
+                // 不提交），再下滑走账本撤销已上屏文字；其余一律
+                // 原样移交引擎 Undo 分支。RimeEngine Undo 分支不动。
+                when (
+                    TypedUndoLedger.decideComposingSwipeDown(
+                        composing = KeyboardStateManager.isComposingNow,
+                        poisoned = TypedUndoLedger.isPoisoned(),
+                        spanHidden = TypedUndoLedger.isComposingSpanHidden(),
+                    )
+                ) {
+                    TypedUndoLedger.ComposingSwipeDown.HIDE_SPAN -> hideComposingSpan()
+                    TypedUndoLedger.ComposingSwipeDown.UNDO_HIDDEN -> undoHiddenComposing()
+                    TypedUndoLedger.ComposingSwipeDown.DELEGATE -> engine?.undo(service)
+                }
+            }
+
+            is KeyboardAction.RedoAction -> {
+                engine?.redo(service)
+            }
+
+            // 宿主文本撤销（#undo）：改道为与下滑 UndoAction 同一
+            // 账本路径——先查上滑清字账本（原样写回），再查语音
+            // 账本、打字账本（污染会话内才查打字账本，与下滑
+            // 一致）；三账本都不命中且会话被污染时空操作，绝不
+            // 回退宿主撤销（宿主撤销栈同样可能把清掉的组字复活）；
+            // 未污染且三账本都不命中时保持原有行为：经当前输入
+            // 连接的上下文菜单动作，尽力而为（返回值不作成功判
+            // 定）；宿主不支持时无效果，不回退删字；连接为空不崩溃。
+            // 组字中三账本一律不查（与下滑 .17 门一致），污染门
+            // 仍按 decideHostUndoFallback 执行。
+            // 生产方核查：HostUndoAction 的唯一生产方是皮肤
+            // #undo 映射（KeyOverrideApplier.HASH_UNDO），无非皮肤
+            // 调用方（工具栏仅作 #undo 文案映射，KeyPreset 下滑用
+            // 的是 UndoAction），故改本分支即只改皮肤 #undo 路径，
+            // 不存在需要保留的另一条非皮肤宿主撤销路径。
+            is KeyboardAction.HostUndoAction -> {
+                try {
+                    val ic = service.currentInputConnection
+                    val composing = KeyboardStateManager.isComposingNow
+                    val clearedHit = !composing && ic != null &&
+                        ClearedTextLedger.tryRestore(ic)
+                    val voiceHit = !composing && !clearedHit && ic != null &&
+                        VoiceUndoLedger.tryUndo(ic)
+                    val poisoned = TypedUndoLedger.isPoisoned()
+                    val typedHit = !composing && !clearedHit && !voiceHit &&
+                        poisoned && ic != null && TypedUndoLedger.tryUndo(ic)
+                    when (
+                        TypedUndoLedger.decideHostUndoFallback(
+                            clearedHit = clearedHit,
+                            voiceHit = voiceHit,
+                            typedHit = typedHit,
+                            poisoned = poisoned,
+                            composing = composing,
+                        )
+                    ) {
+                        TypedUndoLedger.HostUndoFallback.DONE,
+                        TypedUndoLedger.HostUndoFallback.NOOP -> Unit
+                        TypedUndoLedger.HostUndoFallback.HOST_UNDO -> {
+                            ic?.performContextMenuAction(android.R.id.undo)
+                        }
+                    }
+                } catch (ex: Exception) {
+                    DiagLog.w(
+                        "keymap", "host_undo_failed",
+                        mapOf("error" to ex.javaClass.simpleName),
+                    )
+                }
+            }
+
+            // 宿主文本全选（P0-2：#selectText）：经当前输入连接
+            // 的上下文菜单动作，尽力而为（返回值不作成功判定）；
+            // 宿主不支持时无效果，不回退删字；连接为空不崩溃。
+            is KeyboardAction.SelectAllAction -> {
+                try {
+                    service.currentInputConnection?.performContextMenuAction(
+                        android.R.id.selectAll,
+                    )
+                } catch (ex: Exception) {
+                    DiagLog.w(
+                        "keymap", "select_all_failed",
+                        mapOf("error" to ex.javaClass.simpleName),
+                    )
+                }
+            }
+
+            // 宿主文本重做（#redo）：与 #undo 同口径，见上。
+            is KeyboardAction.HostRedoAction -> {
+                try {
+                    service.currentInputConnection?.performContextMenuAction(
+                        android.R.id.redo,
+                    )
+                } catch (ex: Exception) {
+                    DiagLog.w(
+                        "keymap", "host_redo_failed",
+                        mapOf("error" to ex.javaClass.simpleName),
+                    )
+                }
+            }
+
+            is KeyboardAction.MultiReturnAction -> {
+                engine?.resetComposition()
+                // 顺序保证（I-S5）：清组字走引擎异步通道，直发按键是
+                // 同步调用——performEditorAction 若抢在清组字 job 前
+                // 到达编辑器，编辑器侧组字 span 仍在，动作偶发失效。
+                // 先在同一连接上同步清掉编辑器侧组字 span（与引擎
+                // Reset job 随后做的事相同、幂等），再直发动作；
+                // 未组字时不碰编辑器（不干扰语音等其他组字态）。
+                val ic = (service as ImeInputMethodService).activeInputConnection() ?: return
+                clearEditorComposingSpanSync(ic)
+                ic.performEditorAction(
+                    when (action.text) {
+                        "GO" -> EditorInfo.IME_ACTION_GO
+                        "SEND" -> EditorInfo.IME_ACTION_SEND
+                        "SEARCH" -> EditorInfo.IME_ACTION_SEARCH
+                        "NEXT" -> EditorInfo.IME_ACTION_NEXT
+                        "PREVIOUS" -> EditorInfo.IME_ACTION_PREVIOUS
+                        "DONE" -> EditorInfo.IME_ACTION_DONE
+                        else -> EditorInfo.IME_ACTION_NONE
+                    }
+                )
+            }
+
+            // 字面提交（审计 E：symbol 通道与 commit_direct）：经
+            // 引擎直接上屏，不经组字、不经标点转换、不成对。
+            // 注意：此前本分支缺失，LiteralCommitAction 落入 else
+            // 被静默吞掉（Qwerty 变换层只保证了“原样下发”，分发
+            // 层并无接应）；本分支补齐该通道，commit_direct 键与
+            // 符号键自此才真正上屏。
+            is KeyboardAction.LiteralCommitAction -> {
+                engine?.commit(action.text)
+            }
+
+            // 组合按键序列（审计 E：sendKeys）：逐个经引擎按键通道。
+            is KeyboardAction.SendKeysAction -> {
+                for (combo in action.keys) {
+                    engine?.processKey(
+                        service,
+                        KeyEvent.CodeEvent(combo.keyCode, combo.modifiers, isVirtual = true),
+                    )
+                }
+            }
+
+            // 直送应用的按键（审计 E：sendKeyEvent / tab / escape /
+            // 行首行尾）：绕过引擎，经输入连接直发应用；对端全
+            // 语义前置：先清组字（不提交）、先关联想；焦点在
+            // 本键盘自有输入框（当前字段属本包）时空操作；坏键名
+            // 解析期已剔除（VALUE_INVALID），到此恒为合法键码。
+            // 顺序保证（I-S5）：与 MultiReturnAction 同理——先同步清
+            // 编辑器侧组字 span，再直发按键，不让按键抢在异步清组字
+            // job 前到达编辑器。清 span 的连接与直发目标未必同一：
+            // 桥接激活时组字 span 在虚拟连接上（见下，I-L4），按键
+            // 目标仍是真实连接；顺序保证只认先后，不认同连接。
+            is KeyboardAction.AppKeyEventAction -> {
+                val ownField =
+                    service.currentInputEditorInfo?.packageName == service.packageName
+                if (ownField) {
+                    DiagLog.w("keymap", "send_key_event_own_field", emptyMap())
+                } else {
+                    engine?.resetComposition()
+                    engine?.dismissPredictions()
+                    // 清组字 span 走 activeInputConnection()（I-L4）：
+                    // 桥接激活时组字 span 位于虚拟连接上，
+                    // currentInputConnection 指向真实连接、清错对象；
+                    // 与 MultiReturnAction／hideComposingSpan／
+                    // undoHiddenComposing 同口径。键直发
+                    // （sendCombinationKeyEvent）仍走真实连接——那是
+                    // 按键目标，有意不动；无连接时不清 span、按键照发。
+                    val ic = resolveSpanClearConnection(
+                        (service as? ImeInputMethodService)?.activeInputConnection(),
+                        service.currentInputConnection,
+                    )
+                    ic?.let { clearEditorComposingSpanSync(it) }
+                    com.jobeen.hime.base.util.InputConnectionUtil.sendCombinationKeyEvent(
+                        service, action.keyCode,
+                        ctrl = action.ctrl, shift = action.shift,
+                        alt = action.alt, meta = action.meta,
+                    )
+                }
+            }
+
+            // 组合动作（审计 E：combine）：直接分发路径按序递归；
+            // 窗口路径由窗口包装先展开（子动作各经 transformed），
+            // 不会到达此处。delay 子动作改走 appScope 非阻塞延时
+            // （2026-11-16 N8）：旧实现在分发线程 Thread.sleep，
+            // 最长 1s 冻住主线程；现只同步分发 delay 之前的子动作，
+            // 余部延时后在主线程续分发（appScope 即 MainScope，
+            // 执行线程不变），延时中换输入框则门控丢弃余部。
+            is KeyboardAction.CombineAction -> {
+                dispatchCombine(action.actions)
+            }
+
+            // 打开链接（审计 E：openURL）：白名单外一律丢弃记日志。
+            // 白名单内先弹确认（与部署确认同款 IMS showDialog 范
+            // 式：挂键盘窗口 token 的确认框，用户看清链接再决定）；
+            // 确认才起意图，取消只记 scheme 元数据。无安全确认面
+            // 时（服务非 IMS、或键盘窗口未挂上无 token）不硬造假
+            // 确认：退回改前直开行为（长度上限仍由白名单守），并
+            // 记一条元数据日志——该路径的确认缺口如实列入残余。
+            // 日志恒只记 scheme，不记完整链接。
+            is KeyboardAction.OpenUrlAction -> {
+                if (!OpenUrlPolicy.isAllowed(action.url)) {
+                    DiagLog.w(
+                        "keymap", "open_url_blocked",
+                        mapOf("scheme" to action.url.substringBefore(":", "")),
+                    )
+                } else {
+                    val imeService = service as? ImeInputMethodService
+                    val hasToken = imeService?.keyboardWindow?.view?.windowToken != null
+                    if (imeService != null && hasToken) {
+                        val dialog = android.app.AlertDialog.Builder(imeService)
+                            .setTitle(R.string.open_url_confirm_title)
+                            .setMessage(
+                                imeService.getString(
+                                    R.string.open_url_confirm_message, action.url,
+                                ),
+                            )
+                            .setPositiveButton(R.string.open_url_confirm_open) { _, _ ->
+                                openUrl(action.url)
+                            }
+                            .setNegativeButton(R.string.open_url_confirm_cancel) { _, _ ->
+                                DiagLog.w(
+                                    "keymap", "open_url_cancelled",
+                                    mapOf(
+                                        "scheme" to action.url.substringBefore(":", ""),
+                                    ),
+                                )
+                            }
+                            .create()
+                        imeService.showDialog(dialog)
+                    } else {
+                        DiagLog.w(
+                            "keymap", "open_url_no_confirm_surface",
+                            mapOf("scheme" to action.url.substringBefore(":", "")),
+                        )
+                        openUrl(action.url)
+                    }
+                }
+            }
+
+            // 刻意空操作（审计 E：none）：显式吞掉，不回退出厂行为。
+            is KeyboardAction.NoOpAction -> Unit
+
+            // 瞬时上档（审计 E：shift）：直接分发无按下/抬起上下文，
+            // 恒为空操作；真正语义只在按键面按下/抬起钩子实现。
+            is KeyboardAction.MomentaryShiftAction -> Unit
+
+            // 打开本应用设置（审计 E：settings）：与面板设置同款意图。
+            is KeyboardAction.SettingsAction -> {
+                service.startActivity(
+                    android.content.Intent(
+                        service, com.jobeen.hime.ui.MainActivity::class.java,
+                    ).apply {
+                        addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP
+                        )
+                    },
+                )
+            }
+
+            // 打开系统设置（审计 E：systemSettings）。
+            is KeyboardAction.SystemSettingsAction -> {
+                service.startActivity(
+                    android.content.Intent(
+                        android.provider.Settings.ACTION_SETTINGS,
+                    ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                )
+            }
+
+            // 面板快捷入口（W19-6 panel 板 8 钮）：目标见 handlePanelShortcut。
+            is KeyboardAction.PanelShortcutAction -> handlePanelShortcut(action.target)
+
+            // 隐藏键盘（审计 E：dismissKeyboard）：窗口路径由
+            // transformed 拦截；此处接应无窗口的直接分发路径。
+            is KeyboardAction.HideKeyboardAction -> {
+                service.requestHideSelf(0)
+            }
+
+            // 回主键盘／回上一键盘（审计 E：returnPrimary/Last）：
+            // 经类型状态切换，窗口路径直通至此（transformed 不拦截）。
+            is KeyboardAction.ReturnPrimaryAction -> {
+                KeyboardStateManager.returnPrimaryKeyboard()
+            }
+
+            is KeyboardAction.ReturnLastAction -> {
+                KeyboardStateManager.returnLastKeyboard()
+            }
+
+            // 剪贴板（审计 E：#cut/copy/paste/clearSystemPasteboard）：
+            // 经输入连接（cut/copy/paste）或系统剪贴板（clear）。
+            is KeyboardAction.ClipboardAction -> {
+                when (action.kind) {
+                    KeyboardAction.ClipboardAction.Kind.CUT ->
+                        service.currentInputConnection?.performContextMenuAction(
+                            android.R.id.cut,
+                        )
+                    KeyboardAction.ClipboardAction.Kind.COPY ->
+                        service.currentInputConnection?.performContextMenuAction(
+                            android.R.id.copy,
+                        )
+                    KeyboardAction.ClipboardAction.Kind.PASTE ->
+                        service.currentInputConnection?.performContextMenuAction(
+                            android.R.id.paste,
+                        )
+                    KeyboardAction.ClipboardAction.Kind.CLEAR -> {
+                        val clipboard = service.getSystemService(
+                            android.content.Context.CLIPBOARD_SERVICE,
+                        ) as? android.content.ClipboardManager
+                        if (clipboard != null) {
+                            if (android.os.Build.VERSION.SDK_INT >=
+                                android.os.Build.VERSION_CODES.P
+                            ) {
+                                clipboard.clearPrimaryClip()
+                            } else {
+                                clipboard.setPrimaryClip(
+                                    android.content.ClipData.newPlainText("", ""),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // 简繁切换（审计 E：#简繁切换）：翻转繁体偏好。
+            is KeyboardAction.ToggleTraditionalAction -> {
+                CandidateManager.setTraditionalChineseEnabled(
+                    service,
+                    !CandidateManager.isTraditionalChineseEnabled(service),
+                )
+            }
+
+            // 内嵌输入切换（审计 E：#toggleEmbeddedInputMode）。
+            is KeyboardAction.ToggleEmbeddedInputAction -> {
+                CandidateManager.setInlineInputModeEnabled(
+                    service,
+                    !CandidateManager.isInlineInputModeEnabled(service),
+                )
+            }
+
+            // RIME 部署／同步（WO52 3.1a 挂白名单，3.1b/3.1c 改走
+            // :ime Service 跨进程链）：部署走 FabActions.deploy
+            // （内经 RimeMaintenanceClient），同步走 librime
+            // syncUserData（FabActions.syncUserData）；WebDAV 同步
+            // 仍在 FAB 同步按钮上（FabActions.sync），不动。
+            is KeyboardAction.RimeDeployAction -> {
+                com.jobeen.hime.ui.FabActions.deploy(service, appScope)
+            }
+            is KeyboardAction.RimeSyncAction -> {
+                com.jobeen.hime.ui.FabActions.syncUserData(service, appScope)
+            }
+
+            // 候选序号选择（审计 E：#次选/#三选）：窗口路径凭上一帧
+            // 候选表解析；直接分发无候选表，丢弃（transformed 已拦截）。
+            is KeyboardAction.SelectCandidateIndexAction -> Unit
+
+            // 常用语／候选栏切换（审计 E：#showPhraseView /
+            // #candidatesBarStateToggle）：窗口路径拦截；直接分发
+            // 无窗口/面板句柄，丢弃。
+            is KeyboardAction.ShowPhraseViewAction,
+            is KeyboardAction.CandidatesBarToggleAction -> Unit
+
+            else -> {}
+        }
+        com.jobeen.hime.skin.perf.PerfMonitor.noteStage(
+            com.jobeen.hime.skin.perf.PerfMonitor.Event.KEY_DISPATCH, dispatchStart,
+        )
+    }
+
+    /**
+     * 组合动作分发（2026-11-16 N8）：同步分发首个 delay 之前的子动作；
+     * 遇 delay 时余部改走 appScope 挂起延时（delay，不睡线程），到期
+     * 后在主线程续分发；多 delay 递归同理。延时中换输入框（纪元推进）
+     * 时门控丢弃余部，不向旧框分发。delay ≤ 0 或余部为空时不启动协程，直接续分发／返回。
+     */
+    private fun dispatchCombine(actions: List<KeyboardAction>) {
+        val split = splitCombineAtDelay(actions)
+        for (sub in split.prefix) onKeyAction(sub)
+        val delayMs = split.delayMs ?: return
+        if (split.rest.isEmpty()) return
+        if (delayMs <= 0) {
+            dispatchCombine(split.rest)
+            return
+        }
+        val capturedEpoch = inputKeyGate.capture()
+        appScope.launch {
+            delay(delayMs.toLong())
+            if (inputKeyGate.check(capturedEpoch, "combine_delayed")
+                !is InputKeyGateResult.Allow
+            ) {
+                return@launch
+            }
+            dispatchCombine(split.rest)
+        }
+    }
+
+    /**
+     * 面板快捷入口（W19-6 panel 板）：各目标只接已有等价操作，
+     * 不另发明机制。同步与检查更新走 appScope 后台跑、完成时
+     * Toast 报结果；面板本身由按键的 CombineAction 收尾回主键盘。
+     */
+    private fun handlePanelShortcut(target: KeyboardAction.PanelShortcutTarget) {
+        when (target) {
+            KeyboardAction.PanelShortcutTarget.VIBRATION_SETTINGS -> {
+                service.startActivity(
+                    android.content.Intent(
+                        service, com.jobeen.hime.ui.KeyboardSettingsActivity::class.java,
+                    ).apply {
+                        addFlags(
+                            android.content.Intent.FLAG_ACTIVITY_NEW_TASK or
+                                android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP or
+                                android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP,
+                        )
+                    },
+                )
+            }
+            KeyboardAction.PanelShortcutTarget.SYNC_DICTS -> {
+                com.jobeen.hime.ui.FabActions.sync(
+                    service,
+                    appScope,
+                    sessionProvider = {
+                        com.jobeen.hime.engine.rime.daemon.RimeDaemon.createSession("panel-sync")
+                    },
+                    onNotConfigured = {
+                        service.startActivity(
+                            android.content.Intent(
+                                service,
+                                com.jobeen.hime.ui.UserDictActivity::class.java,
+                            ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                        )
+                    },
+                )
+            }
+            KeyboardAction.PanelShortcutTarget.CHECK_UPDATE -> {
+                // 与 AboutScreen 检查更新同口径：DEBUG 包不查（非 GitHub 渠道）。
+                if (com.jobeen.hime.BuildConfig.DEBUG) {
+                    com.jobeen.hime.base.util.ToastUtil.showToast(
+                        service, service.getString(R.string.debug_update_unsupported),
+                    )
+                    return
+                }
+                appScope.launch {
+                    when (val result = com.jobeen.hime.base.net.VersionChecker.check(
+                        com.jobeen.hime.BuildConfig.VERSION_NAME,
+                    )) {
+                        is com.jobeen.hime.base.net.UpdateCheckResult.Available -> {
+                            com.jobeen.hime.base.util.ToastUtil.showToast(
+                                service, service.getString(R.string.update_available),
+                            )
+                            runCatching {
+                                service.startActivity(
+                                    android.content.Intent(
+                                        android.content.Intent.ACTION_VIEW,
+                                        android.net.Uri.parse(result.pageUrl),
+                                    ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+                                )
+                            }
+                        }
+                        com.jobeen.hime.base.net.UpdateCheckResult.Latest -> {
+                            com.jobeen.hime.base.util.ToastUtil.showToast(
+                                service, service.getString(R.string.update_latest),
+                            )
+                        }
+                        com.jobeen.hime.base.net.UpdateCheckResult.Failed -> {
+                            com.jobeen.hime.base.util.ToastUtil.showToast(
+                                service, service.getString(R.string.update_check_failed),
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 起浏览器意图打开链接（open_url 确认后的唯一出口与无确认
+     * 面时的回退出口共用）：失败只记异常类名，不记链接。
+     */
+    private fun openUrl(url: String) {
+        try {
+            service.startActivity(
+                android.content.Intent(
+                    android.content.Intent.ACTION_VIEW,
+                    android.net.Uri.parse(url),
+                ).addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK),
+            )
+        } catch (ex: Exception) {
+            DiagLog.w(
+                "keymap", "open_url_failed",
+                mapOf("error" to ex.javaClass.simpleName),
+            )
+        }
+    }
+
+    /**
+     * 按键提交：符号成对（2026-10-28 截图 6 项）只在此分支判定，
+     * LiteralCommitAction（皮肤字面提交）不受影响、保持字面精确。
+     * 门：开关开 + 非组字 + 非密码框 + 单开符号 + 引号前文守卫。
+     * 前文只在引号类且前门全过时读一次（跨进程 Binder 调用，括号
+     * 类不读）。成对路径抛错时回退普通提交，永不丢字；异常只记
+     * 元数据（操作 + 阶段 + 异常类名），不记提交文本。
+     */
+    private fun commitOrPair(text: String) {
+        val e = engine ?: return
+        val enabled = KeyboardManager.Keyboard.SymbolPairing.isEnabled(service)
+        val composing = KeyboardStateManager.isComposingNow
+        val password = isPasswordField()
+        val beforeCursor: String? =
+            if (text.length == 1 && PairingPolicy.isQuote(text[0]) &&
+                enabled && !composing && !password
+            ) {
+                try {
+                    service.currentInputConnection?.getTextBeforeCursor(1, 0)?.toString()
+                } catch (ex: Exception) {
+                    null
+                }
+            } else {
+                null
+            }
+        if (!PairingPolicy.shouldPair(text, enabled, composing, password, beforeCursor)) {
+            e.commit(text)
+            return
+        }
+        val pair = PairingPolicy.pairText(text[0]) ?: run {
+            e.commit(text)
+            return
+        }
+        try {
+            e.commitPair(pair, text)
+        } catch (ex: Exception) {
+            DiagLog.e(
+                "SkinDiag", "pair_commit_failed",
+                mapOf("stage" to "commit_pair", "error" to ex.javaClass.simpleName),
+                ex,
+            )
+            e.commit(text)
+        }
+    }
+
+    /** 密码框判定（与 KeyboardStateManager.startInput 同口径）：文本类 + 三种密码 variation。 */
+    private fun isPasswordField(): Boolean {
+        val info = service.currentInputEditorInfo ?: return false
+        val inputClass = info.inputType and InputType.TYPE_MASK_CLASS
+        val variation = info.inputType and InputType.TYPE_MASK_VARIATION
+        return inputClass == InputType.TYPE_CLASS_TEXT &&
+            (variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
+                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)
+    }
+
+    /**
+     * 直发前的同步清组字（I-S5）：组字中时在直发目标连接上先发空
+     * 组字串，把编辑器侧组字 span 同步清掉，再直发按键／动作——
+     * 与引擎 Reset job 随后做的事相同、幂等。未组字时不碰连接
+     * （不干扰语音等其他组字态）。只清 span、不提交组字（绝不
+     * 用 finishComposingText）。尽力而为：发送失败时不阻断直发，
+     * 引擎异步清组字仍在后面兜底。
+     */
+    private fun clearEditorComposingSpanSync(ic: InputConnection) {
+        if (!KeyboardStateManager.isComposingNow) return
+        runCatching { ic.setComposingText("", 1) }
+    }
+
+    /**
+     * 藏起编辑器侧组字 span（藏 span 解第一步，只被 UndoAction
+     * 的 HIDE_SPAN 格调用）：经与内嵌直送同一连接
+     * （activeInputConnection，桥接态写虚拟连接）发空组字串，
+     * 组字串移出编辑器显示；Rime 组字状态不动，下一次组字更
+     * 新重发即恢复。绝不用 finishComposingText（会把组字提
+     * 交为正文，与「只藏不录」相反）。
+     * 藏没藏住不凭返回值（I-S4）：部分编辑器忽略空组字串、或
+     * 当作结束组字，返回值本身不可靠——发完按组字串长度读回
+     * 光标前文本复核，组字串仍在才置藏态；读回失败／组字仍在
+     * 时不置藏态，本次下滑即 .17 空操作格（不补发引擎撤销——
+     * 污染会话内引擎分支同样空操作，可见结果一致），下次下滑
+     * 重试藏步，绝不在组字仍在屏上时进账本删已上屏文字。
+     * 日志只记成败，不记组字文本。
+     */
+    private fun hideComposingSpan() {
+        val ic = (service as? ImeInputMethodService)?.activeInputConnection()
+            ?: service.currentInputConnection
+        val composing = TypedUndoLedger.composingText()
+        val sent = ic != null &&
+            runCatching { ic.setComposingText("", 1) }.getOrDefault(false)
+        val hidden = sent && runCatching {
+            TypedUndoLedger.isComposingSpanGone(
+                ic?.getTextBeforeCursor(composing.length, 0),
+                composing,
+            )
+        }.getOrDefault(false)
+        if (hidden) {
+            TypedUndoLedger.markComposingSpanHidden()
+            DiagLog.d("undo", "composing_span_hidden")
+        } else {
+            DiagLog.w("undo", "composing_span_hide_failed")
+        }
+    }
+
+    /**
+     * 藏态下再下滑（藏 span 解第二步，只被 UndoAction 的
+     * UNDO_HIDDEN 格调用）：编辑器里已无组字串，光标前只剩
+     * 已上屏文字，按无组字口径走三账本撤销（上滑清字账本原
+     * 样写回 → 语音账本直删 → 打字账本直删，顺序与引擎 Undo
+     * 分支的无组字链一致）；污染会话三账本都不命中时空操作，
+     * 绝不回落 Ctrl+Z（与 decideUndoFallback 同门——Ctrl+Z
+     * 会把藏起的组字以已上屏文本复活）。日志只记三账本命中，
+     * 不记文本。
+     */
+    private fun undoHiddenComposing() {
+        val ic = (service as? ImeInputMethodService)?.activeInputConnection()
+            ?: service.currentInputConnection
+        val clearedHit = ic != null && ClearedTextLedger.tryRestore(ic)
+        val voiceHit = !clearedHit && ic != null && VoiceUndoLedger.tryUndo(ic)
+        val poisoned = TypedUndoLedger.isPoisoned()
+        val typedHit = !clearedHit && !voiceHit && poisoned &&
+            ic != null && TypedUndoLedger.tryUndo(ic)
+        when (
+            TypedUndoLedger.decideUndoFallback(
+                voiceHit = voiceHit,
+                typedHit = typedHit,
+                clearedHit = clearedHit,
+                poisoned = poisoned,
+            )
+        ) {
+            // 污染会话内 SEND_CTRL_Z 不可达（真值表保证）；即使
+            // 将来表变，也绝不从本路径把 Ctrl+Z 发进被污染的栈。
+            TypedUndoLedger.UndoFallback.DONE,
+            TypedUndoLedger.UndoFallback.NOOP,
+            TypedUndoLedger.UndoFallback.SEND_CTRL_Z -> Unit
+        }
+        DiagLog.d(
+            "undo", "composing_span_undo_hidden",
+            mapOf("cleared" to clearedHit, "voice" to voiceHit, "typed" to typedHit),
+        )
+    }
+}
+
+/**
+ * 按键脚本启动会话快照（纯数据，可单测）：输入目标身份
+ * [InputFieldKey]（包名／字段 id／输入类型／imeOptions，IMS 与
+ * 引擎联想共用的字段口径）＋输入框纪元（SherpaSpeechClient 的
+ * EditorEpoch 现值，换框／输入结束时推进）。两者任一变化即判
+ * 会话已变：同框收起再打开身份与纪元皆不变，复检放行；换框
+ * 或输入结束必推进纪元，过期分发被拦。无输入框时身份为空、
+ * 纪元照常比对（纪元推进仍能拦住旧框结果）。
+ */
+internal data class ScriptRunSession(
+    val field: InputFieldKey?,
+    val epoch: Long,
+) {
+    companion object {
+        fun capture(editorInfo: EditorInfo?, epoch: Long): ScriptRunSession =
+            ScriptRunSession(InputFieldKey.of(editorInfo), epoch)
+
+        /** 字段口径复检（纯逻辑，可单测）。 */
+        fun isCurrent(
+            captured: ScriptRunSession,
+            field: InputFieldKey?,
+            epoch: Long,
+        ): Boolean = captured.field == field && captured.epoch == epoch
+
+        /** 编辑器口径复检：先取字段身份，再走字段口径。 */
+        fun isCurrent(
+            captured: ScriptRunSession,
+            editorInfo: EditorInfo?,
+            epoch: Long,
+        ): Boolean = isCurrent(captured, InputFieldKey.of(editorInfo), epoch)
+    }
+}
+
+/**
+ * 清组字 span 的连接选择（I-L4 纯函数）：桥接激活时组字 span 在
+ * 虚拟连接上（active），否则在真实连接上（current）。active 为空
+ * 即非桥接态，退回 current；两者皆空返回 null（调用方不清 span、
+ * 按键照发）。键直发目标不在此函数内——它恒走真实连接（见
+ * InputConnectionUtil.sendCombinationKeyEvent），有意与清 span
+ * 的连接分开。
+ */
+internal fun resolveSpanClearConnection(
+    active: InputConnection?,
+    current: InputConnection?,
+): InputConnection? = active ?: current
+
+/** combine 在首个 delay 处的切分（纯函数，可单测）。 */
+internal data class CombineSplit(
+    /** delay 之前的子动作（同步分发）。 */
+    val prefix: List<KeyboardAction>,
+    /** 首个 delay 的毫秒数；无 delay 时为 null。 */
+    val delayMs: Int?,
+    /** delay 之后的子动作（延时后续分发）。 */
+    val rest: List<KeyboardAction>,
+)
+
+internal fun splitCombineAtDelay(actions: List<KeyboardAction>): CombineSplit {
+    val index = actions.indexOfFirst { it is KeyboardAction.DelayAction }
+    if (index < 0) return CombineSplit(actions, null, emptyList())
+    val delayMs = (actions[index] as KeyboardAction.DelayAction).ms
+    return CombineSplit(
+        prefix = actions.subList(0, index),
+        delayMs = delayMs,
+        rest = actions.subList(index + 1, actions.size),
+    )
+}

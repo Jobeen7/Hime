@@ -1,0 +1,757 @@
+package com.jobeen.hime.base.util
+
+import com.jobeen.hime.skin.layout.CompactGrouping
+import com.jobeen.hime.skin.layout.CompactLayoutGenerator
+import java.util.concurrent.ConcurrentHashMap
+
+object PinYinUtil {
+    const val CandidateKindT9 = "T9PinYin"
+    const val CandidateKindFull = "PinYin"
+
+    val supportTypes = arrayOf(
+        CandidateKindT9, CandidateKindFull
+    )
+
+    /** 无对应方案拼写的单字母条目：无以其开头的音节，缩写拼写无从派生。 */
+    private val NO_SPELLING_SINGLE_LETTERS = setOf("i", "u", "v")
+
+
+    private val t9KeyMap = mapOf(
+        'a' to 'A',
+        'b' to 'A',
+        'c' to 'A',
+        'd' to 'D',
+        'e' to 'D',
+        'f' to 'D',
+        'g' to 'G',
+        'h' to 'G',
+        'i' to 'G',
+        'j' to 'J',
+        'k' to 'J',
+        'l' to 'J',
+        'm' to 'M',
+        'n' to 'M',
+        'o' to 'M',
+        'p' to 'P',
+        'q' to 'P',
+        'r' to 'P',
+        's' to 'P',
+        't' to 'T',
+        'u' to 'T',
+        'v' to 'T',
+        'w' to 'W',
+        'x' to 'W',
+        'y' to 'W',
+        'z' to 'W',
+
+        '2' to 'A',
+        '3' to 'D',
+        '4' to 'G',
+        '5' to 'J',
+        '6' to 'M',
+        '7' to 'P',
+        '8' to 'T',
+        '9' to 'W'
+    )
+
+    private val allPinyin = setOf(
+        "a",
+        "ai",
+        "an",
+        "ang",
+        "ao",
+
+        "b",
+        "ba",
+        "bai",
+        "ban",
+        "bang",
+        "bao",
+        "bei",
+        "ben",
+        "beng",
+        "bi",
+        "bian",
+        "biang",
+        "biao",
+        "bie",
+        "bin",
+        "bing",
+        "bo",
+        "bu",
+
+        "c",
+        "ca",
+        "cai",
+        "can",
+        "cang",
+        "cao",
+        "ce",
+        "cen",
+        "ceng",
+        "cha",
+        "chai",
+        "chan",
+        "chang",
+        "chao",
+        "che",
+        "chen",
+        "cheng",
+        "chi",
+        "chong",
+        "chou",
+        "chu",
+        "chua",
+        "chuai",
+        "chuan",
+        "chuang",
+        "chui",
+        "chun",
+        "chuo",
+        "ci",
+        "cong",
+        "cou",
+        "cu",
+        "cuan",
+        "cui",
+        "cun",
+        "cuo",
+
+        "d",
+        "da",
+        "dai",
+        "dan",
+        "dang",
+        "dao",
+        "de",
+        "dei",
+        "den",
+        "deng",
+        "di",
+        "dia",
+        "dian",
+        "diao",
+        "die",
+        "ding",
+        "diu",
+        "dong",
+        "dou",
+        "du",
+        "duan",
+        "dui",
+        "dun",
+        "duo",
+
+        "e",
+        "ei",
+        "en",
+        "eng",
+        "er",
+
+        "f",
+        "fa",
+        "fan",
+        "fang",
+        "fei",
+        "fen",
+        "feng",
+        "fo",
+        "fou",
+        "fu",
+
+        "g",
+        "ga",
+        "gai",
+        "gan",
+        "gang",
+        "gao",
+        "ge",
+        "gei",
+        "gen",
+        "geng",
+        "gong",
+        "gou",
+        "gu",
+        "gua",
+        "guai",
+        "guan",
+        "guang",
+        "gui",
+        "gun",
+        "guo",
+
+        "h",
+        "ha",
+        "hai",
+        "han",
+        "hang",
+        "hao",
+        "he",
+        "hei",
+        "hen",
+        "heng",
+        "hong",
+        "hou",
+        "hu",
+        "hua",
+        "huai",
+        "huan",
+        "huang",
+        "hui",
+        "hun",
+        "huo",
+
+        "i",
+
+        "j",
+        "ji",
+        "jia",
+        "jian",
+        "jiang",
+        "jiao",
+        "jie",
+        "jin",
+        "jing",
+        "jiong",
+        "jiu",
+        "ju",
+        "juan",
+        "jue",
+        "jun",
+
+        "k",
+        "ka",
+        "kai",
+        "kan",
+        "kang",
+        "kao",
+        "ke",
+        "ken",
+        "keng",
+        "kong",
+        "kou",
+        "ku",
+        "kua",
+        "kuai",
+        "kuan",
+        "kuang",
+        "kui",
+        "kun",
+        "kuo",
+
+        "l",
+        "la",
+        "lai",
+        "lan",
+        "lang",
+        "lao",
+        "le",
+        "lei",
+        "leng",
+        "li",
+        "lia",
+        "lian",
+        "liang",
+        "liao",
+        "lie",
+        "lin",
+        "ling",
+        "liu",
+        "lo",
+        "long",
+        "lou",
+        "lu",
+        "luan",
+        "lun",
+        "luo",
+        "lv",
+        "lve",
+
+        "m",
+        "ma",
+        "mai",
+        "man",
+        "mang",
+        "mao",
+        "me",
+        "mei",
+        "men",
+        "meng",
+        "mi",
+        "mian",
+        "miao",
+        "mie",
+        "min",
+        "ming",
+        "miu",
+        "mo",
+        "mou",
+        "mu",
+
+        "n",
+        "na",
+        "nai",
+        "nan",
+        "nang",
+        "nao",
+        "ne",
+        "nei",
+        "nen",
+        "neng",
+        "ni",
+        "nian",
+        "niang",
+        "niao",
+        "nie",
+        "nin",
+        "ning",
+        "niu",
+        "nong",
+        "nou",
+        "nu",
+        "nuan",
+        "nuo",
+        "nv",
+        "nve",
+
+        "o",
+        "ou",
+
+        "p",
+        "pa",
+        "pai",
+        "pan",
+        "pang",
+        "pao",
+        "pei",
+        "pen",
+        "peng",
+        "pi",
+        "pian",
+        "piao",
+        "pie",
+        "pin",
+        "ping",
+        "po",
+        "pou",
+        "pu",
+
+        "q",
+        "qi",
+        "qia",
+        "qian",
+        "qiang",
+        "qiao",
+        "qie",
+        "qin",
+        "qing",
+        "qiong",
+        "qiu",
+        "qu",
+        "quan",
+        "que",
+        "qun",
+
+        "r",
+        "ran",
+        "rang",
+        "rao",
+        "re",
+        "ren",
+        "reng",
+        "ri",
+        "rong",
+        "rou",
+        "ru",
+        "rua",
+        "ruan",
+        "rui",
+        "run",
+        "ruo",
+
+        "s",
+        "sa",
+        "sai",
+        "san",
+        "sang",
+        "sao",
+        "se",
+        "sen",
+        "seng",
+        "sha",
+        "shai",
+        "shan",
+        "shang",
+        "shao",
+        "she",
+        "shei",
+        "shen",
+        "sheng",
+        "shi",
+        "shou",
+        "shu",
+        "shua",
+        "shuai",
+        "shuan",
+        "shuang",
+        "shui",
+        "shun",
+        "shuo",
+        "si",
+        "song",
+        "sou",
+        "su",
+        "suan",
+        "sui",
+        "sun",
+        "suo",
+
+        "t",
+        "ta",
+        "tai",
+        "tan",
+        "tang",
+        "tao",
+        "te",
+        "teng",
+        "ti",
+        "tian",
+        "tiao",
+        "tie",
+        "ting",
+        "tong",
+        "tou",
+        "tu",
+        "tuan",
+        "tui",
+        "tun",
+        "tuo",
+
+        "u",
+        "v",
+
+        "w",
+        "wa",
+        "wai",
+        "wan",
+        "wang",
+        "wei",
+        "wen",
+        "weng",
+        "wo",
+        "wu",
+
+        "x",
+        "xi",
+        "xia",
+        "xian",
+        "xiang",
+        "xiao",
+        "xie",
+        "xin",
+        "xing",
+        "xiong",
+        "xiu",
+        "xu",
+        "xuan",
+        "xue",
+        "xun",
+
+        "y",
+        "ya",
+        "yan",
+        "yang",
+        "yao",
+        "ye",
+        "yi",
+        "yin",
+        "ying",
+        "yo",
+        "yong",
+        "you",
+        "yu",
+        "yuan",
+        "yue",
+        "yun",
+
+        "z",
+        "za",
+        "zai",
+        "zan",
+        "zang",
+        "zao",
+        "ze",
+        "zei",
+        "zen",
+        "zeng",
+        "zha",
+        "zhai",
+        "zhan",
+        "zhang",
+        "zhao",
+        "zhe",
+        "zhen",
+        "zheng",
+        "zhi",
+        "zhong",
+        "zhou",
+        "zhu",
+        "zhua",
+        "zhuai",
+        "zhuan",
+        "zhuang",
+        "zhui",
+        "zhun",
+        "zhuo",
+        "zi",
+        "zong",
+        "zou",
+        "zu",
+        "zuan",
+        "zui",
+        "zun",
+        "zuo"
+    )
+
+    private val pinyinMap: Map<String, List<String>> = buildMap {
+        allPinyin.groupBy { pinyin ->
+            buildString(pinyin.length) {
+                pinyin.forEach { c ->
+                    append(t9KeyMap[c] ?: c)
+                }
+            }
+        }.forEach { (key, value) ->
+            put(key, value)
+        }
+    }
+
+    /**
+     * 根据输入类型获取可能的拼音组合。
+     *
+     * T9:
+     *   按 T9 键位进行前缀模糊匹配。
+     *
+     * Full:
+     *   按完整拼音音节进行逐级截断。
+     */
+    fun possibleCombinations(
+        type: String,
+        sequence: String?
+    ): Array<String> {
+        if (sequence.isNullOrBlank()) {
+            return emptyArray()
+        }
+
+        return when (type) {
+            CandidateKindT9 -> possibleT9Combinations(sequence)
+            CandidateKindFull -> possibleFullCombinations(sequence)
+            else -> emptyArray()
+        }
+    }
+
+    /**
+     * 紧凑布局的组合消歧（与 [possibleT9Combinations] 同算法、同一音节表
+     * [allPinyin]，只换分组）：输入串逐字经 [CompactGrouping.codeForInput]
+     * 归一化为组码、取前 6 码、按长度从长到短查前缀；无拼写的单字母
+     * i/u/v 不产出。T9 分组走本函数的结果与 [possibleT9Combinations]
+     * 逐项一致（CompactPinyinExpanderTest 锁死），旧 T9 路径本身不动。
+     */
+    /**
+     * 紧凑分组→音节映射表缓存（P0-2）：groupBy 结果只与分组
+     * 有关（allPinyin 是静态音节表），按分组字母串 key 缓存；
+     * 生产调用只有 9／14／18 三种默认分组，最多 3 份。分组对
+     * 象不可变（CompactGrouping／CompactKeyGroup 均为 val 字
+     * 段，groupingFor 每次新建且建成后无人改写），可安全缓存；
+     * key 取分组字母串而不用 keyCount，保留自定义 alphabet
+     * 能力。computeIfAbsent 保证同一分组只建一次表，调用方
+     * 不再在 BehaviorHost queueLock 内重建。
+     */
+    private val compactMapCache = ConcurrentHashMap<String, Map<String, List<String>>>()
+
+    private fun compactMapFor(grouping: CompactGrouping): Map<String, List<String>> =
+        compactMapCache.computeIfAbsent(
+            grouping.groups.joinToString("|") { it.letters },
+        ) {
+            allPinyin.groupBy { pinyin ->
+                buildString(pinyin.length) {
+                    pinyin.forEach { c -> append(grouping.codeForInput(c) ?: c) }
+                }
+            }
+        }
+
+    fun possibleCompactCombinations(
+        grouping: CompactGrouping,
+        sequence: String?,
+    ): Array<String> {
+        if (sequence.isNullOrBlank()) return emptyArray()
+        val mappedSequence = buildString(sequence.length) {
+            sequence.forEach { c ->
+                append(grouping.codeForInput(c) ?: c)
+            }
+        }
+        val numString = mappedSequence.take(6)
+        if (numString.isEmpty()) return emptyArray()
+        val compactMap = compactMapFor(grouping)
+        val result = ArrayList<String>()
+        for (length in numString.length downTo 1) {
+            compactMap[numString.substring(0, length)]?.let { matches ->
+                // P1-4：一次遍历直接追加，省掉 filterNot＋addAll
+                // 的中间复制（toTypedArray 的终态复制仍保留）。
+                for (item in matches) {
+                    if (item.length != 1 || item !in NO_SPELLING_SINGLE_LETTERS) {
+                        result.add(item)
+                    }
+                }
+            }
+        }
+        return result.toTypedArray()
+    }
+
+    /** 9 键分组（回归锚点：与 [possibleT9Combinations] 的分组同值）。 */
+    fun t9Grouping(): CompactGrouping =
+        CompactLayoutGenerator.groupingFor(9) ?: error("unreachable T9 grouping")
+
+    private fun possibleT9Combinations(sequence: String): Array<String> {
+        val mappedSequence = buildString(sequence.length) {
+            sequence.forEach { c ->
+                append(t9KeyMap[c.lowercaseChar()] ?: c)
+            }
+        }
+
+        val numString = mappedSequence.take(6)
+        if (numString.isEmpty()) {
+            return emptyArray()
+        }
+
+        val result = ArrayList<String>()
+
+        for (length in numString.length downTo 1) {
+            pinyinMap[numString.substring(0, length)]?.let { matches ->
+                // 万象 T9 的 speller 缩写拼写只能由实有音节派生，音节
+                // 表里没有以 i/u/v 开头的音节，单字母 "i"/"u"/"v" 在
+                // 方案里没有对应拼写：点选回写 "i'" 等必然坏段，左列
+                // 不产出这三个单字母条目。多字母组合是实有音节的键
+                // 位映射，不在此列
+                result.addAll(
+                    matches.filterNot { it.length == 1 && it in NO_SPELLING_SINGLE_LETTERS }
+                )
+            }
+        }
+
+        return result.toTypedArray()
+    }
+
+    private fun possibleFullCombinations(sequence: String): Array<String> {
+        val pinyin = sequence.lowercase()
+
+        if (pinyin.isEmpty()) {
+            return emptyArray()
+        }
+
+        val result = ArrayList<String>()
+
+        // 完整拼音
+        if (pinyin in allPinyin) {
+            result.add(pinyin)
+        }
+
+        // 只按照拼音结构进行截断。
+        //
+        // 例如：
+        // zhuang -> zhuan -> z
+        // zhang  -> zhan -> zha -> z
+        // chang  -> chan -> cha -> c
+        //
+        // 不直接按照每个字符进行 substring，
+        // 而是使用合法拼音集合判断截断结果。
+        for (length in pinyin.length - 1 downTo 1) {
+            val prefix = pinyin.substring(0, length)
+
+            if (prefix !in allPinyin) {
+                continue
+            }
+
+            if (isValidFullPinyinPrefix(pinyin, prefix)) {
+                result.add(prefix)
+            }
+        }
+
+        return result.toTypedArray()
+    }
+
+    fun isValidType(type: String): Boolean {
+        return supportTypes.contains(type)
+    }
+
+    /**
+     * 判断 prefix 是否是 sequence 的有效拼音截断。
+     *
+     * 这里不是简单的 contains，而是限制：
+     *
+     * 1. prefix 必须是合法拼音
+     * 2. prefix 必须是 sequence 的前缀
+     * 3. prefix 必须位于合理的拼音截断位置
+     */
+    private fun isValidFullPinyinPrefix(
+        sequence: String,
+        prefix: String
+    ): Boolean {
+        if (!sequence.startsWith(prefix)) {
+            return false
+        }
+
+        // 单字母声母始终允许作为最终截断。
+        if (prefix.length == 1) {
+            return prefix[0] in INITIALS
+        }
+
+        // 双字母声母只允许在完整声母位置作为最终截断。
+        if (prefix.length == 2 && prefix in DOUBLE_INITIALS) {
+            return true
+        }
+
+        /*
+         * 对于 zhuang / zhuan 这类情况：
+         *
+         * zhuang
+         *   ↓
+         * zhuan
+         *
+         * 这是从复韵母 uang 截断到 uan。
+         *
+         * 因此只有当 prefix 本身仍然是完整的、
+         * 合法的拼音音节时才允许。
+         */
+        return prefix in allPinyin
+    }
+
+
+    private val INITIALS = setOf(
+        'b',
+        'c',
+        'd',
+        'f',
+        'g',
+        'h',
+        'j',
+        'k',
+        'l',
+        'm',
+        'n',
+        'p',
+        'q',
+        'r',
+        's',
+        't',
+        'w',
+        'x',
+        'y',
+        'z'
+    )
+
+    private val DOUBLE_INITIALS = setOf(
+        "ch",
+        "sh",
+        "zh"
+    )
+}

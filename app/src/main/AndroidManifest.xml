@@ -1,0 +1,319 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <attribution
+        android:tag="@string/empty_attribution_tag"
+        android:label="@string/attribution_label" />
+
+    <!-- App 内自更新：下载正式版 APK 后调起系统安装 -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 云端语音会话前检查网络可用性（普通权限，无需用户授权） -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CAMERA" />
+    <uses-feature android:name="android.hardware.camera" android:required="false" />
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <uses-feature android:name="android.hardware.microphone" android:required="false" />
+    <!-- MANAGE_EXTERNAL_STORAGE 已删除（2026-10-06 审查）：全仓从未请求或行使
+         该全文件访问权限，纯增权限面与商店政策风险，无功能收益 -->
+    <uses-permission android:name="android.permission.VIBRATE" />
+
+    <!-- 外部调用面（WO52 4.1）：仅与 Hime 同签名的应用可调起 ExternalActionActivity -->
+    <permission
+        android:name="com.jobeen.hime.permission.EXTERNAL_ACTION"
+        android:protectionLevel="signature" />
+    <!-- 后台定期同步：跨重启持久化任务需此权限（JobScheduler setPersisted） -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 通知渠道（WO52 13.1）：前台服务声明＋Android 13+ 通知运行时权限 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+
+    <application
+        android:name="com.jobeen.hime.ImeApplication"
+        android:allowBackup="true"
+        android:networkSecurityConfig="@xml/network_security_config"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/app_name"
+        android:largeHeap="true"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:theme="@style/Theme.Ime">
+
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="hime" android:host="com.jobeen.hime" />
+            </intent-filter>
+        </activity>
+
+        <!-- 桌面图标入口：LAUNCHER 挂在别名上（关于页开关已删，
+             别名保留为唯一启动入口；主 Activity 本身不是启动入口，
+             应用内显式启动不受影响）。 -->
+        <activity-alias
+            android:name=".ui.LauncherAlias"
+            android:targetActivity=".ui.MainActivity"
+            android:exported="true"
+            android:enabled="true"
+            android:icon="@mipmap/ic_launcher"
+            android:roundIcon="@mipmap/ic_launcher_round"
+            android:label="@string/app_name">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity
+            android:name=".ui.InitActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.SetupActivity"
+            android:exported="false"
+            android:label="@string/ime_setup_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.KeyboardSettingsActivity"
+            android:exported="false"
+            android:label="@string/keyboard_settings"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.ToolbarActivity"
+            android:exported="false"
+            android:label="@string/toolbar_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.SymbolBarSettingsActivity"
+            android:exported="false"
+            android:label="@string/symbol_bar_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.KeyboardMenuSettingsActivity"
+            android:exported="false"
+            android:label="@string/keyboard_menu_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.ExternalActionActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:noHistory="true"
+            android:permission="com.jobeen.hime.permission.EXTERNAL_ACTION"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="com.jobeen.hime.action.DEPLOY" />
+                <action android:name="com.jobeen.hime.action.SYNC" />
+                <action android:name="com.jobeen.hime.action.SET_CLIPBOARD" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <activity
+            android:name=".ui.AppearanceActivity"
+            android:exported="false"
+            android:label="@string/appearance_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.KeyboardThemeActivity"
+            android:exported="false"
+            android:label="@string/keyboard_theme"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name="com.journeyapps.barcodescanner.CaptureActivity"
+            android:exported="false"
+            android:screenOrientation="fullSensor"
+            tools:replace="screenOrientation" />
+
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
+        <activity
+            android:name=".ui.SchemaSettingsActivity"
+            android:exported="false"
+            android:label="@string/schema_settings"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.SchemeUpdateActivity"
+            android:exported="false"
+            android:label="@string/schema_update_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.RimeActivity"
+            android:exported="false"
+            android:label="@string/rime_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <provider
+            android:name=".ui.AppFilesDocumentsProvider"
+            android:authorities="${applicationId}.files.documents"
+            android:exported="true"
+            android:grantUriPermissions="true"
+            android:icon="@mipmap/ic_launcher"
+            android:label="@string/app_name"
+            android:permission="android.permission.MANAGE_DOCUMENTS">
+            <intent-filter>
+                <action android:name="android.content.action.DOCUMENTS_PROVIDER" />
+            </intent-filter>
+        </provider>
+
+        <activity
+            android:name=".ui.ClipboardActivity"
+            android:exported="false"
+            android:label="@string/clipboard_manager"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.PhraseActivity"
+            android:exported="false"
+            android:label="@string/phrase_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.AiActivity"
+            android:exported="false"
+            android:label="@string/ai_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.WordCreationActivity"
+            android:exported="false"
+            android:label="@string/word_creation_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.AboutActivity"
+            android:exported="false"
+            android:label="@string/about_us"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.UserDictActivity"
+            android:exported="false"
+            android:label="@string/user_dict"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.BackupActivity"
+            android:exported="false"
+            android:label="@string/backup_restore"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.LogActivity"
+            android:exported="false"
+            android:label="@string/app_logs"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.InputStatsActivity"
+            android:exported="false"
+            android:label="输入统计"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.PredictionSettingsActivity"
+            android:exported="false"
+            android:label="@string/prediction_candidates"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.VoiceSettingsActivity"
+            android:exported="false"
+            android:label="@string/voice_settings"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".ui.CloudVoicePluginsActivity"
+            android:exported="false"
+            android:label="@string/cloud_voice_plugins"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
+            android:name=".base.speech.SpeechPermissionActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <service
+            android:name=".input.ImeInputMethodService"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/ime_input_method" />
+        </service>
+
+        <service
+            android:name=".base.speech.SpeechRecognitionService"
+            android:exported="false"
+            android:process=":speech" />
+
+        <service
+            android:name=".engine.rime.service.RimeMaintenanceService"
+            android:exported="false"
+            android:process=":ime" />
+
+        <service
+            android:name=".engine.rime.data.userdict.PeriodicSyncJobService"
+            android:exported="false"
+            android:permission="android.permission.BIND_JOB_SERVICE" />
+
+        <service
+            android:name=".engine.rime.data.userdict.RemoteTransferService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+    </application>
+
+</manifest>

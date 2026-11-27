@@ -1,0 +1,3928 @@
+package com.jobeen.hime.engine
+
+import android.content.Context
+import android.content.SharedPreferences
+import android.inputmethodservice.InputMethodService
+import android.os.SystemClock
+import android.text.InputType
+import android.view.KeyEvent.*
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import androidx.core.content.edit
+import com.jobeen.hime.ImeApplication
+import com.jobeen.hime.R
+import com.jobeen.hime.base.ngram.UpdateImportGate
+import com.jobeen.hime.base.speech.VoiceUndoLedger
+import com.jobeen.hime.base.util.EmailSuffixes
+import com.jobeen.hime.base.util.InputConnectionUtil
+import com.jobeen.hime.base.util.PinYinUtil
+import com.jobeen.hime.base.util.TextUtil
+import com.jobeen.hime.engine.behavior.IBehavior
+import com.jobeen.hime.input.InputFieldKey
+import com.jobeen.hime.input.InputDropLog
+import com.jobeen.hime.input.isInputFieldChanged
+import com.jobeen.hime.engine.rime.behavior.Segmentation
+import com.jobeen.hime.data.database.AppDatabase
+import com.jobeen.hime.data.manager.CandidateManager
+import com.jobeen.hime.data.manager.PhraseManager
+import com.jobeen.hime.data.manager.RareCharPolicy
+import com.jobeen.hime.data.manager.CandidatePreferCache
+import com.jobeen.hime.data.manager.CandidateSortingManager
+import com.jobeen.hime.data.manager.applySavedCandidateOrder
+import com.jobeen.hime.data.manager.candidateSortingKey
+import com.jobeen.hime.data.manager.DeletedWordsStore
+import com.jobeen.hime.data.manager.DeployAwaitResult
+import com.jobeen.hime.data.manager.DeployKeyGate
+import com.jobeen.hime.data.manager.EngineDeployState
+import com.jobeen.hime.data.manager.RimeSyncPrefs
+import com.jobeen.hime.data.manager.isDeployWindow
+import com.jobeen.hime.data.manager.SchemaManager
+import com.jobeen.hime.data.manager.SchemeDirs
+import com.jobeen.hime.engine.event.KeyEvent
+import com.jobeen.hime.engine.event.KeyModifiers
+import com.jobeen.hime.engine.rime.host.BehaviorHost
+import com.jobeen.hime.engine.data.CandidatePinYin
+import com.jobeen.hime.engine.data.EngineMessage
+import com.jobeen.hime.engine.data.EngineMessage.Candidate
+import com.jobeen.hime.engine.data.PairCommitQueue
+import com.jobeen.hime.engine.rime.behavior.InputKey
+import com.jobeen.hime.engine.rime.behavior.InputString
+import com.jobeen.hime.engine.rime.behavior.Reset
+import com.jobeen.hime.engine.rime.behavior.SelectPinYin
+import com.jobeen.hime.engine.rime.behavior.Selection
+import com.jobeen.hime.engine.rime.core.IRimeJob
+import com.jobeen.hime.engine.rime.core.RimeApi
+import com.jobeen.hime.engine.rime.daemon.RimeDaemon
+import com.jobeen.hime.engine.rime.daemon.RimeSession
+import com.jobeen.hime.engine.manager.CandidateRerankManager
+import com.jobeen.hime.engine.manager.PredictionManager
+import com.jobeen.hime.engine.rime.core.KeyMapping
+import com.jobeen.hime.engine.rime.core.EngineMessageConverter
+import com.jobeen.hime.engine.rime.core.KeycapFilterState
+import com.jobeen.hime.engine.rime.core.Rime
+import com.jobeen.hime.engine.rime.core.RimeConfig
+import com.jobeen.hime.engine.rime.core.RimeMessage
+import com.jobeen.hime.engine.rime.core.RimeStoppedException
+import com.jobeen.hime.skin.layout.CompactGrouping
+import com.jobeen.hime.data.App.modelDir
+import com.jobeen.hime.engine.rime.data.CrossProcessUserDataLock
+import com.jobeen.hime.engine.rime.data.DataManager.sharedDataDir
+import com.jobeen.hime.engine.rime.data.DataManager.userDataDir
+import com.jobeen.hime.base.util.TraditionalConverter
+import com.jobeen.hime.engine.rime.util.OptionsApplier
+import com.jobeen.hime.skin.diag.DiagLog
+import com.jobeen.hime.input.ClearedTextLedger
+import com.jobeen.hime.input.EnterDecision
+import com.jobeen.hime.input.EnterField
+import com.jobeen.hime.input.EnterFieldBoundary
+import com.jobeen.hime.input.EnterOutcome
+import com.jobeen.hime.input.EnterSession
+import com.jobeen.hime.input.ImeInputMethodService
+import com.jobeen.hime.input.TypedUndoLedger
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineDispatcher
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import timber.log.Timber
+import java.io.File
+import java.lang.ref.WeakReference
+import kotlin.lazy
+
+/**
+ * 借道 DEL 的来源标记：占 KeyModifiers 的 bit 29（既有命名位只到
+ * bit 12 与 24–28、30，metaState 映射也不含此位，不影响透传给宿
+ * 主的修饰状态）。只有 handleBackspaceInJob 产生的借道 DEL 带此
+ * 标记——它在 jobs 串行执行时点已确认组字为空。标记是「组字为空
+ * 已确立」这一前提的来源凭据：forwardUnhandledKey 的选区判定对
+ * 带标记与无标记（native 未消费透传）两路同口径（判定表见该函数），
+ * 不再按标记分流处理，但两路的组字前提不同，凭据保留备查。
+ */
+internal const val BORROWED_DEL_MARKER: Int = 1 shl 29
+
+class RimeEngine : IEngine, IBehaviorHost, IRimeJob {
+
+    companion object {
+        /**
+         * librime native 层“禁止个性化学习”运行时开关
+         *（见 cpp/patches/librime-no-personalized-learning.patch，
+         * Memory::OnCommit 为 true 时跳过用户词典自学习）。
+         * 非 schema switch，切换方案不会被重置；每次 onStartInputView 按输入框重设。
+         */
+        private const val NO_PERSONALIZED_LEARNING_OPTION = "__no_personalized_learning"
+
+        /** 选词偏好表容量上限与裁剪检查节流间隔（按 upsert 次数计）。 */
+        /** 分页补取的单页条数（与首屏 bulk 上限分开：续页可以大些，减少往返） */
+        private const val CANDIDATE_PAGE_SIZE = 48
+        /** 每批候选补取封顶：再深处是字体无字形的扩展区生僻字，不加载 */
+        private const val CANDIDATE_BATCH_CAP = 200
+        /** 快照 bulk 窗口条数（与 native kBulkCandidateLimit 同值）：total==-1 时本页条数未满即末页 */
+        private const val NATIVE_BULK_LIMIT = 24
+        /** 动作/任务队列容量：远超正常深度，仅作异常堆积兜底 */
+        private const val ACTION_QUEUE_CAPACITY = 512
+        private const val JOB_QUEUE_CAPACITY = 256
+        /** 清空输入框时的分段删除：每段字符数与最大段数 */
+        private const val CLEAR_CHUNK_CHARS = 1000
+        private const val MAX_CLEAR_CHUNKS = 64
+
+        /**
+         * 清空分流判定（纯函数，可单测）：组字中有未上屏串时走
+         * Action.Reset，只清组字、不动已上屏文字；否则删已上屏文字。
+         */
+        internal fun shouldResetComposing(preedit: String?): Boolean =
+            preedit?.isNotEmpty() == true
+
+        /**
+         * 清空入口三探针（可单测）：前文／后文／选区任一非空即有
+         * 可清内容。旧入口只探前文，光标在字段头时后文一字不删；
+         * 选区须单独探——光标在字段头且有选区时前文为空。
+         * 前文探针与旧入口同口径（不包异常）；后文／选区是新增
+         * 探针，连接异常时按无内容处理，不引入新的抛错路径。
+         */
+        internal fun hasClearableText(ic: InputConnection): Boolean {
+            if (!ic.getTextBeforeCursor(1, 0).isNullOrEmpty()) return true
+            if (!runCatching { ic.getTextAfterCursor(1, 0) }.getOrNull().isNullOrEmpty()) {
+                return true
+            }
+            return !runCatching { ic.getSelectedText(0) }.getOrNull().isNullOrEmpty()
+        }
+
+        /**
+         * 删已上屏文字并入账（InputConnection 桩上可单测，不依赖
+         * 真机；协程／分发／前文缓存失效仍在 clearInternal 内）：
+         * 入口过三探针才进；两轮分段删除循环与入账原样不动——
+         * 分段删（前文→后文）是为避开单次 deleteSurroundingText
+         * 在部分自绘输入框上的部分删除与卡顿，每轮先探长度、
+         * 探到 0 或删除无进展即停，段数设上限防异常输入框让循环
+         * 失控；极端长文删不完时用户可再触发一次。
+         *
+         * 选区处理（两轮循环之外）：第一轮删除会把选区连同前文
+         * 一起删掉（平台 deleteSurroundingText 删
+         * [起点-前长, 终点+后长] 整段），须先取下选区文本再删，
+         * 入账时按原序拼回（前文＋选区＋后文），否则下滑撤销
+         * 写回的串会丢掉中间被选中的一段；删选区用 commitText("",
+         * 1)，是本仓删选区的既有做法（见 DeleteTextPolicy）。
+         * 全选时两轮循环都直接跳过（前后文皆空），选区文本已
+         * 在第一步删掉、记在 cleared 里，字段仍被删净。
+         * commitText 失败时选区可能仍被第一轮连带删掉但未入账
+         * （只记确认删掉的部分，不重复、不谎报）。
+         *
+         * @return true 表示入口通过（调用方按旧口径失效前文缓存），
+         *   false 表示无可清内容、未做任何事。
+         */
+        internal fun clearCommittedText(ic: InputConnection): Boolean {
+            if (!hasClearableText(ic)) return false
+            val cleared = StringBuilder()
+            var overflow = false
+            // 选区先取后删（见上）
+            val selected = runCatching { ic.getSelectedText(0)?.toString() }
+                .getOrNull().orEmpty()
+            var selectionDeleted = false
+            if (selected.isNotEmpty()) {
+                selectionDeleted = runCatching { ic.commitText("", 1) }.getOrDefault(false)
+            }
+            var chunks = 0
+            while (chunks++ < MAX_CLEAR_CHUNKS) {
+                val text = ic.getTextBeforeCursor(CLEAR_CHUNK_CHARS, 0)
+                if (text.isNullOrEmpty()) break
+                if (!ic.deleteSurroundingText(text.length, 0)) break
+                // 前文由近及远删，还原顺序要插到最前
+                if (!overflow) {
+                    if (cleared.length + text.length >
+                        ClearedTextLedger.MAX_RECORDABLE_CHARS
+                    ) {
+                        overflow = true
+                    } else {
+                        cleared.insert(0, text)
+                    }
+                }
+            }
+            // 选区拼在已删前文之后、后文之前；只有确认删掉才记
+            if (selectionDeleted && !overflow) {
+                if (cleared.length + selected.length >
+                    ClearedTextLedger.MAX_RECORDABLE_CHARS
+                ) {
+                    overflow = true
+                } else {
+                    cleared.append(selected)
+                }
+            }
+            chunks = 0
+            while (chunks++ < MAX_CLEAR_CHUNKS) {
+                val text = ic.getTextAfterCursor(CLEAR_CHUNK_CHARS, 0)
+                if (text.isNullOrEmpty()) break
+                if (!ic.deleteSurroundingText(0, text.length)) break
+                // 后文由近及远删，还原顺序按原序追加
+                if (!overflow) {
+                    if (cleared.length + text.length >
+                        ClearedTextLedger.MAX_RECORDABLE_CHARS
+                    ) {
+                        overflow = true
+                    } else {
+                        cleared.append(text)
+                    }
+                }
+            }
+            // 锚点是清空后光标前紧邻的前文：清前文时光标已左移
+            // 到删除起点，清后文不动光标，故此刻读到的正是恢复
+            // 时要核对的位置。
+            //
+            // 清空入账：累计被删文本记进 ClearedTextLedger，下滑
+            // 撤销据此原样写回，不再依赖 Ctrl+Z——污染会话内
+            // Ctrl+Z 已被拦（防清掉的组字复活），不记账的话
+            // 清掉的已上屏文字就没有任何地方可回。超出上限即
+            // 停止累计并标记溢出，删完不记账（超长段恢复无实际
+            // 意义，也不该让账本常驻大字符串）。
+            if (!overflow && cleared.isNotEmpty()) {
+                val anchor = runCatching {
+                    ic.getTextBeforeCursor(ClearedTextLedger.ANCHOR_CHARS, 0)
+                        ?.toString()
+                }.getOrNull().orEmpty()
+                ClearedTextLedger.record(cleared.toString(), anchor, ic)
+            }
+            return true
+        }
+    }
+
+    private data class EngineState(
+        var initialized: Boolean = false,
+        // 联想可见标志跨线程读写：写点分布在 reduce、jobs（退格
+        // 处理）与主线程（onFinishInputView 切框收尾），读点在 jobs
+        // 与主线程（loadMoreCandidates 的防串味守卫）。普通 var 无
+        // 可见性保证，读到过期值会串味（联想显示期误放行分页补取
+        // 拼进组字候选）或吞退格。单写单读的布尔标志无复合操作，
+        // @Volatile 的可见性即足够，不需要 AtomicBoolean
+        @Volatile
+        var predictionVisible: Boolean = false,
+        /**
+         * 邮箱后缀候选正在候选栏显示：与 predictionVisible 同进退
+         * （Rime 组字候选接管、退格 dismiss、清框、切框时一并复位）。
+         * 读点在 jobs（续打拦截）与 reduce（选词分支），与
+         * predictionVisible 同为单写单读的布尔标志，@Volatile 即足够。
+         */
+        @Volatile
+        var emailSuffixVisible: Boolean = false,
+        var suppressNextEmptyCandidates: Boolean = false,
+        var initHookTriggered: Boolean = false,
+        // 代次计数器被主线程（切框失效）与 jobs/协程并发推进：普通
+        // Long 的 ++ 是读-改-写，极端时序下两代同号会让迟到的旧结果
+        // 穿过 Ready 门控；用 AtomicLong 保证 incrementAndGet 不重号
+        // （字段与 Action.requestId 均为 Long，故用 AtomicLong 而非
+        // AtomicInteger，免去每处取值转换）
+        val candidateRequestId: java.util.concurrent.atomic.AtomicLong =
+            java.util.concurrent.atomic.AtomicLong(0L),
+        // 「最新代次」的发布（还原入口/失效路径在 Default 线程）与
+        // 读取（reduce/jobs 线程）跨线程交接。两个发布方都是「在
+        // candidateRequestId 上 incrementAndGet 取新号、再回写本
+        // 字段」的两步操作：若回写用 set，两步交错（甲取 11、乙取
+        // 12、乙先 set(12)、甲后 set(11)）会让已发布的最新代次回退
+        // 到 11，最新一批候选被 Ready 门控误丢、或已被作废的旧批
+        // 反而穿过门控。故发布一律走 accumulateAndGet(maxOf)：本
+        // 字段单调不减，任何交错下都不回退；AtomicLong 同时保证
+        // 单次读写的原子性与跨线程可见性
+        val latestCandidateRequestId: java.util.concurrent.atomic.AtomicLong =
+            java.util.concurrent.atomic.AtomicLong(0L),
+        val predictionRequestId: java.util.concurrent.atomic.AtomicLong =
+            java.util.concurrent.atomic.AtomicLong(0L),
+        // 与 latestCandidateRequestId 同口径：「最新代次」的发布方
+        // （requestPrediction 在 reduce 线程、invalidatePending-
+        // Prediction 在主线程）都是先 incrementAndGet 取新号再回写
+        // 本字段的两步操作，普通 var 回写交错会让最新代次回退——
+        // 已作废的旧联想穿过 PredictionReady 门控在切框后复现，或
+        // 最新一批联想被误丢。发布一律 accumulateAndGet(maxOf)，
+        // 单调不减、读写原子且跨线程可见
+        val latestPredictionRequestId: java.util.concurrent.atomic.AtomicLong =
+            java.util.concurrent.atomic.AtomicLong(0L),
+    )
+
+    private sealed interface Action {
+        data class ProcessKey(val service: InputMethodService, val key: KeyEvent) : Action
+
+        /**
+         * 状态键（空格/回车/退格）的二次分发：分类在 [processKeyInternal]
+         * 完成，但真正入 jobs 的动作推迟到 reduce 处理本 Action 时才做。
+         * 普通键经 Action.Behavior 绕 actions 一圈后才在 reduce 里入
+         * jobs，状态键若在分类当时直接 sendJob，就会插到排在前面的
+         * 普通键之前（积压时空格先于字母被处理）。两路都在 reduce 的
+         * 同一串行点入队，按键到达顺序才等于 jobs 执行顺序。
+         */
+        data class StatefulKey(val key: KeyEvent.CodeEvent) : Action
+        data class RimeMessage(val message: com.jobeen.hime.engine.rime.core.RimeMessage<*>) :
+            Action
+
+        data class Behavior(val behavior: IBehavior) : Action
+        data class SelectCandidate(val candidate: Candidate) : Action
+        data class Clear(val service: InputMethodService) : Action
+        data class Undo(val service: InputMethodService) : Action
+
+        /**
+         * 回车键精简决策（2026-11-03）：软回车键（ReturnAction 经
+         * IEngine.processEnter）与注入的回车键（processKey 的
+         * ENTER 经 reduce 截获）都汇到这里，字段属性在分发时点
+         * 捕获，组字中在 sendEnterJob 执行时点现读原始输入。
+         * [session] 为入队时点的输入会话快照（字段身份＋代次，
+         * 见 [EnterSession]）：执行前复检，不一致丢弃，防旧会
+         * 话的 action 落到新字段上。下滑 Undo 分支与本分支无关，不动。
+         */
+        data class Enter(
+            val service: InputMethodService,
+            val field: EnterField,
+            val isLongPress: Boolean,
+            val hasDedicatedNewlineKey: Boolean,
+            val session: EnterSession,
+        ) : Action
+        data class Redo(val service: InputMethodService) : Action
+
+        /** 前删（定稿四.4）：reduce 串行点入队 job 判组字，禁手势线程预判。 */
+        data class ForwardDelete(val service: InputMethodService) : Action
+
+        /** 前删宿主段：组字已在 job 内确立为空，选区/后文在此执行时点重读。 */
+        data object ForwardDeleteHost : Action
+
+        /** 关闭联想（sendKeyEvent 前置）：仅清联想态，不碰组字与文档。 */
+        data object DismissPredictions : Action
+        /**
+         * @property fieldGen 发起时刻的输入框代次（在分发点捕获）：
+         * 预测的基底读取与框复检都以这一代为准——代次若等到
+         * requestPrediction 执行时才取，分发与执行之间发生的换框
+         * 会被误读成「仍是发起时的框」。null 表示在 reduce 内直
+         * 接发起、无分发时差，执行时现取即可。
+         */
+        data class Predict(val commit: String, val fieldGen: Long? = null) : Action
+        data class PredictionReady(
+            val requestId: Long,
+            val candidates: List<Candidate>,
+            /** 发起预测时的输入框代次：交付时与当前代次复检，防旧框联想落到新框 */
+            val fieldGen: Long,
+        ) : Action
+        data class EmitMessage(val message: EngineMessage) : Action
+        data class CandidatesReady(val requestId: Long, val message: EngineMessage.Candidates) :
+            Action
+
+        data class PossibleCandidatePinYinSnapshot(
+            val candidatePinYinType: String,
+            val currentInput: String,
+            val confirmedLen: Int,
+            /** WO52 1.5：native t9PinyinList 的原始串（空格连接）；非 T9 段为 null。 */
+            val t9ListRaw: String? = null,
+            /** 紧凑键盘（14/18 键）分组；非空时侧栏走 Kotlin 紧凑展开，t9ListRaw 为 null。 */
+            val compactGrouping: CompactGrouping? = null,
+        ) : Action
+
+        data object Reset : Action
+        data class SelectCandidatePinYin(val pinYin: CandidatePinYin) : Action
+        data object Segment : Action
+        data class SelectSchema(val schemaId: String) : Action
+        data class Commit(val text: String) : Action
+        /** 成对提交：pair 为开闭合写文本，opener 为单开符号（组字竞态回退用）。 */
+        data class CommitPair(val pair: String, val opener: String) : Action
+        data object InputCleared : Action
+        data object Reload : Action
+    }
+
+    private val daemon by lazy { RimeDaemon }
+
+    /**
+     * jobs/动作等投递通道的宿主作用域：兜底 handler 与 preferDbScope
+     * 同构（只记非取消异常日志、不杀进程）。没有它时，关库后旧引用
+     * 的 sendJob 在异步补投里抛 ClosedSendChannelException，会走默认
+     * 未捕获异常处理杀进程；handler 是第二层兜底，第一层仍是
+     * enqueueJob 的 isClosedForSend 丢弃与 runCatching。
+     */
+    private val scope by lazy {
+        CoroutineScope(
+            SupervisorJob() + Dispatchers.Default +
+                kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+                    if (e !is CancellationException) {
+                        Timber.w(e, "Uncaught failure in RimeEngine scope")
+                    }
+                }
+        )
+    }
+
+    /**
+     * 引擎作用域死亡信号（I-L1）：finalize 完成它；deployAndAwait 的
+     * 等待方以它与部署 deferred 竞速，作用域已死时立即 FAILED，不等
+     * 作业体 native 收尾——作业体跑在 rime-main 单线程上，取消恢复
+     * 须排在阻塞 native 调用之后，作业体 finally 到不了等待方。
+     * 进程级单例：EngineFactory 按进程缓存同一实例，finalize 后同
+     * 进程内不再复用该实例；initialize 重建它，防将来同实例重初始
+     * 化时拿着已完成的旧信号让全部署立即 FAILED。
+     */
+    private var scopeDeathSignal = CompletableDeferred<Unit>()
+
+    /**
+     * 选词偏好写的发起通道：实际落库、裁剪与计数落点由
+     * [CandidatePreferCache.recordClick] 在缓存侧的串行通道内成对
+     * 执行，本 scope 只负责把调用投递出去（不占 jobs 队列，慢盘
+     * 不堵后续按键）并作异常兜底。用 limitedParallelism(1) 保住
+     * 多次投递的相对顺序与原先在 jobs 内时一致。
+     */
+    private val preferDbScope by lazy {
+        CoroutineScope(
+            SupervisorJob() + Dispatchers.IO.limitedParallelism(1) +
+                // 兜底：本通道的 launch 块应各自 try/catch（见
+                // selectCandidateInternal）；万一有漏网异常，默认
+                // 未捕获异常处理会把进程杀掉——选词偏好这种尽力而为
+                // 的写不值得赔上键盘进程，只记日志吞掉
+                kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+                    if (e !is CancellationException) {
+                        Timber.w(e, "Uncaught failure in preferDbScope")
+                    }
+                }
+        )
+    }
+    // 两条队列都有界（旧实现 UNLIMITED）：正常深度个位数，容量只为异常
+    // 生产者（引擎通知风暴、长任务堵住消费端）兜底防无限堆积。溢出策略
+    // 分两边：jobs 全是控制任务，走 sendJob/awaitJob 的异步补投、永不丢；
+    // actions 经 dispatchAction 分发，易变类满时自丢、控制类异步补投。
+    private val actions = Channel<Action>(ACTION_QUEUE_CAPACITY)
+
+    /**
+     * jobs 队列的单条作业：block 之外带一个作业体永不执行时的
+     * 丢弃回调。消费循环在 runOnReady 门处抛错（引擎已 STOPPED）
+     * 时作业体根本不跑——只在作业体内 finally 复位的标志会就此
+     * 滞留；丢弃回调是这些标志在门外的唯一复位方。
+     * 回调约束（调用方必须遵守）：只做幂等复位与 deferred 完成，
+     * 不挂起、不抛错。作业体执行中抛错时消费循环同样会调它，
+     * 此时作业体自身的 finally/完成已先行，重复调用必须无害。
+     */
+    internal class QueuedJob(
+        val block: suspend RimeApi.() -> Unit,
+        val onDropped: (() -> Unit)? = null,
+    ) {
+        /**
+         * 作业体是否已开始执行（I-L1）：消费循环在 runOnReady 块内、
+         * 紧贴 [block] 调用前置真。丢弃回调只在作业体未执行时才是
+         * 标志／等待方的唯一复位方；作业体已执行时其 finally 已复
+         * 位，再调 onDropped 即双放（releaseRunning 是普通置位，
+         * 两次释放之间另一路抢到部署位会被第二放误删）。跨线程：
+         * 置位在 rime-main（作业体执行线程）、读取在消费循环的
+         * catch（作业体抛错后），故用 AtomicBoolean。
+         */
+        internal val started = java.util.concurrent.atomic.AtomicBoolean(false)
+    }
+
+    private val jobs by lazy { Channel<QueuedJob>(JOB_QUEUE_CAPACITY) }
+
+    private var session: RimeSession? = null
+    private var behaviorHosted: BehaviorHost? = null
+    private var context: Context? = null
+
+    /**
+     * 当前紧凑键盘分组（14/18 键）：窗口切键盘时由 KeyboardWindowView
+     * 经 setCompactGrouping 推送；T9/26 键等推 null（清除）。引擎
+     * 本身不知道键盘——分组只决定侧栏拼音的展开函数（BehaviorHost
+     * possibleCompactPinYin），不参与候选产出。@Volatile：窗口在
+     * 主线程写，引擎任务线程读。
+     */
+    @Volatile
+    private var compactGrouping: CompactGrouping? = null
+
+    /** 窗口切键盘时推送当前紧凑分组（T14/T18）；其他键盘推 null 清除。 */
+    override fun setCompactGrouping(grouping: CompactGrouping?) {
+        compactGrouping = grouping
+    }
+
+    @Volatile
+    private var inputConnection: InputConnection? = null
+    @Volatile
+    private var editorInfo: EditorInfo? = null
+
+    // 用户搭配学习链：上一个打字上屏的词段（简体形）。只由打字路径
+    // （native 上屏、预测候选点选）推进；前端提交（剪贴板/常用语/语音
+    // 等 CommitAction）不学且打断此链；输入结束/隐私闸门时清空。
+    private var lastLearnSegment: String? = null
+    // 弱引用：EngineFactory 单例持有 RimeEngine，强引用 service 会导致 service 销毁后泄漏
+    private var serviceRef: WeakReference<ImeInputMethodService>? = null
+
+    /**
+     * 丢字日志（施工单 10 H2-16）：键盘无声拒掉输入时
+     * 记一行（WARN 级进 DiagLog 文件＋诊断导出）；窗口内多余的只
+     * 计数。只记原因与门状态，绝不记按键与任何文本。
+     */
+    private val inputDrops = InputDropLog(
+        uptimeMillis = SystemClock::uptimeMillis,
+        write = { line -> DiagLog.w("input", "input_dropped", mapOf("detail" to line)) },
+    )
+
+    /**
+     * 无声拒掉输入时记一行（见 [InputDropLog]）。service 为空时只记
+     * 门状态（部署／初始化），不记编辑框信息。
+     */
+    internal fun noteInputDropped(reason: String, service: InputMethodService? = null) =
+        inputDrops.drop(reason) {
+            val editor = service?.currentInputEditorInfo
+            "deploying=${EngineDeployState.isRunning()} " +
+                "orphan=${EngineDeployState.isOrphanRunning()} " +
+                "initialized=${state.initialized} " +
+                "app=${editor?.packageName} " +
+                "inputType=0x${Integer.toHexString(editor?.inputType ?: 0)} " +
+                "connection=${service?.currentInputConnection != null} " +
+                "shown=${service?.isInputViewShown}"
+        }
+
+    //引擎相关配置监控
+    private var prefs: SharedPreferences? = null
+
+    /**
+     * 热路径开关的内存缓存（2026-11-16 性能 §7）：restoreCandidates／
+     * requestPrediction 每批原来各读 5 次 SharedPreferences（带锁查表）。
+     * 现读一次缓存进 @Volatile 字段，热路径只读字段；既有 prefsListener
+     * 在键变化时刷新（同一 prefs 文件，设置页改动即时生效）。初值取
+     * CandidateManager 各 getter 的缺省值，引擎启动注册监听时再全量
+     * 刷新一次——注册前已有读到也是缺省口径，不错。
+     */
+    @Volatile
+    private var cachedRerankEnabled = true
+
+    @Volatile
+    private var cachedRareCharactersEnabled = true
+
+    @Volatile
+    private var cachedEmailSuffixEnabled = true
+
+    @Volatile
+    private var cachedPredictionEnabled = true
+
+    @Volatile
+    private var cachedTraditionalChineseEnabled = false
+
+    private fun refreshCachedCandidateFlags(context: Context) {
+        cachedRerankEnabled = CandidateManager.isRerankEnabled(context)
+        cachedRareCharactersEnabled = CandidateManager.isRareCharactersEnabled(context)
+        cachedEmailSuffixEnabled = CandidateManager.isEmailSuffixEnabled(context)
+        cachedPredictionEnabled = CandidateManager.isPredictionEnabled(context)
+        cachedTraditionalChineseEnabled = CandidateManager.isTraditionalChineseEnabled(context)
+    }
+
+    /**
+     * 候选开关 dirty 位（P1-1）：prefsListener 在主线程回调里
+     * 只置位，不直接重读 5 次偏好；下一次候选还原／预测 job
+     * 在引擎线程批量重读一次——设置页连切多开关只读一次。
+     * 重读是幂等全量读，失败时 dirty 保留、下批再读。
+     */
+    @Volatile
+    private var candidateFlagsDirty = false
+
+    private fun refreshCachedCandidateFlagsIfDirty(context: Context) {
+        if (!candidateFlagsDirty) return
+        refreshCachedCandidateFlags(context)
+        candidateFlagsDirty = false
+    }
+
+    /** 热路径开关的偏好键（监听刷新口径，见 cached*Enabled）。 */
+    private val candidateFlagKeys = setOf(
+        CandidateManager.KEY_RERANK_ENABLED,
+        CandidateManager.KEY_RARE_CHARACTERS_ENABLED,
+        CandidateManager.KEY_EMAIL_SUFFIX_ENABLED,
+        CandidateManager.KEY_PREDICTION_ENABLED,
+        CandidateManager.KEY_TRADITIONAL_ENABLED,
+    )
+
+    private val prefsListener = SharedPreferences.OnSharedPreferenceChangeListener { _, key ->
+        if (key in candidateFlagKeys) {
+            // P1-1：主线程回调只标 dirty，不直接重读 5 次偏好。
+            candidateFlagsDirty = true
+        }
+        if (OptionsApplier.isOptionDependency(key)) {
+            sendJob {
+                currentSchema().applyOptions(this)
+                // 与 SelectSchema/Schema 消息同口径补刷字段选项：
+                // applyOptions 按方案 lock 值整表重刷运行时选项，会
+                // 覆盖密码框强制英文（ascii_mode）等字段选项，必须
+                // 随后按当前输入框重放一次（形态与 SelectSchema 的
+                // 补刷一致）
+                editorInfo?.let { applyFieldOptions(it) }
+            }
+        }
+    }
+
+    /** 桥接模式下返回虚拟连接，否则返回真实连接。 */
+    private fun inputConnection(): InputConnection? =
+        serviceRef?.get()?.activeInputConnection() ?: inputConnection
+
+    private val rerankManager by lazy { context?.let { CandidateRerankManager(it) } }
+    private val predictionManager by lazy { context?.let { PredictionManager(it) } }
+    private val state = EngineState()
+
+    /**
+     * 光标前文本缓存：getTextBeforeCursor() 是跨进程 Binder 调用，
+     * 之前每次产生候选都会调一次。这里缓存最近 64 个字符（见
+     * [BeforeCursorCache]）；新输入框 / 上屏 / 删除文本 / 光标移动
+     * 时主动失效（见各 [invalidateBeforeCursorCache] 调用点），命
+     * 中直接切片返回、不重复读 IC。
+     *
+     * 防串框只靠一个输入框序号整数比对：异步读者以发起时捕获的
+     * 序号（[expectedGen]，没给则以进入时的当前序号为准）在入口、
+     * 真正读 IC 的主线程块内、读回后各比对一次，序号已变即整轮
+     * 作废——旧框前文既不交付本轮、也不回填缓存。隐私复检也在
+     * 主线程块内做：预检与读之间隔着主线程队列，其间可能已切到
+     * 密码框，队列里排在读之前的 onStartInputView 会先更新
+     * editorInfo，读点复检才拦得住。
+     */
+    private val beforeCursorCache = BeforeCursorCache()
+
+    private suspend fun peekTextBeforeCursor(n: Int, expectedGen: Long? = null): String? {
+        val startGen = expectedGen ?: predictionFieldGen.get()
+        // 调用方带着发起序号来读：序号已变，这份上下文不属于它
+        if (predictionFieldGen.get() != startGen) return null
+        beforeCursorCache.cachedText()?.let { return sliceBeforeCursor(it, n) }
+        // InputConnection 非线程安全、契约要求主线程访问：只有真正
+        // 读 IC 的填缓存段切主线程，切片留在调用线程
+        val fresh = withContext(Dispatchers.Main.immediate) {
+            if (predictionFieldGen.get() != startGen) {
+                return@withContext null
+            }
+            if (isNoPersonalizedLearning(editorInfo)) {
+                return@withContext null
+            }
+            runCatching {
+                inputConnection()?.getTextBeforeCursor(64, 0)?.toString() ?: ""
+            }.getOrDefault("")
+        } ?: return null
+        // 提交前比对：读取期间序号已被推进（换框且缓存已失效），
+        // 这份前文属旧框——不交付本轮、也不回填
+        if (predictionFieldGen.get() != startGen) return null
+        beforeCursorCache.publish(fresh)
+        return sliceBeforeCursor(fresh, n)
+    }
+
+    private fun sliceBeforeCursor(text: String, n: Int): String {
+        val want = n.coerceIn(0, 64)
+        return if (text.length <= want) text else text.takeLast(want)
+    }
+
+    private fun invalidateBeforeCursorCache() {
+        beforeCursorCache.invalidate()
+    }
+    /**
+     * 输入框序号：换框时推进——onStartInputView(!restarting)，以及
+     * restarting 但关键字段已变（实为换框，见 [InputFieldKey]）。
+     * 异步读者（前文读取、预测 job、前端提交认领）以发起时捕获的
+     * 序号作整轮作废的比对基准，交付点再比对一次；取代旧的
+     * EditorInfo 引用同一性（===）——同一性比较把「同框 restartInput
+     * 换发新 EditorInfo 实例」与「换框」混为一谈。同框重启（字段
+     * 未变）不推进，框没换、在途联想仍属本框。
+     */
+    private val predictionFieldGen = java.util.concurrent.atomic.AtomicLong(0L)
+
+    /**
+     * 前端提交（剪贴板/常用语/语音/符号键等经 [requestCommit]）待
+     * 发起预测的文本队列（FIFO，规格见 [FrontendPredictionQueue]）：
+     * requestCommit 的 job 先把文本入队、再 emitCommit 产生消息
+     * （条目先于消息可见；emit 抛错按令牌回滚本条目），
+     * handleRimeMessage 在对应直送 Commit 落屏（emitMessage）之
+     * 后认领并发起预测——预测的发起点由此落在 reduce 的落屏之
+     * 后，job 内读到的是落屏后的真实前文。条目带入队时的输入框
+     * 代次，换框推进代次时整队清空，认领时队首文本与代次都要
+     * 对上；空格/回车的直送 Commit 不入队，其文本（" "/"\n"）与
+     * 队首不等时不认领。残存巧合：前端文本恰为 " "/"\n" 且同一时
+     * 窗有空格/回车直送 Commit 在途时，可能由后者提前认领——后
+     * 果仅为一轮以落屏后真实前文计算的预测提前/缺席，不产生错
+     * 误上屏、不参与搭配学习（本路径 learnable 恒 false）。
+     */
+    private val pendingFrontendPredictions = FrontendPredictionQueue()
+
+    /** 上一个输入框的身份快照：restarting 重启时比对是否实为换框（见 [InputFieldKey]）。 */
+    @Volatile
+    private var lastInputFieldKey: InputFieldKey? = null
+
+    @Volatile
+    private var predictionJob: Job? = null
+
+    /**
+     * 候选还原 job 句柄。写点两处：[restoreCandidates]（reduce
+     * 串行点，cancel 旧的再赋新的）与 [invalidatePendingCandidates]
+     * （reduce 多路与 onFinishInputView 的主线程收尾都会调，cancel
+     * 后置空）。两处以 @Volatile 保可见性即够：Job.cancel 本身线
+     * 程安全；赋值交错最坏让一次作废漏取消一个刚启动的还原 job，
+     * 其结果仍被 CandidatesReady 的 requestId 门控丢弃，不会把旧
+     * 批次候选发出去。
+     */
+    @Volatile
+    private var candidateRestoreJob: Job? = null
+
+    /**
+     * 候选还原的独立队（性能第 1 条）：还原任务（常用语输入码、排序还原、
+     * gram 重排、生僻字补字）不再跑在引擎 scope（Dispatchers.Default）上——
+     * scope 同时宿主 reduce 串行循环与 jobs 消费循环，还原的重活（Room、
+     * gram 查询）会与按键路径抢 Default 线程。独立单线程队与按键队彻底
+     * 隔离：按键从不排在还原后面，还原之间仍以前一 job 取消串行。
+     * 挂在 scope 下（scope.launch(dispatcher)）：finalize 取消 scope
+     * 时还原 job 一并取消，取消语义与原来一致；IO 池无需手动关闭。
+     */
+    private val candidateRestoreDispatcher: CoroutineDispatcher =
+        Dispatchers.IO.limitedParallelism(1)
+    /** 分页补取的批次状态：已从引擎取到的原始候选条数（分页 start 必须用原始计数，不能用 UI 过滤后的条数） */
+    @Volatile
+    private var candidateBatchLoaded: Int = 0
+    /** 本批候选总数：-1 = 未知（首屏取满、后面可能还有） */
+    @Volatile
+    private var candidateBatchTotal: Int = -1
+    /** 分页补取在飞标记（批次代次）：-1 = 无在飞，否则为在飞批次的 latestCandidateRequestId */
+    private val loadMoreBatch = java.util.concurrent.atomic.AtomicLong(-1L)
+    /**
+     * 候选分页双模式页号记账（WO52 1.1）：native 模式的当前页号；
+     * 滑动模式仅在批量取空时复位 0（取空则回到第 0 页）。首屏帧
+     * 与上屏提交时复位。
+     */
+    @Volatile
+    private var pagingPageNo: Int = 0
+    /** 方案 page_size（快照 context.menu.pageSize）：native 末页判定与下标偏移用 */
+    @Volatile
+    private var nativePageSize: Int = 0
+    /** pageCandidates 发起的 native 翻页待下一帧 Candidates 认领的页号 */
+    @Volatile
+    private var pendingNativePage: Int? = null
+
+    /** 当前生效分页模式（纯决策的引擎侧读口：只看滑动翻页开关）。 */
+    internal fun effectivePagingMode(): CandidatePagingMode {
+        val ctx = context
+        val swipeEnabled = ctx?.let { CandidateManager.isSwipePagingEnabled(it) } ?: true
+        return CandidatePagingPolicy.resolveMode(swipeEnabled, false)
+    }
+    /** 候选拖拽排序表判空缓存：null 语义用 false+首次查询实现，保存时由 resortCandidates 失效 */
+    @Volatile
+    private var sortingTableEmpty: Boolean = false
+    // UI 消息通道：控制类 emit 保序不丢、易变类（状态型）最新值
+    // 合流必达，分流与合流的规格见 EngineMessageChannel——旧实现
+    // 易变类走 tryEmit、缓冲满静默丢自己，一串快打的最后一批组
+    // 字被丢后无下一批自愈、胶囊永久滞留旧值（wode 截图定案，
+    // 第十六批改为合流通道）
+    private val messageChannel = EngineMessageChannel()
+
+    /** 全部 UI 消息的统一出口（语义见 [EngineMessageChannel]） */
+    private suspend fun emitMessage(msg: EngineMessage) {
+        messageChannel.emit(msg)
+    }
+
+    override fun initialize(context: Context) {
+        // I-L1：新一轮初始化重建作用域死亡信号——finalize 已完成旧
+        // 信号，同实例重初始化时旧信号会让 deployAndAwait 立即 FAILED。
+        scopeDeathSignal = CompletableDeferred()
+        val appContext = context.applicationContext
+        this@RimeEngine.context = appContext
+
+        val app = this@RimeEngine.context as ImeApplication
+        app.notifyState(ImeApplication.AppState.EngineStarting)
+        behaviorHosted = BehaviorHost(this)
+
+        scope.launch {
+            for (action in actions) reduce(action)
+        }
+
+        //observe engine Messages at first.
+        // 背压隔离（E-M2）：不用挂起的 actions.send——UI 消费一慢会向上
+        // 传导，native 通知分发整条停摆、部署结果通知被堵在无界队列后；
+        // dispatchAction 在队列满时丢易变类、控制类转异步补投，收集器永不挂起。
+        scope.launch {
+            daemon.observeMessages { dispatchAction(Action.RimeMessage(it)) }
+        }
+        session = daemon.createSession(javaClass.name)
+        scope.launch {
+            for (entry in jobs) {
+                try {
+                    val currentSession = session
+                    if (currentSession == null) {
+                        // 会话尚未建立：作业体永不会执行，按丢弃处理，
+                        // 否则带完成回调的部署作业会让等待方空等到超时。
+                        entry.onDropped?.invoke()
+                        continue
+                    }
+                    currentSession.runOnReady {
+                        // 字段选项（禁个性化学习等隐私项）待补设时，在
+                        // 本 job 之前先行应用：不依赖补设 job 在队列中
+                        // 与按键 job 的相对位置——队列满时 sendJob 的
+                        // 异步补投会让两者乱序，密码框最初几键可能在
+                        // native 学习仍开启时被处理。消费端是唯一串行
+                        // 执行点，在这里补设顺序即确定。
+                        if (fieldOptionsPending) {
+                            fieldOptionsPending = false
+                            editorInfo?.let { applyFieldOptions(it) }
+                        }
+                        // 裸调用：block 是带 RimeApi 接收者的函数值，
+                        // 只有裸调用才沿用 runOnReady 块的隐式接收者；
+                        // 写成 entry.block() 时编译器要求显式传接收者
+                        // （原实现 job() 即此形态）。
+                        val job = entry.block
+                        // I-L1：紧贴作业体调用前置位——此前的补设段
+                        // 被取消时作业体未执行，丢弃回调仍须跑；置位
+                        // 之后作业体自身的 finally 即复位方，消费循
+                        // 环不再补调 onDropped。
+                        entry.started.set(true)
+                        job()
+                    }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    // 取消到达时作业体未执行（正挂在 runOnReady 或 receive
+                    // 上）：丢弃回调是等待方的唯一复位方，须在循环死亡前
+                    // 调用，否则 deployAndAwait 的等待方空等满整个超时（E-S3）。
+                    // 作业体已执行时不调（I-L1）：其 finally 已复位标志，
+                    // 再调 onDropped 即双放——releaseRunning 是普通置位，
+                    // 两次释放之间另一路抢到部署位会被第二放误删。
+                    if (!entry.started.get()) entry.onDropped?.invoke()
+                    throw e
+                } catch (e: Exception) {
+                    // 单个 job 失败（如引擎在就绪前被停掉，whenReady 抛
+                    // RimeStoppedException）只丢这一个 job 并记日志，
+                    // 不能让异常杀掉整个 job 消费循环、堵死后续所有引擎操作。
+                    // 作业体未执行时 onDropped 是其标志/等待方的唯一复位方：
+                    // 消费循环是 jobs 唯一的串行执行点，丢弃回调跑在本
+                    // 循环内，与作业体执行点同一线程/队列，回调只做幂等
+                    // 复位与 deferred 完成，故与作业体 finally 的保证等价。
+                    // 作业体已执行时不调（I-L1）：其 finally 已复位，见上。
+                    Timber.w(e, "Rime job failed")
+                    if (!entry.started.get()) entry.onDropped?.invoke()
+                }
+            }
+        }
+        //监听引擎注册事件
+        prefs = appContext.getSharedPreferences(
+            CandidateManager.PREFS_NAME, Context.MODE_PRIVATE
+        ).also {
+            it.registerOnSharedPreferenceChangeListener(prefsListener)
+        }
+        // 热路径开关缓存初值（性能 §7）：监听注册后全量读一次。
+        refreshCachedCandidateFlags(appContext)
+        //以结束为号
+        sendJob {
+            EngineDeployState.setRunning(true)
+            try {
+                // join 超时是防永久卡死的护栏，不是编译时限：600 秒取
+                // awaitSchemasReady 的既有默认值口径。超时只让本作业失败
+                // （转非取消异常，消费循环只丢本作业、不杀整条 jobs 队列；
+                // finally 照常复位标志），不中断 native 侧仍在阻塞的 join
+                // 线程；残余 3a 定论：补齐观察点以 running 为准，孤儿期
+                // running 仍真故不早触发；本路径 running 复位后可能提前
+                // 补齐，但补齐读盘源在部署中不被改写，故不另设信号。
+                try {
+                    withTimeout(600_000) { joinMaintenanceThread() }
+                } catch (e: TimeoutCancellationException) {
+                    EngineDeployState.releaseRunning()
+                    throw IllegalStateException("deploy join timeout")
+                }
+                // 与部署结果通知同一投递口径（E-M2）：Finish 与在途的
+                // Success/Failure 走同一 dispatchAction/resend 通道保序，
+                // 不因队列满被后者超车、让 Finish 处理器误判本轮结果。
+                dispatchAction(
+                    Action.RimeMessage(
+                        RimeMessage.DeployMessage(RimeMessage.DeployMessage.State.Finish)
+                    )
+                )
+                currentSchema().applyOptions(this)
+            } finally {
+                EngineDeployState.releaseRunning()
+            }
+        }
+    }
+
+    override fun finalize() {
+        // I-L1：先完成作用域死亡信号——deployAndAwait 的等待方据此
+        // 立即 FAILED，不等作业体 native 收尾（complete 幂等，多次
+        // finalize 无害；等待方在调用方作用域，不被本处 scope.cancel 影响）。
+        scopeDeathSignal.complete(Unit)
+        prefs?.unregisterOnSharedPreferenceChangeListener(prefsListener)
+        prefs = null
+        actions.close()
+        jobs.close()
+        // 关库后通道里残留的作业永不会被消费循环取走：逐条调丢弃回调，
+        // 让部署等待方快速失败而不是空等超时（E-S3）。消费循环并发取走
+        // 的条目走它自己的取消路径（见上），同一条目只会被一方取走，不重复。
+        drainJobsOnFinalize(jobs)
+        // 引擎死后排队未执行的部署作业永不会跑：其入口置位
+        // （reload/deployAndAwait）与超时孤儿在此统一清零，否则
+        // 进程级单例标志会把下一个引擎实例也堵死。锁内先取消
+        // 作用域再清标志，并与 reload/deployAndAwait 入口的
+        // 查—置段共用同一把锁定序：锁内已取消作用域的，后续
+        // 入口必在锁内看到 scope 已死而拒绝置位；锁前已置位的，
+        // 本处清零后不再有作业能把它重新置真（派发通道已关闭）。
+        // 锁内只有取消与标志赋值，无挂起调用，不会堵住部署本身；
+        // 锁顺序上 finalize 只拿 deployGateLock，绝不拿 deployMutex，
+        // 与 deployAndAwait（先 deployMutex 后 deployGateLock）无环。
+        synchronized(deployGateLock) {
+            scope.cancel()
+            resendScope.cancel()
+            EngineDeployState.releaseRunning()
+            EngineDeployState.releaseOrphanRunning()
+        }
+        preferDbScope.cancel()
+        predictionManager?.destroy()
+        daemon.destroySession(javaClass.name)
+    }
+
+    override fun processKey(service: InputMethodService, key: KeyEvent) {
+        // P4 分段探针（引擎段）：量 processKey 同步部分的耗时（门禁判定 +
+        // 入动作队列）；门控关时 measureStage 直接跑原体，零附加开销。
+        // 跨异步的键→提交总耗时仍由既有 KEY_TO_COMMIT 粗配对覆盖，
+        // 本探针不做逐键配对（快打下单 lastPressMs 会被覆盖，见该探针注释）。
+        com.jobeen.hime.skin.perf.PerfMonitor.measureStage(
+            com.jobeen.hime.skin.perf.PerfMonitor.Event.KEY_ENGINE,
+        ) {
+            // 部署期按键门：见 DeployKeyGate。门必须放在 dispatchAction
+            // 之前——键一旦入动作队列，就会在部署作业之后执行。
+            // 只记日志不弹提示：部署中连续打字时提示会刷屏。
+            if (DeployKeyGate.shouldDrop()) {
+                noteInputDropped("key_deploy", service)
+                Timber.d("processKey dropped during deploy")
+                return@measureStage
+            }
+            dispatchAction(Action.ProcessKey(service, key))
+        }
+    }
+
+    override fun processEnter(
+        service: InputMethodService,
+        field: EnterField,
+        isLongPress: Boolean,
+        hasDedicatedNewlineKey: Boolean,
+    ) {
+        // 与 processKey 同口径的部署期按键门：部署中回车键同样丢弃，
+        // 不单独放行（分发点在主线程，字段属性已由调用方映射好）。
+        if (DeployKeyGate.shouldDrop()) {
+            noteInputDropped("enter_deploy", service)
+            Timber.d("processEnter dropped during deploy")
+            return
+        }
+        // 会话绑定（2026-11-05 审计 #1 项 4）：本函数由
+        // KeyActionListener 在主线程同步调用，与调用方映射 field
+        // 是同一调用栈、同一时点——此处取的字段身份与代次即分发
+        // 时点的会话；执行前在 sendEnterJob 复检。
+        dispatchAction(
+            Action.Enter(
+                service,
+                field,
+                isLongPress,
+                hasDedicatedNewlineKey,
+                captureEnterSession(service),
+            ),
+        )
+    }
+
+    /**
+     * 捕获当前输入会话（字段身份＋代次）：调用方须在分发时点
+     * 同步调用——KeyActionListener 的软回车与 reduce 的注入回车
+     * 均满足（与 field 映射同一时点）。代次源为 prediction-
+     * FieldGen（onStartInputView 换框即推进，含 restarting 型
+     * 逻辑换框；同框重启不推进，在途回车仍属本框、照常执行）。
+     */
+    private fun captureEnterSession(service: InputMethodService): EnterSession =
+        EnterSession(
+            InputFieldKey.of(service.currentInputEditorInfo),
+            predictionFieldGen.get(),
+        )
+
+    private fun processKeyInternal(key: KeyEvent) {
+        if (!state.initialized) {
+            // 部署 Start 刚把 initialized 复位、门还没来得及拦住的键：
+            // 与部署期门同口径记丢字日志，不静默丢。
+            noteInputDropped("key_not_initialized", serviceRef?.get())
+            return
+        }
+        when (key) {
+            is KeyEvent.SequenceEvent -> {
+                // 序列键在分类 job 内原本即无条件转发、不读任何状态：
+                // 直接分发 Behavior，省去纯转发的一跳。行为的 native
+                // 工作仍由 Behavior 经 sendJob 入 jobs 队列执行。
+                // 例外——邮箱后缀续打：列表正显示、单字是后缀可续字符
+                // （字母／数字／点）时先判后走，对得上字面上屏（不进
+                // 拼音）、对不上照常进 Rime。判定在 jobs 里做（读前文
+                // 与查方案都是挂起调用），见 handleEmailDomainKey。
+                val sequence = key.sequence
+                if (state.emailSuffixVisible &&
+                    EmailSuffixes.normalizeDomainChar(sequence) != null
+                ) {
+                    sendJob { handleEmailDomainKey(sequence) }
+                } else {
+                    dispatchAction(Action.Behavior(InputString(sequence)))
+                }
+            }
+
+            is KeyEvent.CodeEvent -> {
+                when (key.keyCode) {
+                    // 空格/退格的去向取决于执行时点的实时组字，
+                    // 只能留在 job 内串行判定（见 sendStatefulKeyJob）；
+                    // 但入 job 的动作本身经 Action 二次分发，与普通键
+                    // 的 Behavior 在 reduce 同一点入队，避免状态键凭
+                    // 直达 sendJob 插到在途普通键之前（见 StatefulKey）。
+                    // 回车不再走状态键：reduce 截获 ENTER 后汇到
+                    // Action.Enter，走精简决策（见 sendEnterJob）。
+                    KEYCODE_SPACE, KEYCODE_DEL ->
+                        dispatchAction(Action.StatefulKey(key))
+
+                    KEYCODE_APOSTROPHE -> {
+                        // 分隔符键在分类 job 内同样是无条件转发
+                        dispatchAction(Action.Behavior(Segmentation()))
+                    }
+
+                    else -> {
+                        // 其余普通键在分类 job 内不读状态、只转发
+                        // InputKey：直接分发，绕开纯转发 job
+                        dispatchAction(
+                            Action.Behavior(
+                                InputKey(key.keyCode, key.modifiers.toInt(), key.isVirtual)
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 空格/退格的分类 job（经 Action.StatefulKey 在 reduce 里
+     * 调用，入队点与普通键的 Behavior 对齐，见 StatefulKey）：两者
+     * 的去向都取决于 jobs 串行执行时点的实时组字（getRawInput），
+     * 不能在分发侧凭组字缓存预判——compositionCached.preedit 是
+     * 展示串而非原始输入，且分发时点上先行按键的 job 可能尚未
+     * 执行、缓存滞后于在途按键，预判会重蹈退格注释里跨队列按旧
+     * 状态误判的覆辙。空格在空组字时直通文本、非空时在本 job
+     * 内同步转交 Rime（与退格的 handleBackspaceInJob 同口径，见
+     * 下方非空分支）；退格的判断与处理更必须同 job 完成
+     * （见 handleBackspaceInJob）。回车不再走本函数：见 sendEnterJob。
+     */
+    private fun sendStatefulKeyJob(key: KeyEvent.CodeEvent) {
+        sendJob {
+            when (key.keyCode) {
+                KEYCODE_SPACE -> {
+                    if (getRawInput().isEmpty()) {
+                        // 经 emitCommit 走引擎消息管线而非直送 actions：
+                        // 上一键的 native Commit 尚在管线中（转换/分发
+                        // 含 rime-main 补取）时，直送会超车它先落屏，
+                        // 上屏顺序错乱（如「你好」未落、空格先行）
+                        emitCommit(" ")
+                        // 邮箱后缀续打被空格打断：直送空格不触发预测复核，
+                        // 列表不会自动收起，这里直接收起（与对端
+                        // 「对不上就收起」同口径；空帧被
+                        // suppressNextEmptyCandidates 残留吞掉时迟一轮
+                        // 收起，选词侧 completion-null 兜底不误提交）
+                        if (state.emailSuffixVisible) {
+                            state.emailSuffixVisible = false
+                            state.predictionVisible = false
+                            emitMessage(EngineMessage.Candidates(emptyList(), 0, 0, total = 0))
+                        }
+                        return@sendJob
+                    }
+                }
+
+                KEYCODE_DEL -> {
+                    // 判断与处理收进本 job 内完成（见 handleBackspaceInJob）：
+                    // 不再先在本 job 取组字状态、再经 actions 队列转发处理，
+                    // 避免跨队列期间组字变化导致按旧状态误判
+                    handleBackspaceInJob()
+                    return@sendJob
+                }
+
+            }
+            // 组字非空的空格（退格已在上方分支内处理）：在本 job
+            // 内同步转交 Rime，与 InputKey.invoke() 的转交内容逐字
+            // 等价（键码映射＋修饰键＋isVirtual），只是不再绕回
+            // actions 队尾另发一个 job。此前绕回 actions 时，本键的
+            // 处理 job 要排到 reduce 消费完在途动作之后才入队，积压
+            // 时落在本键之后到达的普通键 job 之后（a、空格、b 连按
+            // 会先把 b 并入组字、再拿 "ab" 的首选上屏），即按键被
+            // 后续键超车。InputKey 在 BehaviorHost 里不登记任何队列
+            // 状态（flowedLocked 的 InputKey 分支只是 invoke 转交），
+            // 跳过 flowBehavior 这一跳不丢队列维护，与退格经
+            // backspaceInJob 在本 job 内直达 Rime 同构。
+            // 回车不再走本函数：见 sendEnterJob（精简决策）。
+            processKey(
+                KeyMapping.keyCodeToVal(key.keyCode),
+                key.modifiers.toInt().toUInt(),
+                key.isVirtual,
+            )
+            return@sendJob
+        }
+    }
+
+    /**
+     * 邮箱后缀续打（jobs 串行线）：列表正显示时，单字序列键先到这里判定。
+     * 对得上就字面上屏（不进拼音），落屏后经前端预测认领重新给后缀；
+     * 对不上照常进 Rime——同时把可见标志清掉（序列已断，后续键不再拦截，
+     * 列表随后由 Rime 组字候选接管或预测空结果收起）。
+     * 九宫格数字是拼音编码，不参与续打；全角点按半角 . 算。
+     * 前文现读（列表出现时 @ 已落屏，不存在读到 @ 之前的前文）；光标
+     * 已挪走时 typedDomain 为 null，照常进 Rime。
+     */
+    private suspend fun RimeApi.handleEmailDomainKey(text: String) {
+        if (!state.emailSuffixVisible) {
+            dispatchAction(Action.Behavior(InputString(text)))
+            return
+        }
+        val normalized = EmailSuffixes.normalizeDomainChar(text) ?: run {
+            dispatchAction(Action.Behavior(InputString(text)))
+            return
+        }
+        if (normalized[0] in '0'..'9') {
+            val schemaId = runCatching { currentSchema().schemaId }.getOrNull().orEmpty()
+            if (EmailSuffixes.isT9SchemaId(schemaId)) {
+                dispatchAction(Action.Behavior(InputString(text)))
+                return
+            }
+        }
+        val before = peekTextBeforeCursor(EmailSuffixes.CONTEXT_LENGTH)
+        if (before == null || !EmailSuffixes.continues(before, normalized)) {
+            state.emailSuffixVisible = false
+            dispatchAction(Action.Behavior(InputString(text)))
+            return
+        }
+        pendingFrontendPredictions.offerAndEmit(normalized, predictionFieldGen.get()) {
+            emitCommit(normalized)
+        }
+    }
+
+    /**
+     * 回车键精简决策执行（与下滑 Undo 分支无关，不动其账本与门）：
+     * 组字只读本 job 执行时点的原始输入（getRawInput），与空格／
+     * 退格同纪律——分发时点先行按键的 job 可能尚未执行，分发侧
+     * 预判会按旧状态误判。发动作走主线程的输入连接（与 Undo
+     * 分支同口径的 withContext(Dispatchers.Main.immediate)，
+     * job 内挂起等主线程执行完才放行后续 job，不超车）；
+     * 插换行走 emitCommit("\n") 的 FIFO 路径；无动作为空操作。
+     * 组字中上屏候选与旧回车非空分支同口径：同步转交 Rime。
+     */
+    private fun sendEnterJob(enter: Action.Enter) {
+        sendJob {
+            // 会话复检（2026-11-05 审计 #1 项 4）：入队后换框或
+            // 输入结束时，旧会话的回车一律丢弃——组字上屏与动作
+            // 执行都属旧会话，不得对新字段调 performEditorAction，
+            // 也不得把旧 Enter 键交进 Rime（会误上屏新框组字候选）。
+            // 同框重启（代次与身份皆不变）照常放行。
+            if (!enter.session.isCurrent(
+                    InputFieldKey.of(editorInfo),
+                    predictionFieldGen.get(),
+                )
+            ) {
+                Timber.d("sendEnterJob dropped stale session")
+                return@sendJob
+            }
+            val composing = getRawInput().isNotEmpty()
+            when (
+                val outcome = EnterDecision.decide(
+                    composing = composing,
+                    field = enter.field,
+                    hasDedicatedNewlineKey = enter.hasDedicatedNewlineKey,
+                    isLongPress = enter.isLongPress,
+                )
+            ) {
+                EnterOutcome.CommitCandidate -> {
+                    processKey(
+                        KeyMapping.keyCodeToVal(KEYCODE_ENTER),
+                        0u,
+                        true,
+                    )
+                }
+
+                is EnterOutcome.PerformAction -> {
+                    withContext(Dispatchers.Main.immediate) {
+                        inputConnection()?.performEditorAction(
+                            EnterFieldBoundary.toEditorAction(outcome.action),
+                        )
+                    }
+                }
+
+                EnterOutcome.InsertNewline -> {
+                    emitCommit("\n")
+                }
+
+                EnterOutcome.NoOp -> Unit
+            }
+            return@sendJob
+        }
+    }
+
+    override fun selectCandidate(candidate: Candidate) {
+        dispatchAction(Action.SelectCandidate(candidate))
+    }
+
+    private suspend fun selectCandidateInternal(candidate: Candidate) {
+        // 选词后旧组字的候选还原结果作废，防止迟到结果把已清空的候选复活
+        invalidatePendingCandidates()
+        // 隐私：密码框 / 声明 IME_FLAG_NO_PERSONALIZED_LEARNING 的输入框不做任何学习
+        //（不读前文、不写偏好表、不跑预测上下文）；正常上屏不受影响
+        val noLearn = isNoPersonalizedLearning(editorInfo)
+        if (candidate.type == Candidate.TYPE_EMAIL_SUFFIX) {
+            // 邮箱后缀点选：把光标前「@已打」换成「@整个后缀」，不进 Rime 选词、
+            // 不记偏好、不学搭配；落屏后重新评估（完成后缀一般无剩余匹配，列表收起）
+            selectEmailSuffix(candidate.text)
+            return
+        }
+        if (candidate.type == Candidate.TYPE_IME_PREDICTION) {
+            // 落屏之后再发起预测（与打字上屏路径同口径）：job 内
+            // 读到的是落屏后的真实前文，已含本次点选词，不在
+            // reduce 上、落屏之前同步读前文（那会让本次上屏等一
+            // 次主线程 IPC 往返）
+            emitMessage(EngineMessage.Commit(candidate.text))
+            invalidateBeforeCursorCache()
+            // 预测候选点选属于打字流上屏：参与搭配学习
+            requestPrediction(candidate.text, learnable = true)
+            return
+        }
+        if (candidate.type == Candidate.TYPE_RARE_CHAR) {
+            // 生僻字补字点选：合成候选不在 Rime 菜单里，不进 Rime 选词；
+            // 文本直接上屏（与联想候选同口径），不进用户词库、不记偏好、
+            // 不学搭配；补字不进学习链（断链，与前端提交同口径），
+            // 下一打字词不跨补字配对
+            emitMessage(EngineMessage.Commit(candidate.text))
+            invalidateBeforeCursorCache()
+            lastLearnSegment = null
+            requestPrediction(candidate.text, learnable = false)
+            return
+        }
+        if (candidate.type == Candidate.TYPE_PHRASE_SHORTCUT) {
+            // 常用语输入码点选（WO52 6.1）：仅点击上屏，不参与 Rime
+            // 组字、不进 Rime 选词；文本直接上屏（与生僻字补字同口径），
+            // 不记偏好、不学搭配；记一次最近使用（自动排序键）。
+            emitMessage(EngineMessage.Commit(candidate.text))
+            invalidateBeforeCursorCache()
+            lastLearnSegment = null
+            val ctx = context
+            if (ctx != null && candidate.phraseId >= 0) {
+                preferDbScope.launch {
+                    try {
+                        PhraseManager.markUsed(ctx, candidate.phraseId)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to record phrase usage")
+                    }
+                }
+            }
+            requestPrediction(candidate.text, learnable = false)
+            return
+        }
+
+        // Only Rime selection produces the empty candidate response that must be hidden.
+        // Prediction candidates bypass Rime and must not arm this flag.
+        state.suppressNextEmptyCandidates = true
+        if (!noLearn) {
+            // 偏好写走独立串行 IO 通道（见 preferDbScope），不再占
+            // jobs 队列堵后续按键；落库、节流裁剪与计数落点由缓存
+            // 侧在同一串行通道内成对执行（见
+            // CandidatePreferCache.recordClick），不再拆成「本通道
+            // upsert、缓存通道落点」两段——两段分属不同通道时，首
+            // 次加载的读库段可插进对子中间造成双计
+            val ctx = context
+            if (ctx != null) {
+                preferDbScope.launch {
+                    // 整段兜住：盘满（SQLiteFullException）、还原期间
+                    // 库被替换等失败只丢这一次偏好，异常不得逃出
+                    // launch——此前写在 jobs 里时异常被 jobs 消费循环
+                    // 的通用 catch 吸收，移出后必须在本处补上同等吸收，
+                    // 否则未捕获异常会杀进程（scope 上另有
+                    // CoroutineExceptionHandler 作第二层兜底）
+                    try {
+                        val dao = AppDatabase.getInstance(ctx).candidatePreferDao()
+                        CandidatePreferCache.recordClick(candidate.text, dao)
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        Timber.w(e, "Failed to persist candidate preference")
+                    }
+                }
+            }
+        }
+        flowBehavior(Selection(candidate.index))
+    }
+
+    /**
+     * 邮箱后缀点选：把光标前「@已打」换成「@整个后缀」（全角 ＠ 一并换成半角）。
+     * 删段走主线程直连 IC（与 Undo 分支同口径），上屏走 emitCommit 的 FIFO 路径；
+     * 完成后以前端预测认领重新评估——完成后缀一般无剩余匹配，空结果收起列表。
+     * 光标前已对不上（挪了光标、改了字）只收起列表，什么都不改。
+     */
+    private suspend fun selectEmailSuffix(domain: String) {
+        invalidatePendingCandidates()
+        val before = peekTextBeforeCursor(EmailSuffixes.CONTEXT_LENGTH)
+        val completion = before?.let { EmailSuffixes.completion(it, domain) }
+        if (completion == null) {
+            state.emailSuffixVisible = false
+            state.predictionVisible = false
+            emitMessage(EngineMessage.Candidates(emptyList(), 0, 0, total = 0))
+            return
+        }
+        val (typed, full) = completion
+        withContext(Dispatchers.Main.immediate) {
+            runCatching {
+                inputConnection()?.deleteSurroundingText(typed.length, 0)
+            }
+        }
+        invalidateBeforeCursorCache()
+        // reduce 上下文没有 RimeApi 接收者，emitCommit 只能在 jobs
+        // 里调：删段已在主线程 await 完成，入队提交必在其后（与
+        // requestCommit 同模式——入队在 emit 之前，认领在落屏后）
+        sendJob {
+            pendingFrontendPredictions.offerAndEmit(full, predictionFieldGen.get()) {
+                emitCommit(full)
+            }
+        }
+    }
+
+    /**
+     * 是否禁止个性化学习：统一判定在 [InputFieldPolicy]（密码类输入框，
+     * 或输入框声明了 IME_FLAG_NO_PERSONALIZED_LEARNING）。
+     * 生效范围：本 engine 的选词偏好表/缓存/预测/重排，以及经由
+     * [NO_PERSONALIZED_LEARNING_OPTION] 控制的 librime native 用户词典自学习。
+     */
+    private fun isNoPersonalizedLearning(info: EditorInfo?): Boolean =
+        com.jobeen.hime.base.util.InputFieldPolicy.isNoPersonalizedLearning(info)
+
+    /** 是否为文本类密码框（数字密码走数字键盘，不在此列）。 */
+    private fun isPasswordTextField(info: EditorInfo?): Boolean {
+        if (info == null) return false
+        if ((info.inputType and InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) return false
+        return when (info.inputType and InputType.TYPE_MASK_VARIATION) {
+            InputType.TYPE_TEXT_VARIATION_PASSWORD,
+            InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD,
+            InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD -> true
+            else -> false
+        }
+    }
+
+    override fun resetComposition() {
+        dispatchAction(Action.Reset)
+    }
+
+    override fun moveCursor(service: InputMethodService, direction: Int) {
+        sendJob {
+            if (compositionCached.preedit?.isNotEmpty() == true) {
+                // 正在输入拼音：交给 Rime 处理方向键，移动 preedit 内的 caret（Rime 原生行为）
+                processKeyInternal(
+                    KeyEvent.CodeEvent(
+                        if (direction < 0) KEYCODE_DPAD_LEFT else KEYCODE_DPAD_RIGHT,
+                        KeyModifiers.Empty,
+                    )
+                )
+            } else {
+                withContext(Dispatchers.Main.immediate) {
+                    val ic = inputConnection() ?: return@withContext
+                    // 结束编辑器侧 composing（如语音听写），避免与编辑器光标状态错位
+                    ic.finishComposingText()
+                    val keyCode = if (direction < 0) KEYCODE_DPAD_LEFT else KEYCODE_DPAD_RIGHT
+                    ic.sendKeyEvent(android.view.KeyEvent(ACTION_DOWN, keyCode))
+                    ic.sendKeyEvent(android.view.KeyEvent(ACTION_UP, keyCode))
+                }
+            }
+        }
+    }
+
+    override fun selectCandidatePinYin(pinYin: CandidatePinYin) {
+        dispatchAction(Action.SelectCandidatePinYin(pinYin))
+    }
+
+    override fun segement() {
+        dispatchAction(Action.Segment)
+    }
+
+    override fun selectSchema(schemaId: String) {
+        dispatchAction(Action.SelectSchema(schemaId))
+    }
+
+    override fun deleteForward(service: InputMethodService) {
+        dispatchAction(Action.ForwardDelete(service))
+    }
+
+    override fun toggleRuntimeOption(option: String) {
+        sendJob {
+            val current = getRuntimeOption(option)
+            setRuntimeOption(option, !current)
+        }
+    }
+
+    override fun dismissPredictions() {
+        dispatchAction(Action.DismissPredictions)
+    }
+
+    override fun undo(service: InputMethodService) {
+        dispatchAction(Action.Undo(service))
+    }
+
+    override fun redo(service: InputMethodService) {
+        dispatchAction(Action.Redo(service))
+    }
+
+    override fun resortCandidates(candidates: List<Candidate>) {
+        val ctx = context ?: return
+        if (candidates.isEmpty()) return
+        val db = AppDatabase.getInstance(ctx)
+        // 有保存动作即排序表非空，失效 restoreCandidates 的判空缓存
+        sortingTableEmpty = false
+        sendJob {
+            // 键的两个输入只在 RimeApi 作用域内可读，必须在本 job
+            // 内取齐：组字串读 compositionCached（与组字产生同步
+            // 赋值的缓存），方案读 schemaCached（方案变更消息处理点
+            // 同步回写的缓存，与还原端同源同值）；无组字（预测态）
+            // 时键为空，save 内部据此跳过。候选列表在此拷一份快照，
+            // 写库移出 jobs 后由 preferDbScope 异步消费，调用方的
+            // 列表对象不能再被原地改动影响到落库内容
+            val key = candidateSortingKey(
+                compositionCached.preedit.orEmpty(), schemaCached.schemaId
+            )
+            // 输入码候选是按组字码临时拼到帧首的合成项，不进 Rime 菜单：
+            // 不随拖拽保存进排序表，否则它的文本哈希会套到以后的
+            // 真实候选上（与长按删除的墓碑排除同口径）。
+            val snapshot = candidates.filterNot {
+                it.type == Candidate.TYPE_PHRASE_SHORTCUT
+            }.toList()
+            if (snapshot.isEmpty()) return@sendJob
+            // 写库与选词偏好同走 preferDbScope 串行 IO 通道（与 28
+            // 号原则一致：Room 写不占 jobs、不堵后续按键）。代价是
+            // 保存与还原之间不再有 jobs FIFO 的先后保证：还原端
+            // load 读的是 Room 而非内存表，紧随保存触发的同一批
+            // 还原可能读到落库前的值（本批沿用旧序、下一批起按新
+            // 序，属有界的最终一致，不会错套到别的组字上——键含
+            // 组字串与方案，两端同源）
+            preferDbScope.launch {
+                try {
+                    CandidateSortingManager(db).save(snapshot, key)
+                    // 落库成功后把判空缓存再置一次非空：入口处置 false
+                    // 与真正落库之间隔着 jobs→preferDbScope 两跳，其间
+                    // 若有一次还原执行到 isTableEmpty()，读到的仍是空
+                    // 表、会把缓存打回 true 并在此后一直短路还原——刚
+                    // 保存的顺序在本进程内永不生效，直到再拖一次或重
+                    // 启。落库已成事实的时点再置一次，缓存与库内事实
+                    // 收敛（save 内部因空键跳过时表内仍可能有旧记录，
+                    // 置 false 同样正确；表真为空时下一次还原查库即把
+                    // 缓存重新置 true）。restore 端读点口径不变。
+                    sortingTableEmpty = false
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Timber.w(e, "Failed to save candidate sorting")
+                }
+            }
+        }
+    }
+
+    override fun deleteCandidate(index: Int) {
+        sendJob { deleteCandidate(index, global = true) }
+    }
+
+
+    override fun flowed(behavior: IBehavior): Boolean {
+        dispatchAction(Action.Behavior(behavior))
+        return true
+    }
+
+    private fun flowBehavior(behavior: IBehavior): Boolean =
+        behaviorHosted?.flowed(behavior) == true
+
+    override fun resetState() {
+        dispatchAction(Action.Reset)
+    }
+
+    private fun possibleCandidatePinYin() {
+        sendJob {
+            if (!PinYinUtil.isValidType(schemaCached.candidateKind)) {
+                return@sendJob
+            }
+            // WO52 1.5：T9 段的拼音列表取自 native t9PinyinList（按空格
+            // 切分）；全拼段仍走既有 Kotlin 计算。raw 串随快照动作下发，
+            // 切分与配对在 reduce 里做。紧凑键盘（14/18 键）不走 native
+            // T9 表（9 键分组）：分组随快照下发，reduce 里走 Kotlin
+            // 紧凑展开（BehaviorHost.possibleCompactPinYin）。
+            val grouping = compactGrouping
+            val t9ListRaw = if (grouping != null) {
+                null
+            } else if (schemaCached.candidateKind == PinYinUtil.CandidateKindT9) {
+                t9PinyinList()
+            } else {
+                null
+            }
+            val currentInput = getRawInput()
+            val confirmedLen = getInputConfirmedPosition()
+            dispatchAction(
+                Action.PossibleCandidatePinYinSnapshot(
+                    schemaCached.candidateKind, currentInput, confirmedLen, t9ListRaw, grouping
+                )
+            )
+        }
+    }
+
+    private suspend fun reduce(action: Action) {
+        when (action) {
+            is Action.ProcessKey -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                val key = action.key
+                if (key is KeyEvent.CodeEvent && key.keyCode == KEYCODE_ENTER) {
+                    // 注入的回车键（SendKeys 等）同样走精简决策：
+                    // 字段属性在此由当前编辑框信息映射，长按与
+                    // 专用换行键均无（注入键无长按概念、无键盘身份），
+                    // 与软回车键汇合到 Action.Enter，不再进状态键旧路径。
+                    // 会话快照与字段属性同一时点捕获（见 processEnter）。
+                    dispatchAction(
+                        Action.Enter(
+                            action.service,
+                            EnterFieldBoundary.fromEditorInfo(
+                                action.service.currentInputEditorInfo,
+                            ),
+                            isLongPress = false,
+                            hasDedicatedNewlineKey = false,
+                            session = captureEnterSession(action.service),
+                        ),
+                    )
+                } else {
+                    processKeyInternal(key)
+                }
+            }
+
+            is Action.Enter -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                sendEnterJob(action)
+            }
+
+            is Action.StatefulKey -> sendStatefulKeyJob(action.key)
+
+            is Action.RimeMessage -> handleRimeMessage(action.message)
+            is Action.Behavior -> flowBehavior(action.behavior)
+            is Action.SelectCandidate -> selectCandidateInternal(action.candidate)
+            is Action.Clear -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                clearInternal()
+            }
+
+            is Action.Undo -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                sendJob {
+                    // 下滑永远撤销，不分组字状态（用户口径：有无组字
+                    // 都一样）。组字清理只走上滑，下滑绝不清组字——
+                    // 旧分支“组字中下滑 = Reset 清组字”已删。
+                    // 组字中账本不查：光标前先是组字串，账本以后缀
+                    // 对段，对上也会删到组字头上（deleteSurrounding
+                    // Text 只删光标前相邻字），故组字中跳过账本：
+                    // 污染会话空操作（发 Ctrl+Z 会复活），未污染会
+                    // 话直发 Ctrl+Z（药丸组字不在编辑器内，不受影响）。
+                    withContext(Dispatchers.Main.immediate) {
+                        val ic = inputConnection()
+                        val composing = compositionCached.preedit?.isNotEmpty() == true
+                        // 先查上滑清字账本：上滑清掉的已上屏文字记在
+                        // 这里，命中就原样写回，不走 Ctrl+Z。污染会话
+                        // 内 Ctrl+Z 已被拦（防清掉的组字复活），不查
+                        // 这本，清掉的文字就没有任何地方可回——两个
+                        // 既有账本记的都不是它（语音记语音段、打字
+                        // 记打出来的段，都是「还在编辑器里」的文本，
+                        // 而清掉的这段已经不在编辑器里了）。
+                        // 组字中三账本一律不查（与 .17 门一致：光标前
+                        // 先是组字串，账本以后缀对段，对上也会删到
+                        // 组字头上）；组字中＋内嵌开那一格保持 .17
+                        // 现状（污染空操作、未污染 Ctrl+Z），不动。
+                        val restoredByCleared = !composing && ic != null &&
+                            ClearedTextLedger.tryRestore(ic)
+                        // 再查语音上屏账本：最近一段语音文字还在光标前
+                        // 原样躺着就整段直删。语音走组字转正，编辑器
+                        // 撤销栈的记账口径不一（分多步、甚至不入栈），
+                        // 盲发 Ctrl+Z 经常删不完一整段。不命中（上屏
+                        // 后打过字/移过光标/账本无账）才回落 Ctrl+Z。
+                        val undoneByLedger = !composing && !restoredByCleared &&
+                            ic != null && VoiceUndoLedger.tryUndo(ic)
+                        // 污染会话内才查打字账本（未污染会话保持正式版
+                        // 原样：语音账本不命中即直发 Ctrl+Z，打字账本
+                        // 只作污染会话内的直删后备，不改变正常会话
+                        // 的撤销粒度）；落点按 TypedUndoLedger
+                        // .decideUndoFallback 真值表执行——污染且
+                        // 三账本都不命中时空操作，绝不把 Ctrl+Z
+                        // 发进被污染的编辑器撤销栈（那正是清掉的
+                        // 组字以已上屏文本复活的路径）。
+                        val poisoned = TypedUndoLedger.isPoisoned()
+                        val undoneByTyped = !composing && !restoredByCleared &&
+                            !undoneByLedger && poisoned &&
+                            ic != null && TypedUndoLedger.tryUndo(ic)
+                        if (TypedUndoLedger.decideUndoFallback(
+                                voiceHit = undoneByLedger,
+                                typedHit = undoneByTyped,
+                                clearedHit = restoredByCleared,
+                                poisoned = poisoned,
+                            ) == TypedUndoLedger.UndoFallback.SEND_CTRL_Z
+                        ) {
+                            InputConnectionUtil.sendCombinationKeyEvent(
+                                ic, KEYCODE_Z, ctrl = true
+                            )
+                        }
+                    }
+                }
+            }
+
+            is Action.Redo -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                sendJob {
+                    if (compositionCached.preedit?.isNotEmpty() == true) {
+                        // 组字中恢复与旧实现同口径：盲发组合键，不查账本
+                        // （组字是输入法内部状态，账本恢复够不着也不该动）
+                        InputConnectionUtil.sendCombinationKeyEvent(
+                            inputConnection(), KEYCODE_Z, ctrl = true, shift = true
+                        )
+                    } else {
+                        withContext(Dispatchers.Main.immediate) {
+                            val ic = inputConnection()
+                            // 先查语音账本恢复栈：账本直删绕开了编辑器
+                            // 的撤销栈，Ctrl+Shift+Z 对这笔删除无账可
+                            // 恢复；删除后状态未被动过时由账本整串写回。
+                            // 不命中（期间打过字/删过字/无恢复账）才回落
+                            // 组合键——打字撤销的恢复仍走编辑器自己的栈
+                            val redoneByLedger = ic != null && VoiceUndoLedger.tryRedo(ic)
+                            // 打字账本的恢复只在污染会话内接管（与撤销
+                            // 对称：直删只发生在污染会话内）；未污染会
+                            // 话仍直发 Ctrl+Shift+Z。恢复不设污染门：
+                            // 编辑器重做只能重做被编辑器撤销过的编辑，
+                            // 而污染会话内编辑器撤销已被拦下，清组字
+                            // 那条记录从未被编辑器撤销过，重做够不着它。
+                            val redoneByTyped = !redoneByLedger &&
+                                TypedUndoLedger.isPoisoned() &&
+                                ic != null && TypedUndoLedger.tryRedo(ic)
+                            if (!redoneByLedger && !redoneByTyped) {
+                                InputConnectionUtil.sendCombinationKeyEvent(
+                                    ic, KEYCODE_Z, ctrl = true, shift = true
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            is Action.ForwardDelete -> {
+                serviceRef = (action.service as? ImeInputMethodService)?.let(::WeakReference)
+                sendJob {
+                    // 组字判定在 job 内以 getRawInput 现读（与退格
+                    // handleBackspaceInJob 同纪律）：组字中前删按
+                    // 重点候选 8-9 只删编码右侧——composition 快照
+                    // 的 caret 未到 preedit 末尾时，送内部 Delete
+                    // 给 Rime 删码右字符（Rime 消费，不碰宿主文本）；
+                    // caret 已到末尾时不动（右侧无码）。内部合成键
+                    // isVirtual=false：即使未消费也被透传门控拦下，
+                    // 绝不补发宿主 DEL；快照滞后时宁可漏删一次。
+                    if (getRawInput().isNotEmpty()) {
+                        val composition = compositionCached
+                        if (ForwardDeleteDecision.shouldDeleteCodeRight(
+                                composition.preedit, composition.cursorPos,
+                            )
+                        ) {
+                            processKey(KeyMapping.Key_Delete, 0U, false)
+                            DiagLog.d("fwd_delete", "composing_code_right")
+                        } else {
+                            DiagLog.d("fwd_delete", "noop_composing")
+                        }
+                        return@sendJob
+                    }
+                    // 选区/后文不在 job 内判：上一键的 Commit 可能
+                    // 尚在消息管线中未落屏，按旧选区判定会吞删——
+                    // 宿主段回 reduce 在执行时点重读（学
+                    // forwardUnhandledKey 的判定点纪律，详设 §5.2-2）
+                    dispatchAction(Action.ForwardDeleteHost)
+                }
+            }
+
+            Action.ForwardDeleteHost -> forwardDeleteOnHost()
+
+            Action.DismissPredictions -> {
+                invalidatePendingPrediction()
+                if (state.predictionVisible) {
+                    state.predictionVisible = false
+                    emitMessage(EngineMessage.Candidates(emptyList(), 0, 0))
+                }
+            }
+
+            is Action.Predict -> requestPrediction(
+                action.commit,
+                fieldGenOverride = action.fieldGen,
+            )
+            is Action.PredictionReady -> {
+                // requestId 只防同框内的请求交错；输入框已切换
+                // （代次推进）时旧框联想直接丢弃，不落到新框
+                if (action.requestId == state.latestPredictionRequestId.get() &&
+                    action.fieldGen == predictionFieldGen.get()
+                ) {
+                    // 预测路径同样要过滤已删除词（删除过滤不能只挂在 Rime 候选还原上）
+                    val visible = action.candidates.filterNot { DeletedWordsStore.isDeleted(it.text) }
+                    state.predictionVisible = visible.isNotEmpty()
+                    // 邮箱后缀是预测通道上的一组特殊联想：全员都是后缀类型时才记可见，
+                    // 续打拦截与退格 dismiss 以此为准；普通联想不置位
+                    state.emailSuffixVisible = visible.isNotEmpty() &&
+                        visible.all { it.type == Candidate.TYPE_EMAIL_SUFFIX }
+                    // 预测候选是本地联想的完整列表、没有分页：total 显式给
+                    // 确切条数，避免下游按 -1（未知）误判"还有更多"而在
+                    // 预测态触发引擎分页补取、把组字候选拼进联想列表
+                    emitMessage(EngineMessage.Candidates(visible, 0, 0, total = visible.size))
+                }
+            }
+
+            is Action.EmitMessage -> emitMessage(action.message)
+
+            is Action.PossibleCandidatePinYinSnapshot -> {
+                // 紧凑键盘（14/18 键）以 Kotlin 紧凑展开为准（分组随快照
+                // 下发；native T9 表是 9 键分组，不参与）。
+                // WO52 1.5：T9 段以 native 列表为准绳（按空格切分）；
+                // raw/position 仍取 Kotlin 侧同一段的计算（BehaviorHost
+                // 队列坐标，native 只有会话输入坐标）。两者同源同算法，
+                // 正常恒一致；native 多出的拼音无队列坐标可配对、丢弃
+                // （宁可漏，不可错）。非 T9 段走既有 Kotlin 计算。
+                val pinYins = when {
+                    action.compactGrouping != null -> {
+                        behaviorHosted?.possibleCompactPinYin(
+                            action.compactGrouping, action.currentInput, action.confirmedLen
+                        ) ?: emptyList()
+                    }
+                    action.t9ListRaw != null -> {
+                        val native = parseT9PinyinList(action.t9ListRaw)
+                        val local = behaviorHosted?.possiblePinYin(
+                            action.candidatePinYinType, action.currentInput, action.confirmedLen
+                        ) ?: emptyList()
+                        val byPinYin = local.associateBy { it.pinYin }
+                        native.mapNotNull { byPinYin[it] }
+                    }
+                    else -> {
+                        behaviorHosted?.possiblePinYin(
+                            action.candidatePinYinType, action.currentInput, action.confirmedLen
+                        ) ?: emptyList()
+                    }
+                }
+                emitMessage(EngineMessage.PossibleCandidatePinYin(pinYins))
+            }
+
+            is Action.CandidatesReady -> {
+                if (action.requestId == state.latestCandidateRequestId.get()) {
+                    // 首屏版本号：取 restoreCandidates 的 requestId。
+                    // 消费侧凭它丢弃迟到旧帧；追加页不走本通道，版本号
+                    // 另取批次号（见 loadMoreCandidates），两路不混比。
+                    emitMessage(action.message.copy(revision = action.requestId))
+                }
+            }
+
+            Action.Reset -> {
+                invalidatePendingCandidates()
+                invalidatePendingPrediction()
+                // resetState/resetComposition 两个入口都汇入本分
+                // 支（总复位点）：一并清消息通道的待补发槽，防
+                // 复位前滞留的易变旧帧抢在新组字前补发（审查 A-2）
+                messageChannel.clearPending()
+                flowBehavior(Reset())
+            }
+
+            is Action.SelectCandidatePinYin -> flowBehavior(SelectPinYin(action.pinYin))
+            Action.Segment -> flowBehavior(Segmentation())
+            is Action.SelectSchema -> {
+                flowBehavior(Reset())
+                sendJob {
+                    selectSchema(action.schemaId)
+                    // ApplySchema 会清掉 librime 的 "_" 开头 transient options（含
+                    // __no_personalized_learning），密码框 ascii 强制也可能被重置：
+                    // 同一输入框内切方案后按当前输入框统一重设字段选项
+                    editorInfo?.let { applyFieldOptions(it) }
+                }
+            }
+
+            is Action.Commit -> requestCommit(action.text)
+            is Action.CommitPair -> requestCommitPair(action.pair, action.opener)
+            Action.InputCleared -> {
+                invalidatePendingCandidates()
+                invalidatePendingPrediction()
+                if (state.predictionVisible) {
+                    state.predictionVisible = false
+                    state.emailSuffixVisible = false
+                    emitMessage(EngineMessage.Candidates(emptyList(), 0, 0))
+                }
+            }
+
+            Action.Reload -> {
+                behaviorHosted?.resetState()
+                // 丢弃回调：作业体在就绪门处被丢时，入口前置置位
+                // 的 running 标志除此之外无任何复位方——作业体内的
+                // finally 根本不会执行。此前该路径让 running 永久滞留
+                // 真，守门与 FAB 部署永久走“忙”路径。回调只复位
+                // running：不记孤儿。
+                sendDeployJob(
+                    block = {
+                        try {
+                            // 输入未变时跳过 deploy()+join（与
+                            // deployAndAwaitIfChanged 同口径）：Finish 收尾
+                            // 照常，方案表与选项由 Finish 处理器刷新。
+                            val reloadCtx = this@RimeEngine.context
+                            val reloadPre = if (reloadCtx != null) {
+                                withContext(Dispatchers.IO) {
+                                    computeCurrentDeployFingerprint(reloadCtx)
+                                }
+                            } else {
+                                null
+                            }
+                            val reloadStored = reloadCtx?.let {
+                                readStoredDeployFingerprint(it)
+                            }
+                            if (reloadCtx != null && shouldSkipDeploy(
+                                    reloadStored, reloadPre, deployProductsPresent(), false
+                                )
+                            ) {
+                                Timber.d("Reload skipped: deploy inputs unchanged")
+                            } else {
+                                deploy()
+                                // join 超时是防永久卡死的护栏，不是编译时限：600 秒取
+                                // awaitSchemasReady 的既有默认值口径。超时只让本作业失败
+                                // （转非取消异常，消费循环只丢本作业、不杀整条 jobs 队列；
+                                // finally 照常复位标志），不中断 native 侧仍在阻塞的 join
+                                // 线程；残余 3a 定论同上（补齐观察点以 running 为准，孤儿期不早触发）。
+                                try {
+                                    withTimeout(600_000) { joinMaintenanceThread() }
+                                } catch (e: TimeoutCancellationException) {
+                                    // 复位只在 finally 一处（I-L1）：此处预先释放再叠 finally 即双放。
+                                    throw IllegalStateException("deploy join timeout")
+                                }
+                                // 成功且部署前后指纹稳定时才存（部署中输入变了则不存）。
+                                if (reloadCtx != null && reloadPre != null) {
+                                    val reloadPost = withContext(Dispatchers.IO) {
+                                        computeCurrentDeployFingerprint(reloadCtx)
+                                    }
+                                    if (reloadPost != null && reloadPost == reloadPre) {
+                                        storeDeployFingerprint(reloadCtx, reloadPost)
+                                    }
+                                }
+                            }
+                            // 与部署结果通知同一投递口径（E-M2，见 initialize 作业）。
+                            dispatchAction(
+                                Action.RimeMessage(
+                                    RimeMessage.DeployMessage(RimeMessage.DeployMessage.State.Finish)
+                                )
+                            )
+                        } finally {
+                            EngineDeployState.releaseRunning()
+                        }
+                    },
+                    onDropped = { EngineDeployState.releaseRunning() },
+                )
+            }
+        }
+    }
+
+    /**
+     * 退格处理（在 processKeyInternal 的 rime job 内同步执行）：「组字是否
+     * 为空」的判断与后续处理落在同一个 job 里，不再跨 actions/jobs 两条
+     * 队列——旧实现先取状态再转发，期间组字被其它按键改掉就会按旧状态
+     * 误判（组字已空仍转交 Rime、或组字未空却删了宿主文本）。
+     * 组字非空时交给 [BehaviorHost.backspaceInJob] 在本 job 内同步消化
+     * （其队列维护的第二套状态也在同一 job 内一并推进）；组字为空时才
+     * 走原有出口：先收联想候选，再按选区/宿主 DEL 处理。
+     */
+    private suspend fun RimeApi.handleBackspaceInJob() {
+        if (getRawInput().isNotEmpty()) {
+            behaviorHosted?.backspaceInJob(this)
+            return
+        }
+        if (state.predictionVisible) {
+            state.predictionVisible = false
+            state.emailSuffixVisible = false
+            emitMessage(EngineMessage.Candidates(emptyList(), 0, 0))
+            return
+        }
+        // 「有选区只删选区、无选区删一字」的判定不在本 job 内做：
+        // 上一键的 native Commit 尚在消息管线中未落屏时，宿主里还
+        // 是替换前的旧选区，按它判定走「删选区」分支，等 Commit
+        // 落屏后选区已不存在，这次退格会被白白吞掉。统一借道
+        // KeyMessage 透传，由 forwardUnhandledKey 在实际执行删除
+        // 的时点重读选区再决定（其判定点排在在途 Commit 的消息
+        // 之后）。不经 native processKey，避免被方案处理器吞掉
+        // 后宿主收不到键。借道 DEL 带来源标记（见
+        // BORROWED_DEL_MARKER）：本 job 内刚确认组字为空，是透传
+        // 点区分「借道」与「native 未消费透传」的唯一凭据
+        emitKey(KeyMapping.keyCodeToVal(KEYCODE_DEL), BORROWED_DEL_MARKER, true)
+        invalidateBeforeCursorCache()
+    }
+
+    /**
+     * 引擎未处理按键的透传：native 拒绝的按键原先经 converter 落到
+     * EngineMessage.Unknown，在消费端被直接丢弃，目标应用收不到
+     * （个别按键在应用里无反应）。这里按 Android 键事件补发给输入连接。
+     * 修饰键状态由 [KeyModifiers.metaState] 还原；Release 修饰只补发抬起。
+     * 映射不回 Android 键码的（[KeyMapping.Key_VoidSymbol] 等）原始键码在
+     * 进入引擎的映射阶段已经丢失、无法还原，仍只能丢弃并记日志。
+     */
+    private suspend fun forwardUnhandledKey(message: RimeMessage.KeyMessage) {
+        // 内部合成按键（isVirtual=false，如部署 hook 的 processKey
+        // (Key_Delete,…,false)、退格在 job 内重走的 BackSpace）不是用户
+        // 真实按键：native 未处理也不透传给宿主，避免凭空删字/触发宿主按键
+        if (!message.data.isVirtual) return
+        val keyCode = message.data.value.keyCode
+        if (keyCode == KEYCODE_UNKNOWN) {
+            Timber.d("Drop unhandled key without Android mapping: %s", message.data.value)
+            return
+        }
+        val metaState = message.data.modifiers.metaState
+        val now = SystemClock.uptimeMillis()
+        if (keyCode == KEYCODE_DEL && !message.data.modifiers.release) {
+            // 退格删除判定表（DEL 且非 release 的三条路径）：
+            //  一、组字非空：不经本函数——handleBackspaceInJob 在
+            //      job 内由 BehaviorHost 同步消化（删组字码），不产
+            //      生透传消息。
+            //  二、带标记借道 DEL（见 BORROWED_DEL_MARKER）：组字为
+            //      空已由 handleBackspaceInJob 在同一 job 内确立（判
+            //      定与 emitKey 之间无其他组字变更点，组字变更全在
+            //      rime-main 串行线；消息管线全局 FIFO 保证本消息排
+            //      在该 job 之后产生的组字消息之前到达 reduce）。
+            //  三、无标记 virtual DEL（native 未消费透传）：组字状
+            //      态未经 job 确立，但 native 在组字非空时消费
+            //      BackSpace，透传到此的实际形态即组字为空（唯一的
+            //      isVirtual=true behavior 来源 Backspace 无构造点、
+            //      不可达）；若此路不判选区径发键事件，「组字空＋有
+            //      选区」的删除会绕过下方 Commit 的三件套（改道/记
+            //      账/探针通知），与路径二及旧路径口径不一致。
+            // 路径二、三在此同口径判定：删除形态在执行时点按当前
+            // 选区决定——有选区只删选区、无选区才落到下方按 DEL
+            // 键事件删光标前一字。判定点在 reduce 消费流内、排在在
+            // 途 Commit 的消息之后：在 job 内提前判定会读到 Commit
+            // 落屏前的旧选区，按它走删选区分支，等落屏后选区已不
+            // 存在，这次退格会被白白吞掉。
+            // 严禁在此回 jobs 查组字（awaitJob）：那读到的是 jobs
+            // 队尾执行时点的状态、与消息时点错位（后续按键已并入
+            // 组字时会误判有组字），还让整个 reduce 最坏干等 2 秒
+            // ——已随第十三批 L2 废除，不得恢复。
+            val hasSelection = withContext(Dispatchers.Main.immediate) {
+                !runCatching { inputConnection()?.getSelectedText(0) }
+                    .getOrNull().isNullOrEmpty()
+            }
+            if (hasSelection) {
+                // 选区删除不直达 InputConnection，而是以直送
+                // Commit 送回引擎消息管线：MessageHandler 对
+                // Commit 有剪贴板搜索态改道（interceptCommit）
+                // 与上屏后经 24ms 合并通道的探针通知
+                // （scheduleNotifyInputChanged，每次直探）两件
+                // 处理，直达 commitText 会整段绕过。此处本就在
+                // reduce 内，直接 emitMessage 与借道管线落到同
+                // 一条下游处理，不必再绕 jobs→rime-main 一圈
+                // （绕行期间第二次退格的判定会赶在第一个
+                // Commit("") 落屏前重复走删选区分支，两次退
+                // 格只删一次选区）。
+                emitMessage(EngineMessage.Commit("", direct = true))
+                // 与旧删选区路径同口径：宿主文本已变，前文缓存失效
+                invalidateBeforeCursorCache()
+                return
+            }
+        }
+        withContext(Dispatchers.Main.immediate) {
+            val ic = inputConnection() ?: return@withContext
+            if (!message.data.modifiers.release) {
+                ic.sendKeyEvent(
+                    android.view.KeyEvent(now, now, ACTION_DOWN, keyCode, 0, metaState)
+                )
+            }
+            ic.sendKeyEvent(
+                android.view.KeyEvent(now, now, ACTION_UP, keyCode, 0, metaState)
+            )
+        }
+    }
+
+    private suspend fun forwardDeleteOnHost() {
+        withContext(Dispatchers.Main.immediate) {
+            runCatching {
+                val ic = inputConnection() ?: run {
+                    DiagLog.w("fwd_delete", "no_input_connection")
+                    return@withContext
+                }
+                // 第 (1) 态：有选区只删选区本身。走消息管线直送
+                // Commit（与退格删选区同构：剪贴板搜索改道/记账/
+                // 探针通知不绕行）；禁用 deleteSurroundingText——
+                // 基线实现有选区时保留选区只删环绕，与意图相反
+                val selected = ic.getSelectedText(0)
+                if (!selected.isNullOrEmpty()) {
+                    emitMessage(EngineMessage.Commit("", direct = true))
+                    invalidateBeforeCursorCache()
+                    DiagLog.d(
+                        "fwd_delete", "executed", mapOf("state" to "selection"),
+                    )
+                    return@withContext
+                }
+                val after = ic.getTextAfterCursor(
+                    ForwardDeletePlanner.PROBE_CHARS, 0,
+                )?.toString().orEmpty()
+                val cluster = ForwardDeletePlanner.firstCluster(after)
+                if (cluster == null) {
+                    // 第 (4) 态：光标后无文，天然无操作
+                    DiagLog.d("fwd_delete", "noop_empty_after")
+                    return@withContext
+                }
+                // 第 (2) 态：删光标后一字素簇。主路径走码点口径；
+                // 返回 false/抛异常时以 UTF-16 口径同簇回退（同为
+                // InputConnection 删除面，非键事件、非退格）
+                val deleted = runCatching {
+                    ic.deleteSurroundingTextInCodePoints(0, cluster.codePoints)
+                }.getOrDefault(false) || runCatching {
+                    ic.deleteSurroundingText(0, cluster.utf16Length)
+                }.getOrDefault(false)
+                if (!deleted) {
+                    DiagLog.w(
+                        "fwd_delete", "delete_returned_false",
+                        mapOf("clusterCp" to cluster.codePoints),
+                    )
+                    return@withContext
+                }
+                // 删后探长校验（探针 §五注）：部分自绘输入框对删除
+                // 只执行一部分——校验不过只记日志，绝不重试连删。
+                // 探测窗未饱和时才可判（饱和时删后会补进窗外文本）
+                if (after.length < ForwardDeletePlanner.PROBE_CHARS) {
+                    val afterNow = runCatching {
+                        ic.getTextAfterCursor(ForwardDeletePlanner.PROBE_CHARS, 0)?.length
+                    }.getOrNull()
+                    if (afterNow != null && afterNow != after.length - cluster.utf16Length) {
+                        DiagLog.w(
+                            "fwd_delete", "verify_failed",
+                            mapOf("clusterCp" to cluster.codePoints),
+                        )
+                    }
+                }
+                invalidateBeforeCursorCache()
+                DiagLog.d(
+                    "fwd_delete", "executed",
+                    mapOf("state" to "cluster", "clusterCp" to cluster.codePoints),
+                )
+            }.onFailure { e ->
+                // 只记异常类名（红线：不记文本内容/凭据）
+                DiagLog.e(
+                    "fwd_delete", "failed",
+                    mapOf("error" to e.javaClass.simpleName), e,
+                )
+            }
+        }
+    }
+
+    private suspend fun handleRimeMessage(message: RimeMessage<*>) {
+        if (message is RimeMessage.KeyMessage) {
+            forwardUnhandledKey(message)
+            return
+        }
+        val msg = EngineMessageConverter.convert(message)
+        // 打字上屏的预测在函数尾部发起（见尾部说明）：发起点落在
+        // emitMessage 之后，预测 job 内读到的是落屏后的真实前文
+        // （含本次上屏词），不在此同步读前文——那会让本次上屏在
+        // reduce 串行点上等一次主线程 IPC 往返才落屏
+        var predictionText: String? = null
+        when (msg) {
+            is EngineMessage.InlinePreedit -> {
+                if (msg.preedit.isEmpty()) {
+                    behaviorHosted?.resetState()
+                }
+                possibleCandidatePinYin()
+                return
+            }
+
+            is EngineMessage.Commit -> {
+                // 直送 Commit（空组字空格/回车经 emitCommit 借道管线）
+                // 只为与 native Commit 同 FIFO 排序：旧直送路径
+                // （Action.EmitMessage）在 reduce 里只做本函数尾部的
+                // emitMessage、不触任何记账，这里同口径整段跳过——
+                // 否则空格/回车会被记成一次打字上屏：suppress 标记
+                // 无随行候选可消耗、会滞留吞掉后续空候选更新；
+                // requestPrediction 还会多跑一轮必空预测（并清掉上
+                // 一轮联想显示）、且把空格/回车作为可学段打断候选
+                // 学习链。落屏不受影响：emitMessage(msg) 照常执行，
+                // 其下游消费者（MessageHandler 落屏、KeyboardState-
+                // Manager 组字态）旧路径同样经 emitMessage 到达，
+                // 行为不变
+                if (!msg.direct) {
+                    invalidatePendingCandidates()
+                    candidateBatchLoaded = 0
+                    candidateBatchTotal = -1
+                    pagingPageNo = 0
+                    pendingNativePage = null
+                    state.suppressNextEmptyCandidates = true
+                    // native 刚上屏：前文缓存失效，后续读到新鲜前文
+                    invalidateBeforeCursorCache()
+                    // 打字上屏：参与搭配学习。只记下文本，实际发起
+                    // 在本函数尾部（见 predictionText）
+                    predictionText = msg.text
+                }
+            }
+
+            is EngineMessage.Candidates -> {
+                // 记录分页批次：首屏 bulk 的原始条数与总数信号（total=-1 为
+                // 取满上限、后面可能还有），供 loadMoreCandidates 续取
+                candidateBatchLoaded = msg.list.size
+                candidateBatchTotal = msg.total
+                // native 分页帧定页号／末页（WO52 1.1＋B-P-1/P-2）：changePage
+                // 挂起的页号由下一帧认领；其余首屏帧复位 0；追加页（滑动模式）
+                // 不碰页号。末页 = (页号+1)×页宽 >= 确切总数；总数未知
+                // （total==-1，bulk 取满）时本页条数未满即末页。
+                val framed = if (effectivePagingMode() == CandidatePagingMode.NATIVE) {
+                    val pending = pendingNativePage
+                    if (pending != null) {
+                        pagingPageNo = pending
+                        pendingNativePage = null
+                    } else if (!msg.append) {
+                        pagingPageNo = 0
+                    }
+                    // 页宽取方案 page_size（快照 context.menu.pageSize），
+                    // 不再用首帧 bulk 条数——bulk 窗口恒 24，与方案页宽无关。
+                    if (msg.pageSize > 0) {
+                        nativePageSize = msg.pageSize
+                    }
+                    val (framedList, framedPage, framedIsLast) =
+                        frameNativeCandidatePage(
+                            candidates = msg.list,
+                            total = msg.total,
+                            pageSize = nativePageSize,
+                            pageNo = pagingPageNo,
+                            bulkLimit = NATIVE_BULK_LIMIT,
+                        )
+                    msg.copy(list = framedList, page = framedPage, isLastPage = framedIsLast)
+                } else {
+                    msg
+                }
+                if (msg.list.isNotEmpty()) {
+                    // Rime candidates take over the panel from prediction candidates.
+                    state.predictionVisible = false
+                    state.emailSuffixVisible = false
+                    invalidatePendingPrediction()
+                }
+                if (state.suppressNextEmptyCandidates) {
+                    state.suppressNextEmptyCandidates = false
+                    if (msg.list.isEmpty()) {
+                        return
+                    }
+                }
+                restoreCandidates(framed)
+                return
+            }
+
+            is EngineMessage.Schema -> {
+                // librime 内部切方案（switcher/lua 等）不走 Action.SelectSchema：
+                // ApplySchema 会 ClearTransientOptions 清掉 "_" 开头的运行时
+                // 选项（含 __no_personalized_learning），且没有上层路径补设，
+                // 密码框等场景的禁学习会被内部切方案绕过。这里在方案变更
+                // 消息路径上按 SelectSchema/Deploy 的同款方式补设一次。
+                sendJob { editorInfo?.let { applyFieldOptions(it) } }
+            }
+
+            is EngineMessage.Depoly -> {
+                when (msg.state) {
+                    EngineMessage.Depoly.State.Start -> {
+                        state.initialized = false
+                        deployRunTracker.onStart()
+                    }
+                    // native 部署结果：Success/Failure 到达时完成部署作业
+                    // 等待的 outcome（无 waiter 时为空操作）。Failure 除
+                    // 完成 outcome 外还做两件 waiter 无关的事：标记单发
+                    // 补跑（下次键盘出现时补一次），以及投递待显示通知
+                    // （设置侧部署/同步完成时同款通道，下次出现时显示；
+                    // 即时 Toast 归各 waiter 调用方——FAB/菜单/切换/导入
+                    // 在 FAILED 时各自已弹，避免此处再弹一次重复）。
+                    EngineMessage.Depoly.State.Success ->
+                        pendingDeployOutcome?.complete(true)
+                    EngineMessage.Depoly.State.Failure -> {
+                        deployRunTracker.onFailure()
+                        pendingDeployOutcome?.complete(false)
+                        pendingRedeploy.markFailed()
+                        context?.let {
+                            RimeSyncPrefs.postNotice(
+                                it,
+                                it.getString(R.string.fab_deploy_failed),
+                            )
+                        }
+                    }
+                    EngineMessage.Depoly.State.Finish -> {
+                        // 合成的 Finish 必须查本轮实际结果（E-S1）：native
+                        // 部署已明确失败时不置 initialized、不刷新方案表与
+                        // 选项，也不再向 UI 发一条 Finish 与先到的 Failure
+                        // 自相矛盾；补跑标记与失败通知已由 Failure 处理器
+                        // 记下，此处幂等再记一次。
+                        if (deployRunTracker.consumeFinishFailed()) {
+                            pendingRedeploy.markFailed()
+                            return
+                        }
+                        state.initialized = true
+                        val triggerHook = !state.initHookTriggered
+                        state.initHookTriggered = true
+                        sendJob {
+                            val prefs = context?.getSharedPreferences(
+                                SchemaManager.PREFS_NAME, Context.MODE_PRIVATE
+                            )
+                            val enabledIds =
+                                prefs?.getString(SchemaManager.KEY_ENABLED_IDS, "")?.split(",")
+                                    ?.filter { it.isNotBlank() }
+                            val schemas = enabledSchemata()
+                            if (enabledIds.isNullOrEmpty()) {
+                                val ids = schemas.joinToString(",") { it.id }
+                                prefs?.edit { putString(SchemaManager.KEY_ENABLED_IDS, ids) }
+                            }
+                            val currentSchema = currentSchema()
+                            // openSchema 是 librime native 入口：本 job 运行在
+                            // jobs 线程，直调会绕开 rime-main 串行线。派发到
+                            // rime-main 执行并等待结果，读取失败按无语法模型降级
+                            val grammarLanguage = runCatching {
+                                Rime.runOnRimeMain {
+                                    RimeConfig.openSchema(currentSchema.schemaId).use { config ->
+                                        config.getString("grammar/language")
+                                    }
+                                }
+                            }.getOrNull()
+                            grammarLanguage?.let {
+                                Timber.d("predictionManager load model %s.gram", it)
+                                predictionManager?.loadModels(modelDir, sharedDataDir, it)
+                            }
+
+                            if (triggerHook) {
+                                processKey(KeyMapping.Key_Delete, 0U, false)
+                                context?.let { it as ImeApplication }
+                                    ?.notifyState(ImeApplication.AppState.Finished)
+                            }
+
+                            // 部署重建了 native 会话：字段选项（禁个性化学习、
+                            // 密码框强制英文）随会话丢失，按当前输入框重设
+                            // （Reload 的完成路径也走这里）。初始化部署时
+                            // editorInfo 为空，自动跳过。
+                            // 部署完成时先重刷方案 options：偏好监听只在偏好
+                            // 变化时触发，部署本身不调 applyOptions，选项会
+                            // 停留在 reset 默认值（如英文整句）；随后字段选项
+                            // 重放（下行）覆盖密码框等字段特例，与偏好监听
+                            // 同口径。
+                            currentSchema().applyOptions(this)
+                            // 部署窗口内到达的 Schema 通知丢 kind 更新（E-M4）：
+                            // snapshotOnRimeMain 在部署窗口内返回 null，
+                            // applySchemaKind 不被调用；Finish 是窗口关闭后
+                            // 的第一个收尾点，按当前方案的 kind 重刷音节
+                            // 切分器，否则切分一直用旧方案的切分器直到下
+                            // 次切方案。无部署窗口丢失时本调用是幂等重刷。
+                            EngineMessageConverter.applySchemaKind(currentSchema.kind)
+                            editorInfo?.let { applyFieldOptions(it) }
+                        }
+                    }
+
+                    else -> {}
+                }
+            }
+
+            else -> {}
+        }
+        emitMessage(msg)
+        // 发起预测（打字上屏）：emitMessage 返回时本次 Commit 已
+        // 投递，collector 在 Main 的落屏处理排在预测 job 随后投递
+        // 的 withContext(Main) 之前，job 内读到的前文必然含本次
+        // 词——上下文在 job 内读落屏后的真实文本，不在发起点拼
+        // 装（发起点同步读会把一次 IPC 往返压在落屏之前；拼装则
+        // 会把宿主过滤器/自动纠正改过的落屏结果排除在外）
+        predictionText?.let { text ->
+            requestPrediction(text, learnable = true)
+        }
+        // 前端提交的预测发起点（见 pendingFrontendPredictions）：
+        // 直送 Commit 已在上方 emitMessage 落屏，此刻认领并发起
+        // ——job 内同读落屏后前文，不拼接。认领须队首文本与当
+        // 前输入框代次都对上（换框时队列已整队清空，认领侧再
+        // 按代次挡一层，见 FrontendPredictionQueue）
+        if (msg is EngineMessage.Commit && msg.direct &&
+            pendingFrontendPredictions.claim(msg.text, predictionFieldGen.get())
+        ) {
+            requestPrediction(msg.text)
+        }
+    }
+
+    override fun observeMessages(
+        scope: CoroutineScope, onMessage: suspend (EngineMessage) -> Unit
+    ): Job = messageChannel.observe(scope, onMessage)
+
+    override suspend fun schemasList(): List<EngineMessage.Schema> =
+        awaitJob(emptyList()) {
+            enabledSchemata().map {
+                EngineMessage.Schema(
+                    it.id, it.name, it.layout, it.punctuation, it.kind
+                )
+            }
+        }
+
+
+    override fun clear(service: InputMethodService) {
+        dispatchAction(Action.Clear(service))
+    }
+
+    private suspend fun clearInternal() {
+        invalidatePendingCandidates()
+        invalidatePendingPrediction()
+        val clearPredictions = state.predictionVisible
+        state.predictionVisible = false
+        state.emailSuffixVisible = false
+        if (clearPredictions) {
+            emitMessage(EngineMessage.Candidates(emptyList(), 0, 0))
+        }
+        sendJob {
+            if (shouldResetComposing(compositionCached.preedit)) {
+                actions.send(Action.Reset)
+            } else {
+                withContext(Dispatchers.Main.immediate) {
+                    val ic = inputConnection()
+                    // 删已上屏文字并入账（见 clearCommittedText）；
+                    // 入口通过才失效前文缓存，与旧口径一致。
+                    if (ic != null && clearCommittedText(ic)) {
+                        invalidateBeforeCursorCache()
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * 动作队列的非挂起分发入口：先 trySend；队列满时易变类直接丢弃
+     * （预测/候选回执有 requestId 守卫，候选/组字类引擎通知会被下一批
+     * 取代），控制类（按键、选词、切方案、上屏、清空等）转异步挂起
+     * 补投、永不丢。协程上下文内可直接 actions.send 挂起等待。
+     */
+    private fun dispatchAction(action: Action) {
+        if (actions.trySend(action).isSuccess) return
+        if (action.isDroppable()) {
+            // 被丢的候选帧若正是 Commit 后等的那帧空候选，suppress 标志
+            // 须随丢弃同步清掉，否则滞留吞掉下一帧合法空候选（E-L6）。
+            // 先到先得：Commit 之后的第一帧候选必先到，它被丢即标志
+            // 的消费对象已丢；其余丢弃不触标志。
+            if (action is Action.RimeMessage &&
+                shouldClearSuppressOnDrop(
+                    action.message.messageType, state.suppressNextEmptyCandidates
+                )
+            ) {
+                state.suppressNextEmptyCandidates = false
+            }
+            return
+        }
+        resendScope.launch { actions.send(action) }
+    }
+
+    private fun Action.isDroppable(): Boolean = when (this) {
+        // 预测/候选回执有 requestId 守卫，丢了下一批自愈，可丢
+        is Action.PredictionReady, is Action.CandidatesReady -> true
+        is Action.RimeMessage -> when (message.messageType) {
+            RimeMessage.MessageType.Candidate, RimeMessage.MessageType.Composition,
+            RimeMessage.MessageType.InlinePreedit, RimeMessage.MessageType.DynamicPreedit,
+            RimeMessage.MessageType.Menu -> true
+            else -> false
+        }
+        else -> false
+    }
+
+    private fun enqueueJob(entry: QueuedJob) {
+        if (jobs.trySend(entry).isFailure) {
+            // 通道已关（引擎 finalize 后旧引用仍调 sendJob）：直接丢弃，
+            // 不许再异步补投——已关通道的 send 必抛 ClosedSendChannelException，
+            // 无 handler 时会走默认未捕获异常处理杀进程。关库后的作业
+            // 本就无处执行，丢弃是正确语义（finalize 已清全部置位）；
+            // 丢弃回调仍须调（E-S3）：它是部署等待方快速失败的唯一路径，
+            // 不调则等待方空等满整个超时。
+            if (jobs.isClosedForSend) {
+                entry.onDropped?.invoke()
+                return
+            }
+            // 队列满说明引擎正被长任务堵住：任务都是控制类（导词典、
+            // 清屏、切方案等），不许丢，转异步挂起入队等空位；补投仍
+            // 可能撞上关库窗口，故失败时调丢弃回调（E-S3），取消则
+            // 重抛（不吞取消语义）；补投走单并发重发域（见
+            // createResendDispatcher），保满队列边界的严格 FIFO。
+            resendScope.launch {
+                try {
+                    jobs.send(entry)
+                } catch (e: CancellationException) {
+                    entry.onDropped?.invoke()
+                    throw e
+                } catch (e: Exception) {
+                    entry.onDropped?.invoke()
+                }
+            }
+        }
+    }
+
+    override fun sendJob(block: suspend RimeApi.() -> Unit) {
+        enqueueJob(QueuedJob(block))
+    }
+
+    /**
+     * 带丢弃回调的部署作业投递：仅 Reload 与 deployAndAwait 两路
+     * 部署作业使用。普通按键类作业无等待方、无入口置位，丢了也
+     * 无需复位，走 sendJob 即可。
+     */
+    private fun sendDeployJob(block: suspend RimeApi.() -> Unit, onDropped: () -> Unit) {
+        enqueueJob(QueuedJob(block, onDropped))
+    }
+
+    override suspend fun <T> awaitJob(defaultValue: T, block: suspend RimeApi.() -> T): T {
+        val deferred = CompletableDeferred<T>()
+        val task: suspend RimeApi.() -> Unit = {
+            try {
+                deferred.complete(block())
+            } catch (t: Throwable) {
+                // 捕获面保持 Throwable、等待方仍以默认值收尾，行为
+                // 不变；这里只补可诊断性。捕获面不能收窄到
+                // Exception：Error（OOM 等）一旦穿透 task，会落进
+                // jobs 消费循环并杀死它（其 catch 只有
+                // CancellationException 与 Exception 两档），后果远
+                // 比静默降级严重。CancellationException 是引擎收尾
+                // 的正常路径，不打错误日志
+                if (t !is CancellationException) {
+                    if (t is Error) {
+                        Timber.e(t, "awaitJob task failed with an Error; completing with default value")
+                    } else {
+                        Timber.e(t, "awaitJob task failed; completing with default value")
+                    }
+                }
+                deferred.complete(defaultValue)
+            }
+        }
+        // 同 sendJob：满时异步补投，任务仍会执行；等待方有 2 秒
+        // 超时兜底，超时先返回默认值，迟到的 complete 自动忽略。
+        // 任务被就绪门丢弃时同样走超时兜底（无 onDropped：等待方
+        // 本就有超时，不需要第二条完成路径）。
+        enqueueJob(QueuedJob(task))
+        return withTimeoutOrNull(2000L) { deferred.await() } ?: defaultValue
+    }
+
+    /**
+     * 分页补取：首屏 bulk 只取少量候选（native 上限），UI 滚动到底时经此
+     * 按已加载原始条数续取下一页。批次锚点用 latestCandidateRequestId：
+     * 补取在途时用户又打了键，新批次会 ++ 该值，回来时对不上即丢弃，
+     * 不会把上一编码的候选拼进新列表。追加页不走 restoreCandidates 的
+     * 重排/排序还原（那套只管首屏），仅过滤已删词与（触发条件成立时）
+     * 键帽表情、保持引擎原序。
+     */
+    override fun loadMoreCandidates() {
+        // 预测（联想）显示期间不补取：分页补的是引擎组字候选，拼进
+        // 联想列表会串味。正常由消息侧 total 保证预测态不触发，这里
+        // 再兜一道（批次计数是上一组字批次的残留值）
+        if (state.predictionVisible) return
+        val start = candidateBatchLoaded
+        if (start <= 0) return
+        val total = candidateBatchTotal
+        if (total >= 0 && start >= total) return
+        val batch = state.latestCandidateRequestId.get()
+        // 在飞守卫按批次代次判定：同批次已有补取在飞才跳过；标记停在
+        // 旧批次（旧 job 被停机吞掉、其 finally 没跑到）时与当前批次
+        // 天然不等，直接接管放行，不会永久滞留
+        while (true) {
+            val inFlight = loadMoreBatch.get()
+            if (inFlight == batch) return
+            if (loadMoreBatch.compareAndSet(inFlight, batch)) break
+        }
+        // 封顶：每批最多累计取 CANDIDATE_BATCH_CAP 个候选。词库深处是
+        // 设备字体无字形的扩展区生僻字（渲染为方框、打出也无处可用），
+        // 200 已覆盖全部真实输入需求，不再往深处加载
+        val limit = minOf(CANDIDATE_PAGE_SIZE, CANDIDATE_BATCH_CAP - start)
+        sendJob {
+            try {
+                if (limit <= 0) {
+                    // 已达封顶：回空追加页把 UI 的「还有更多」关掉
+                    candidateBatchTotal = start
+                    emitMessage(
+                        EngineMessage.Candidates(
+                            list = emptyList(),
+                            highlighted = 0,
+                            page = 0,
+                            total = start,
+                            append = true,
+                            revision = batch,
+                        )
+                    )
+                    return@sendJob
+                }
+                val page = getCandidates(start, limit)
+                if (state.latestCandidateRequestId.get() != batch) return@sendJob
+                val raw = page.size
+                if (raw == 0) {
+                    candidateBatchTotal = start
+                    // 滑动模式取空则回到第 0 页（WO52 1.1）
+                    pagingPageNo = 0
+                    return@sendJob
+                }
+                candidateBatchLoaded = start + raw
+                if (raw < limit || candidateBatchLoaded >= CANDIDATE_BATCH_CAP) {
+                    candidateBatchTotal = candidateBatchLoaded
+                }
+                val rawItems = page.mapIndexed { i, c ->
+                    EngineMessage.Candidate(
+                        index = start + i,
+                        text = c.text,
+                        comment = c.comment,
+                        type = c.type,
+                    )
+                }.filterNot { DeletedWordsStore.isDeleted(it.text) }
+                // 键帽表情过滤与首屏同口径（第十七批补覆盖）：触发
+                // 状态在 KeycapFilterState（转换器随组字消息刷新），
+                // 本页在批次校验之后才构造；极窄窗口内可能读到下
+                // 一轮已刷新的状态，后果仅限本页且随新首屏自愈；
+                // 只摘条目、保留其余条目的引擎全局下标，分页计数
+                // （candidateBatchLoaded 按 raw 条数推进）不受过滤影响
+                val items = KeycapFilterState.applyTo(rawItems)
+                if (items.isNotEmpty()) {
+                    emitMessage(
+                        EngineMessage.Candidates(
+                            list = items,
+                            highlighted = 0,
+                            page = 0,
+                            total = candidateBatchTotal,
+                            append = true,
+                            revision = batch,
+                        )
+                    )
+                }
+            } finally {
+                // 只清自己批次的标记：批次已推进时标记多半已被新批次
+                // 接管，无条件清零会误清新批次的在飞守卫，同一页被
+                // 两条 job 各取一次、重复追加
+                loadMoreBatch.compareAndSet(batch, -1L)
+            }
+        }
+    }
+
+    /**
+     * 候选翻页（WO52 1.1）：#rimeNextPage/#rimePreviousPage 与翻页钮
+     * 的统一入口，按模式分派。
+     * - 滑动模式：向前走批量追加（loadMoreCandidates，48 条/批、
+     *   CAP 200 不变）；向后走 native 翻页（C-L-19：
+     *   changeCandidatePage(true)，与 native 模式同路——此前向后
+     *   空操作，滑到已加载批次之前就翻不动）。
+     * - native 模式：调 changeCandidatePage；成功页号±1（下限 0），
+     *   下一帧 Candidates 认领该页号；失败（已到尽头）则回到第 0 页：
+     *   页号复位 0，并把高亮移回全局 0 号（首页首候选）。
+     */
+    override fun pageCandidates(backward: Boolean) {
+        if (effectivePagingMode() == CandidatePagingMode.SWIPE && !backward) {
+            loadMoreCandidates()
+            return
+        }
+        sendJob {
+            val moved = changeCandidatePage(backward)
+            if (moved) {
+                val next = CandidatePagingPolicy.nextNativePage(pagingPageNo, backward, true)
+                pagingPageNo = next
+                pendingNativePage = next
+            } else {
+                pagingPageNo = 0
+                pendingNativePage = 0
+                // 取空则回到第 0 页：高亮回全局 0 号（onCurrentPage=false）
+                highlightCandidate(0, false)
+            }
+        }
+    }
+
+    /**
+     * 候选高亮（WO52 1.1）：只移动高亮、不提交。下标口径按模式分派
+     * （native 模式页内下标、滑动模式全局下标，见
+     * CandidatePagingPolicy.highlightOnCurrentPage）。
+     */
+    override fun highlightCandidate(index: Int) {
+        val onCurrentPage = CandidatePagingPolicy.highlightOnCurrentPage(
+            effectivePagingMode() == CandidatePagingMode.SWIPE,
+        )
+        sendJob { highlightCandidate(index, onCurrentPage) }
+    }
+
+    private fun restoreCandidates(msg: EngineMessage.Candidates) {
+        // 分页在飞标记已按批次代次化（loadMoreBatch）：新批次到来时
+        // 下方推进的 latestCandidateRequestId 与标记天然不等，
+        // loadMoreCandidates 直接接管放行——旧 job 在停机窗口被吞掉
+        // 也不会永久滞留，无需在此复位；其 finally 也只清自己批次
+        val requestId = state.candidateRequestId.incrementAndGet()
+        // 本批所属的输入框序号：job 内读前文时随 peek 一并比对
+        // （与联想 job 的发起序号同口径）——换框后本批整轮作废，
+        // 不得消费旧框的缓存前文
+        val fieldGen = predictionFieldGen.get()
+        state.latestCandidateRequestId.accumulateAndGet(requestId) { a, b -> maxOf(a, b) }
+        candidateRestoreJob?.cancel()
+        candidateRestoreJob = scope.launch(candidateRestoreDispatcher) {
+            // 过滤用户长按删除的词（Rime 墓碑不隐藏系统词，App 层过滤）；
+            // 兜底分支也要用过滤后的列表，故在 try 外先算好
+            val filtered = msg.list.filterNot { DeletedWordsStore.isDeleted(it.text) }
+            val filteredMsg = if (filtered.size == msg.list.size) msg
+                else EngineMessage.Candidates(filtered, msg.highlighted, msg.page, total = msg.total,
+                    isLastPage = msg.isLastPage, composition = msg.composition)
+            try {
+                val ctx = context
+                if (ctx == null) {
+                    actions.send(Action.CandidatesReady(requestId, filteredMsg))
+                    return@launch
+                }
+                // P1-1：读开关前先把 prefsListener 标的 dirty 批量
+                // 重读掉（本批即用新开关值；连切多开关只读一次）。
+                refreshCachedCandidateFlagsIfDirty(ctx)
+
+                // 常用语输入码候选（WO52 6.1）：组字码与输入码完整匹配时，
+                // 拼到候选前。组字码随候选消息的 composition 快照下发
+                // （转换器在同批组字消息转换时暂存，与 KeycapFilterState
+                // 同口径），不再经 awaitJob 回 jobs 取——按键不再排在
+                // 上一批候选后处理后面。开关关着或码非法时 PhraseManager
+                // 短路不查库（码格式校验在查库前，见 getByShortcut）；
+                // 查库失败只丢输入码候选，不影响本批 Rime 候选落地。
+                // 迟到批次（代次已被新批取代）不用这份匹配，与保存顺序同口径。
+                val phrasePrefix: List<Candidate> = runCatching {
+                    val preedit = msg.composition.preedit
+                    if (state.latestCandidateRequestId.get() != requestId) {
+                        emptyList()
+                    } else {
+                        PhraseManager.getByShortcut(ctx, preedit).mapIndexed { position, phrase ->
+                            Candidate(
+                                index = Candidate.PHRASE_SHORTCUT_INDEX_BASE + position,
+                                text = phrase.text,
+                                comment = phrase.label,
+                                type = Candidate.TYPE_PHRASE_SHORTCUT,
+                                phraseId = phrase.id,
+                            )
+                        }
+                    }
+                }.getOrDefault(emptyList())
+
+                /** 输入码候选拼到帧首：按 text 去重（输入码候选与 Rime 候选
+                 * 同文时只留一条，2026-11-16 debug 问题 3“辛苦了”重复）；
+                 * 高亮下标后移，总数未知（-1）时保持，未知以外加条数。 */
+                fun withPhrasePrefix(msg: EngineMessage.Candidates): EngineMessage.Candidates {
+                    if (phrasePrefix.isEmpty()) return msg
+                    val deduped = phrasePrefix.filter { phrase ->
+                        msg.list.none { it.text == phrase.text }
+                    }
+                    if (deduped.isEmpty()) return msg
+                    return EngineMessage.Candidates(
+                        deduped + msg.list,
+                        msg.highlighted + deduped.size,
+                        msg.page,
+                        total = if (msg.total < 0) msg.total else msg.total + deduped.size,
+                        append = msg.append,
+                        revision = msg.revision,
+                        isLastPage = msg.isLastPage,
+                    )
+                }
+
+                val db = AppDatabase.getInstance(ctx)
+                // 用户拖拽保存的顺序是对该候选集的显式意愿：无论是否开启
+                // 智能重排都要应用（此前重排分支直接丢弃保存顺序，而重排
+                // 默认开启，拖拽排序存进数据库也永不生效、拖完必回原位）。
+                // 排序表为空时（绝大多数用户从未保存过）跳过查询：旧实现
+                // 每键都算一次指纹 + 查一次 Room，结果注定为 null
+                val savedOrder = if (sortingTableEmpty) {
+                    null
+                } else {
+                    val mgr = CandidateSortingManager(db)
+                    if (mgr.isTableEmpty()) {
+                        sortingTableEmpty = true
+                        null
+                    } else {
+                        // 按本批候选所属的组字串＋方案查保存顺序（与保存
+                        // 端同源同值）；保存的文本哈希序列可套到本批
+                        // 子集上。组字码与方案 id 随候选消息的 composition
+                        // 快照下发，不再经 awaitJob 回 jobs 取（与常用语
+                        // 输入码同源）。仅排序表非空（用户真拖过）时才
+                        // 走这里，从未拖过的用户被上面的判空缓存短路、
+                        // 热路径无感
+                        val key = candidateSortingKey(
+                            msg.composition.preedit,
+                            msg.composition.schemaId,
+                        )
+                        if (state.latestCandidateRequestId.get() != requestId) {
+                            null
+                        } else {
+                            mgr.load(key)
+                        }
+                    }
+                }
+                // 生僻字补字只在打满一个完整音节时触发：音节随候选消息
+                // 的 composition 快照下发（与组字码同源，不再经 awaitJob
+                // 回 jobs 取）；开关关着时不取——热路径无感。补字目标
+                // 只在单音节命中时存在（见 RareCharPolicy.targetSupplement），
+                // 无目标时 supplementedCandidates 原样返回。
+                // 快照即本批组字（转换时暂存），不存在旧 awaitJob 那种
+                // “读到新组字”的错套，故不再验本批代次；迟到批次由
+                // CandidatesReady 的 requestId 门控丢弃。
+                val (rareSpellings, rareFirstRawInput) =
+                    if (cachedRareCharactersEnabled) {
+                        msg.composition.spellings to msg.composition.firstRawInput
+                    } else {
+                        emptyList<String>() to ""
+                    }
+                val rerankEnabled = cachedRerankEnabled
+                if (rerankEnabled) {
+                    // 隐私模式下不读光标前文（gramDb 为空时前文本来也不参与打分）；
+                    // 非隐私模式走前文缓存，避免每次候选刷新都跨进程读一次
+                    val inputContext = if (isNoPersonalizedLearning(editorInfo)) "" else
+                        peekTextBeforeCursor(20, expectedGen = fieldGen) ?: ""
+                    // 偏好只读视图：已加载时直接读活表（2026-11-16 性能 ②，
+                    // 不再每批 HashMap(cache) 全量拷贝）；未加载时
+                    // 不在本 job 里等加载——加载段与点击写事务同在
+                    // 缓存的跨挂起互斥内，首屏等它就等于等在途写
+                    // 事务整段。先用当前缓存（可能为空）出本批候
+                    // 选，偏好在下一次按键的新批次里自然生效；同
+                    // 时发起后台加载，下批直接走只读视图
+                    val prefers = if (CandidatePreferCache.isLoaded()) {
+                        CandidatePreferCache.readOnlyView()
+                    } else {
+                        CandidatePreferCache.ensureLoadInBackground(ctx)
+                        CandidatePreferCache.currentCache()
+                    }
+                    // gram 不进重排（2026-11-17 性能 ②，按简意）：
+                    // 简意 RimeEngine.restoreCandidates 传 gramDb=null，
+                    // 重排零 gram 工作，只按偏好＋长度排；预测
+                    // （PredictionManager.modelPredictions）仍用 gramDb
+                    // 出联想。重排每批至多 10 个候选的 gram 查询
+                    // （trie 走 ~400MB .gram）就此省掉；gram 分缓存
+                    // 已随之删除（2026-11-17 阶段 4：生产恒传 null，
+                    // 缓存不可达，查询本身仍保留在 rerank 的 gramDb
+                    // 入参路径上）。
+                    val sortedList = rerankManager?.rerank(
+                        filteredMsg.list, inputContext, null, prefers
+                    )
+                    val baseList = sortedList ?: filteredMsg.list
+                    val ordered = if (savedOrder.isNullOrEmpty()) baseList
+                        else applySavedCandidateOrder(baseList, savedOrder)
+                    actions.send(
+                        Action.CandidatesReady(
+                            requestId,
+                            withPhrasePrefix(
+                                supplementedCandidates(
+                                    ordered, 0, filteredMsg.total, rareSpellings, rareFirstRawInput,
+                                    filteredMsg.page, filteredMsg.isLastPage,
+                                )
+                                    ?: EngineMessage.Candidates(
+                                        ordered, 0, filteredMsg.page,
+                                        total = filteredMsg.total,
+                                        isLastPage = filteredMsg.isLastPage,
+                                    )
+                            )
+                        )
+                    )
+                } else {
+                    actions.send(
+                        Action.CandidatesReady(
+                            requestId, withPhrasePrefix(
+                                if (savedOrder.isNullOrEmpty()) {
+                                    supplementedCandidates(
+                                        filteredMsg.list, filteredMsg.highlighted, filteredMsg.total,
+                                        rareSpellings, rareFirstRawInput,
+                                        filteredMsg.page, filteredMsg.isLastPage,
+                                    ) ?: filteredMsg
+                                } else {
+                                    val ordered = applySavedCandidateOrder(filteredMsg.list, savedOrder)
+                                    supplementedCandidates(
+                                        ordered, 0, filteredMsg.total, rareSpellings, rareFirstRawInput,
+                                        filteredMsg.page, filteredMsg.isLastPage,
+                                    )
+                                        ?: EngineMessage.Candidates(
+                                            ordered, 0, filteredMsg.page,
+                                            total = filteredMsg.total,
+                                            isLastPage = filteredMsg.isLastPage,
+                                        )
+                                }
+                            )
+                        )
+                    )
+                }
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Exception) {
+                Timber.e(error, "Failed to restore candidates; using filtered list")
+                actions.send(Action.CandidatesReady(requestId, filteredMsg))
+            }
+        }
+    }
+
+    /**
+     * 生僻字补字帧（R2＋D17）：开关开着且打满一个完整音节时，粤语常用字
+     * 补到第 10 位；未补时返回 null（调用方原样发出旧帧，高亮／总数口
+     * 径与旧行为一致）；只有确实插入新项时 total +1，移位时表长不变、
+     * 总数不变（否则 hasMore 恒真，面板多发一次分页请求），未知总数
+     *（-1）保持；高亮下标随插入／移位重映射。音节由调用方在 restoreCandidates 内
+     * 随候选消息的 composition 快照传入（转换器在同批组字消息转换时暂存）；
+     * 迟到批次由 CandidatesReady 的 requestId 门控丢弃。
+     */
+    private fun supplementedCandidates(
+        list: List<EngineMessage.Candidate>,
+        highlighted: Int,
+        total: Int,
+        spellings: List<String>,
+        firstRawInput: String,
+        page: Int,
+        isLastPage: Boolean,
+    ): EngineMessage.Candidates? = supplementedCandidateFrame(
+        list,
+        highlighted,
+        total,
+        spellings,
+        firstRawInput,
+        page,
+        isLastPage,
+        isDeleted = DeletedWordsStore::isDeleted,
+    )
+
+    /** 取消在途的候选还原并推进代次：迟到的旧还原结果会被 CandidatesReady 门控丢弃。 */
+    private fun invalidatePendingCandidates() {
+        candidateRestoreJob?.cancel()
+        candidateRestoreJob = null
+        state.latestCandidateRequestId.accumulateAndGet(
+            state.candidateRequestId.incrementAndGet()
+        ) { a, b -> maxOf(a, b) }
+    }
+
+    /** 取消在途的预测并推进代次，避免迟到预测覆盖新候选或在清空后重现。 */
+    private fun invalidatePendingPrediction() {
+        predictionJob?.cancel()
+        predictionJob = null
+        state.latestPredictionRequestId.accumulateAndGet(
+            state.predictionRequestId.incrementAndGet()
+        ) { a, b -> maxOf(a, b) }
+    }
+
+    override fun onFinishInputView() {
+        inputConnection = null
+        editorInfo = null
+        lastLearnSegment = null
+        // 联想可见标志是上一个输入框的状态：切框必须复位，否则新框
+        // 非空（不触发 InputCleared 顺带清）时，第一次退格会只清掉
+        // 这个残留标志而不删字。invalidatePendingPrediction 只取消
+        // 在途预测、不动此标志，故在此与连接/缓存一并收尾
+        state.predictionVisible = false
+        state.emailSuffixVisible = false
+        invalidateBeforeCursorCache()
+        invalidatePendingCandidates()
+        invalidatePendingPrediction()
+        // 键盘收起：把本轮打字学到的搭配落盘（无脏数据时零开销）；
+        // 进程被杀前的最后一道写盘机会，不走节流延时
+        predictionManager?.flushCollocations()
+    }
+
+    override fun onSelectionChanged() {
+        // 光标移动后前文变了：缓存失效，避免 800ms 内读到旧前文
+        invalidateBeforeCursorCache()
+    }
+
+    /** 有字段选项等待在下一个 job 之前补设（见 jobs 消费循环）。 */
+    @Volatile
+    private var fieldOptionsPending = false
+
+    override fun onStartInputView(ic: InputConnection, info: EditorInfo, restarting: Boolean) {
+        inputConnection = ic
+        editorInfo = info
+        // 输入框代次推进：在途预测的交付/job 复检按代次作废旧框结果。
+        // 同框重启（restarting 且关键字段未变）不推进：框没换，在
+        // 途联想仍属本框，推进会误杀（旧实现以 EditorInfo === 比
+        // 对有同一问题）。但 restarting 只代表宿主在同一 View 上
+        // 重启输入：WebView 内不同 <input> 切换焦点正是 restarting
+        // =true、且不经 onFinishInputView——关键字段（见
+        // InputFieldKey）已变时按换框推进，否则旧框联想会照常交
+        // 付到新框（代次与禁学习复检都拦不住同为可学习框的切换）
+        val fieldKey = InputFieldKey.of(info)
+        if (!restarting || isInputFieldChanged(lastInputFieldKey, fieldKey)) {
+            predictionFieldGen.incrementAndGet()
+            // 前端提交队列整队清空：条目带的是旧框代次、再无认
+            // 领方，留着只会占住新框的队首（认领侧另有代次校
+            // 验兜底，见 FrontendPredictionQueue）
+            pendingFrontendPredictions.clear()
+        }
+        lastInputFieldKey = fieldKey
+        invalidateBeforeCursorCache()
+        // 隐私：把当前输入框的学习开关同步给 librime native 层。
+        // 密码框 / NO_PERSONALIZED_LEARNING 输入框内 native 用户词典不再自学习；
+        // 文本密码框进出时保存/恢复中英状态（见 applyAsciiModeForField）。
+        // 只置待补设标记：实际补设由 jobs 消费端在下一个 job（含本框
+        // 的第一个按键）执行之前完成，顺序确定，不走 sendJob 的异步
+        // 队列位置竞争。
+        fieldOptionsPending = true
+    }
+
+    /**
+     * 按输入框应用字段相关的运行时选项：禁个性化学习 + 密码框中英处理。
+     * 输入开始时调一次；部署/切方案会重建或重置 native 侧状态，这些选项
+     * 随之丢失，必须按当前输入框重设（Deploy Finish 与 SelectSchema 共用）。
+     */
+    private suspend fun RimeApi.applyFieldOptions(info: EditorInfo) {
+        setRuntimeOption(NO_PERSONALIZED_LEARNING_OPTION, isNoPersonalizedLearning(info))
+        applyAsciiModeForField(info)
+    }
+
+    /**
+     * 密码框强制英文前保存的中英状态；null 表示当前不在"密码框强制英文"中。
+     * 只在 jobs 通道消费者内读写（串行），无需同步。
+     */
+    private var asciiModeBeforePassword: Boolean? = null
+
+    private suspend fun RimeApi.applyAsciiModeForField(info: EditorInfo) {
+        if (isPasswordTextField(info)) {
+            // 进入文本密码框：首次进入时保存当前中英状态（连续两个密码框不重复保存），
+            // 然后强制英文直输。数字密码已走数字键盘，不在此处理。
+            if (asciiModeBeforePassword == null) {
+                asciiModeBeforePassword = getRuntimeOption("ascii_mode")
+            }
+            setRuntimeOption("ascii_mode", true)
+        } else {
+            // 离开密码框：恢复进入前保存的状态。
+            // 非密码框之间切换不再按偏好重设：Shift 临时切换、方案锁定（如万象锁定中文）
+            // 的状态都得以保留。
+            val saved = asciiModeBeforePassword
+            if (saved != null) {
+                asciiModeBeforePassword = null
+                setRuntimeOption("ascii_mode", saved)
+            }
+        }
+    }
+
+    override fun predict(commit: String) {
+        // 代次在分发点捕获、随 Action 带到 reduce（见 Action.Predict）：
+        // 等 reduce 执行 requestPrediction 时才取，分发与执行之间
+        // 的换框会被误读成发起时的框
+        dispatchAction(Action.Predict(commit, predictionFieldGen.get()))
+    }
+
+    private suspend fun requestPrediction(
+        commit: String,
+        learnable: Boolean = false,
+        fieldGenOverride: Long? = null,
+    ) {
+        // 隐私：密码框 / 声明 IME_FLAG_NO_PERSONALIZED_LEARNING 的输入框不读前文、不跑预测、不学搭配
+        if (isNoPersonalizedLearning(editorInfo)) {
+            lastLearnSegment = null
+            return
+        }
+        // 搭配学习（仅打字上屏路径 learnable=true 时）：与上一个打字
+        // 词段组成词对计数；本段不合规（标点等）则断链。查询键取更新
+        // 后的链尾，即刚上屏的词段。
+        val userKey: String?
+        if (learnable) {
+            val segment = TraditionalConverter.toSimplified(commit)
+            if (com.jobeen.hime.base.ngram.UserCollocationStore.isLearnableSegment(segment)) {
+                lastLearnSegment?.let { prev ->
+                    predictionManager?.learnCollocation(prev, segment)
+                }
+                lastLearnSegment = segment
+            } else {
+                lastLearnSegment = null
+            }
+            userKey = lastLearnSegment
+        } else {
+            userKey = null
+        }
+        val requestId = state.predictionRequestId.incrementAndGet()
+        state.latestPredictionRequestId.accumulateAndGet(requestId) { a, b -> maxOf(a, b) }
+        // 发起时的输入框代次随结果带回：交付时复检代次未变才落屏，
+        // 切框后到达的旧联想直接丢弃（见 PredictionReady 分支）；
+        // job 内读前文前与出结果前也按代次复检（见 job 内注释）。
+        // 经 Action.Predict 分发的预测以分发点捕获的代次为准（见
+        // Action.Predict 的 fieldGen），reduce 内直接发起的现取
+        val startFieldGen = fieldGenOverride ?: predictionFieldGen.get()
+        predictionJob?.cancel()
+        predictionJob = scope.launch {
+            try {
+                // P1-1：读开关前先把 prefsListener 标的 dirty 批量
+                // 重读掉（本批即用新开关值；连切多开关只读一次）。
+                context?.let { refreshCachedCandidateFlagsIfDirty(it) }
+                // 邮箱后缀（默认开，独立开关，不受预测开关影响）：
+                // 光标前是「邮箱名@…」时给对得上的后缀，走同一
+                // PredictionReady 通道上候选栏。放预测开关检查之前：
+                // 预测关着时邮箱后缀照常给。peek 自带代次与隐私复检
+                // （切框／密码框返回 null、整轮作废）。组字中不另设
+                // 门：组字码在 preedit 里、不在编辑器前文，正则对不
+                // 上自然落空；组字候选随后到达时会接管候选栏并取消
+                // 本 job，与普通预测路径同口径。
+                if (cachedEmailSuffixEnabled) {
+                    val emailBefore = peekTextBeforeCursor(
+                        EmailSuffixes.CONTEXT_LENGTH, expectedGen = startFieldGen,
+                    ) ?: return@launch
+                    // §4：前文无 @（半角／全角）时不可能是邮箱，跳过
+                    // 后缀匹配（typedDomain 恒返回 null），直接走下方普通预测。
+                    if ('@' in emailBefore || '＠' in emailBefore) {
+                        val emailDomains = EmailSuffixes.suggestions(emailBefore)
+                        if (emailDomains.isNotEmpty()) {
+                            val emailCandidates = emailDomains.mapIndexed { index, domain ->
+                                Candidate(index, domain, type = Candidate.TYPE_EMAIL_SUFFIX)
+                            }
+                            actions.send(Action.PredictionReady(requestId, emailCandidates, startFieldGen))
+                            return@launch
+                        }
+                    }
+                }
+                if (!cachedPredictionEnabled) {
+                    actions.send(Action.PredictionReady(requestId, emptyList(), startFieldGen))
+                    return@launch
+                }
+                // 复检一（用上下文之前）：发起后已切框（代次推进）或
+                // 当前框已变为禁学习（密码框等）时整轮作废——不在
+                // 新框上读前文、不写前文缓存。函数头的隐私闸门只覆
+                // 盖发起时刻，job 排队/执行期间的切框靠这里兜底
+                if (!isPredictionFieldCurrent(startFieldGen)) return@launch
+                // 上下文在 job 内读落屏后的真实前文：三条发起路径
+                // （打字上屏、点联想词、前端提交）都把发起点放在
+                // 本次上屏的 emitMessage/落屏之后，collector 在
+                // Main 的落屏处理排在本 job 随后投递的
+                // withContext(Main) 之前，读到的前文必然含本次词，
+                // 且就是宿主实际落屏的文本（过滤器/自动纠正改过
+                // 的结果也在内）——不在发起点拼装基底、更不在
+                // reduce 落屏前同步读（那会把一次 IPC 往返压在落
+                // 屏之前）。基底与代次同处捕获：peek 以发起代次在
+                // 真正读 IC 的主线程块内复检代次与隐私（见
+                // peekTextBeforeCursor），不过返回 null、整轮作废。
+                // 预测模型基于简体训练，先转简体再推导，以支持繁
+                // 体输入下的候选预测
+                val baseContext = peekTextBeforeCursor(20, expectedGen = startFieldGen)
+                    ?: return@launch
+                val inputContext = TraditionalConverter.toSimplified(baseContext)
+                var candidates: List<Candidate> = emptyList()
+                if (inputContext.isNotEmpty() && !TextUtil.isSymbol(inputContext.last()) && !TextUtil.isAlphabet(
+                        inputContext.last()
+                    )
+                ) {
+                    candidates = predictionManager?.makePredictions(inputContext, userKey) ?: emptyList()
+                }
+                if (cachedTraditionalChineseEnabled) {
+                    candidates = candidates.map {
+                        it.copy(
+                            text = TraditionalConverter.toTraditional(it.text),
+                            comment = it.comment.takeIf(String::isNotEmpty)
+                                ?.let(TraditionalConverter::toTraditional) ?: it.comment,
+                        )
+                    }
+                }
+                // 复检二（出结果之前）：读前文与计算期间切了框，
+                // 同样整轮作废，不把旧框联想送去交付（交付侧还有
+                // 代次门控，此处提前丢弃省掉无谓的 actions 投递）
+                if (!isPredictionFieldCurrent(startFieldGen)) return@launch
+                actions.send(Action.PredictionReady(requestId, candidates, startFieldGen))
+            } catch (error: CancellationException) {
+                throw error
+            }
+        }
+    }
+
+    /**
+     * 预测 job 的框复检：代次未变且当前输入框非禁学习。发起时点的
+     * 隐私闸门（[requestPrediction] 函数头）只覆盖发起时刻；job 在
+     * Default 线程异步执行，其间用户可能已切到密码框——读前文（写
+     * [beforeCursorCache]）与出结果前各复检一次，任一不过整轮丢弃
+     * 且不写缓存。
+     */
+    private fun isPredictionFieldCurrent(startFieldGen: Long): Boolean =
+        predictionFieldGen.get() == startFieldGen && !isNoPersonalizedLearning(editorInfo)
+
+    override fun reload() {
+        // 单部署门控：部署进行中（running）或有超时孤儿在跑时，
+        // 本次 reload 直接丢弃、不派发、不置位——此前无条件派发，
+        // Reload 作业会串行排在进行中的部署之后，待前者完成立即
+        // 执行第二份全量部署（冷编译约 20 秒量级），只浪费一次
+        // 部署窗口与一次方案表 churn。
+        // 守门与置位在同一 deployGateLock 内完成：reload 与
+        // deployAndAwait 入口的“查—置”若不串行，两个调用方可能
+        // 同时看到空闲并各置位各派发，门控形同虚设。
+        // 作用域已死（finalize 后）同样不置位不派发：派发会被悄悄
+        // 丢弃、无作业复位，标志会滞留真。
+        // 交叉闸被持有时同样丢弃（只读、不抢占）：reload 是即发即弃，
+        // 不能像 deployAndAwait 那样持闸等作业收尾；下载全程持闸，
+        // 此处若不读闸，下载中途的手动 reload 会白白多编一次旧内容
+        // （更新完成回调的 reload 本就只在非部署时发，丢弃无损失）。
+        // 换位窗口本身由 deployAndAwait 的持闸封闭；reload 的读闸到
+        // 派发之间仍剩微秒级间隙，但更新完成回调的 reload 会在换位
+        // 后重编一次，残余影响收敛到可忽略。
+        synchronized(deployGateLock) {
+            if (UpdateImportGate.isHeld) return
+            if (!deployGateAllows(
+                    EngineDeployState.isRunning(),
+                    EngineDeployState.isOrphanRunning(),
+                    scope.isActive,
+                )
+            ) return
+            // 门内抢占（D-L6 跟进）：查—置之间另一路部署作业可能已
+            // 置位，CAS 抢不到即已有部署在跑，本次 Reload 不再重复派发
+            // （丢弃不补跑，Finish 必触发方案刷新）。
+            if (!EngineDeployState.tryAcquireRunning()) return
+        }
+        // 丢弃不补跑的定论：调用方是 fire-and-forget（返回 Unit），
+        // 触发点（工具栏、方案更新/语法模型下载完成回调、FAB）均
+        // 不感知“被丢弃”；但部署结束的 Finish 必触发方案刷新（见
+        // handleEngineMessage），在途部署编的即落盘内容，补跑只多
+        // 一次全量编译、界面结果相同，故不设“部署结束后自动补跑”。
+        dispatchAction(Action.Reload)
+    }
+
+    // 部署入口守门锁：只覆盖各入口“查标志—置标志”的瞬时段，
+    // 绝不跨越作业执行或等待——锁内无挂起调用，不会堵住部署本身。
+    private val deployGateLock = Any()
+
+    // 部署等待互斥：同一时刻只允许一个 deployAndAwait 持有。
+    private val deployMutex = Mutex()
+
+    // 队列满时控制类补投的专属域（单并发，严格 FIFO，见
+    // createResendDispatcher）：与主 scope 分离，finalize 时随主 scope
+    // 一并取消——关库后的补投被取消而不抛 ClosedSendChannelException
+    // （dispatchAction 的补投无 runCatching，靠本域的 handler 兜底记日志）。
+    private val resendScope = CoroutineScope(
+        SupervisorJob() + createResendDispatcher() +
+            kotlinx.coroutines.CoroutineExceptionHandler { _, e ->
+                if (e !is CancellationException) {
+                    Timber.w(e, "Rime resend failed")
+                }
+            }
+    )
+
+    // 部署失败单发补跑（见 PendingRedeploy）：native 失败处理器与
+    // 部署作业失败路径标记，下次键盘出现时消费一次 deployAndAwait。
+    private val pendingRedeploy = PendingRedeploy()
+
+    // 本次部署作业等待的 native 成功/失败通知：部署作业在 deploy()
+    // 前创建并挂在这里，Depoly 处理器在 Success/Failure 到达时完成它；
+    // 无 waiter 的 reload/initialize 路径不挂，处理器完成调用为空操作。
+    @Volatile
+    private var pendingDeployOutcome: CompletableDeferred<Boolean>? = null
+
+    // 本轮部署的 Start/Failure 跟踪（E-S1）：initialize/Reload 合成的
+    // Finish 在此查本轮实际结果。只在 reduce 串行点读写（Depoly 分支），无需加锁。
+    private val deployRunTracker = DeployRunTracker()
+
+    /** 下次键盘出现时消费一次失败补跑：true = 本次出现应补跑一次。 */
+    fun consumePendingRedeploy(): Boolean = pendingRedeploy.consumeForRetry()
+
+    /** 补跑结束（无论成败）后解除补跑期抑制：补跑自身的失败不续订。 */
+    fun finishRedeployRetry() = pendingRedeploy.finishRetry()
+
+    /** 当前部署输入指纹：目录名＋启用镜像串＋两棵树清单；任一步读失败返回 null（按 miss 处理，绝不误跳过）。 */
+    private fun computeCurrentDeployFingerprint(ctx: Context): String? {
+        val dirName = SchemeDirs.currentDirName(ctx)
+        val mirror = ctx.getSharedPreferences(SchemaManager.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(SchemaManager.KEY_ENABLED_IDS, "") ?: ""
+        val files = collectDeployInputs(userDataDir, sharedDataDir) ?: return null
+        return computeDeployFingerprint(dirName, mirror, files)
+    }
+
+    private fun readStoredDeployFingerprint(ctx: Context): String? {
+        val dirName = SchemeDirs.currentDirName(ctx)
+        return ctx.getSharedPreferences(SchemaManager.PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(deployFingerprintKey(dirName), null)
+    }
+
+    private fun storeDeployFingerprint(ctx: Context, fingerprint: String) {
+        val dirName = SchemeDirs.currentDirName(ctx)
+        ctx.getSharedPreferences(SchemaManager.PREFS_NAME, Context.MODE_PRIVATE).edit {
+            putString(deployFingerprintKey(dirName), fingerprint)
+        }
+    }
+
+    /** 当前目录部署产物存在：staging build 目录非空；缺产物时跳过无意义（无旧表可复用）。 */
+    private fun deployProductsPresent(): Boolean {
+        val staging = File(userDataDir, "build")
+        return staging.isDirectory && (staging.listFiles()?.isNotEmpty() == true)
+    }
+
+    /**
+     * 部署输入未变时跳过部署的 deployAndAwait：指纹命中且产物存在时
+     * 不调 deploy()+join，直接发 Finish 收尾（Finish 处理器刷新方案表
+     * 与选项，与正常部署同一收尾）；其余情况直调 deployAndAwait，成功
+     * 且部署前后指纹稳定时才存新指纹（部署中输入变了则不存，下次再编）。
+     * forceFull=true 时永不跳过（切换/导入误调时的硬约束；切换/导入
+     * 本身仍直调 deployAndAwait，不走本函数）。冷启动无维护快速启动
+     * 已由 librime mtime 跳过覆盖，不在本函数处理。引擎已停时不跳过
+     * （H-1）：合成的 Finish 会把已停的引擎标为 initialized=true，
+     * 而方案表读回的 job 在就绪门即被丢；此时走 deployAndAwait
+     * （其入口先重启再部署）。
+     * 异步维护旧表打字不做（需产品决策：与部署期按键门禁矛盾——维护
+     * 中的键要么被门丢弃、要么在旧表上打，两种语义只能取其一）。
+     */
+    suspend fun deployAndAwaitIfChanged(
+        timeoutMs: Long,
+        forceFull: Boolean = false,
+    ): DeployAwaitResult {
+        if (forceFull) return deployAndAwait(timeoutMs)
+        if (isDeployWindow()) return deployAndAwait(timeoutMs)
+        val ctx = context ?: return deployAndAwait(timeoutMs)
+        val pre = withContext(Dispatchers.IO) { computeCurrentDeployFingerprint(ctx) }
+        val stored = readStoredDeployFingerprint(ctx)
+        if (shouldSkipDeploy(stored, pre, deployProductsPresent(), forceFull)) {
+            // H-1：引擎已停时跳过是错的——合成的 Finish 会把已停的
+            // 引擎标为 initialized=true、刷新方案表，而方案表读回
+            // 的 job 在就绪门即被丢、实际什么都没刷新。探到 STOPPED
+            // 即不跳过，走 deployAndAwait（其入口先重启再部署；
+            // 上次部署既已失败，本次即补跑，不算多余重编）。
+            if (restartEngineIfStopped()) return deployAndAwait(timeoutMs)
+            dispatchAction(
+                Action.RimeMessage(
+                    RimeMessage.DeployMessage(RimeMessage.DeployMessage.State.Finish)
+                )
+            )
+            return DeployAwaitResult.COMPLETED
+        }
+        val result = deployAndAwait(timeoutMs)
+        if (result == DeployAwaitResult.COMPLETED && pre != null) {
+            val post = withContext(Dispatchers.IO) { computeCurrentDeployFingerprint(ctx) }
+            if (post != null && post == pre) storeDeployFingerprint(ctx, post)
+        }
+        return result
+    }
+
+    /**
+     * 执行一次全量部署并等待其返回。
+     * - timeoutMs <= 0 时直接返回 FAILED，不启动部署。
+     * - deployMutex.tryLock() 抢不到返回 FAILED；入口守门与 reload()
+     *   共用 [deployGateAllows]：已在跑、有超时孤儿在跑、作用域已死
+     *   时均返回 FAILED。查—置段与 reload 入口共用 deployGateLock，
+     *   两路不可能同时看到空闲并各置位各派发。
+     * - 交叉闸（[UpdateImportGate]，acquireUpdateImportGate=true 时）：
+     *   在运行标志置位之前抢占并持有至部署收尾。抢占动作本身把部署
+     *   入口与更新/导入入口串行化——先抢到者胜，后到者快速失败；只
+     *   读 isHeld 不够：读到空闲与置位运行标志之间，更新仍可抢闸换
+     *   位，换位前复核到 rename 的窗口重开。导入事务内部部署传
+     *   false：事务全程已持闸，持闸部署再抢必自挡（见 runImport）。
+     *   同位置另取跨进程文件锁（B-X-1，[CrossProcessUserDataLock]）：
+     *   闸只拦本进程，文件锁拦另一进程的部署／同步；取锁失败亦
+     *   按 FAILED 返回，释放归属与闸一致（超时孤儿归作业体收尾）。
+     *   释放归属：正常完成/丢弃/作用域已死时由等待方 finally 放闸；
+     *   超时/取消时等待方只记孤儿、不放闸，作业体收尾时凭
+     *   waitingGaveUp 放闸——孤儿仍在编译，放闸会让更新换位撞上它。
+     *   凭证 CAS 使重复释放无害，丢弃回调与等待方 finally 的双放不
+     *   会误清后来的持有者。
+     * - 门内以 EngineDeployState.tryAcquireRunning() 抢占部署位
+     *   （抢不到按门禁失败返回 FAILED），标志由部署作业收尾复位
+     *   （只在作业体 finally 一处复位；complete() 只分派等待方恢复、
+     *   不内联执行等待方，故等待方醒来时状态已一致）。
+     * - H-1 自愈：门过之后、作业发出之前，先探引擎是否已停
+     *   （见 [restartEngineIfStopped]）：上次部署在 deploy() 内
+     *   抛错致 lifecycle 打回 STOPPED 时，作业在 runOnReady 即被
+     *   拒、本次部署本身也跑不起来；探到 STOPPED 即先重启（普通
+     *   启动，旧 .ocd2 可用）再发作业，瞬时失败可自愈、持续失败
+     *   每次出现都重试并可见报错，不再静默死停。
+     * - 通过 sendDeployJob 串行投递任务：deploy() -> joinMaintenanceThread() ->
+     *   等 native 成功/失败通知（上限 DEPLOY_OUTCOME_TIMEOUT_MS，超时按未知
+     *   走既有成功路径）-> 失败不合成 Finish、返回 FAILED 并记单发补跑
+     *   （下次键盘出现时补一次）；成功走孤儿对齐＋合成 Deploy Finish
+     *   （与 Reload 同一收尾）。此前 join 后无条件合成 Finish，native
+     *   维护失败也被报成成功（Failure 通知经转换后被 Depoly 处理器丢弃）。
+     * - 超时孤儿对齐（案-O5）：作业体在首次部署编完后、发 Finish 之前，
+     *   若等待方已放弃且指针目录＋镜像快照相对作业启动时变了（调用方
+     *   超时回滚：切换/导入回滚指针＋镜像，管理页回滚同目录 custom＋
+     *   镜像），说明 native 表编的是已回滚掉的目标内容——当场再跑一次
+     *   deploy() + joinMaintenanceThread()，重编当前指针目录内容，
+     *   Finish 只发一次（对齐后的那次）。快照不变时（FAB 等无回滚的
+     *   超时）不重编；快照读失败时按不变处理、走旧行为，绝不因一次
+     *   偏好读取失败把已成功的部署打成 FAILED。对齐跑在同一作业体
+     *   内：不调 deployAndAwait（入口守门会因 running 真而 FAILED，
+     *   且互斥/守门锁序不容作业内重入），不新开协程/作用域、不拿新
+     *   锁，running/orphanRunning 在对齐结束前保持真、新部署仍被
+     *   守门挡下，闸的释放仍归作业体 finally（切换路）或等待方
+     *   finally（导入路不持闸）。重选不另做：Finish 收尾（引擎内
+     *   镜像为空时回写、键盘侧按盘＋镜像刷新选首位）已覆盖选方案。
+     * - 作业在就绪门处被丢弃（引擎已 STOPPED）时丢弃回调立即完成
+     *   deferred 为 FAILED：此前 deferred 永不完成，等待方空等满
+     *   整个 timeoutMs（180–1800 秒）才返回 TIMEOUT_RUNNING 并记
+     *   孤儿，而孤儿的唯一复位点在永不执行的作业体内——门控本身
+     *   堵死了复位路径，此后每次调用都在孤儿门处直接 FAILED。
+     *   本处不另查生命周期状态：RimeSession/RimeDaemon 未向引擎
+     *   暴露当前状态，丢弃回调已覆盖 STOPPED 时的全部结果
+     *   （快失败、无孤儿、无滞留标志）；STARTING 时作业不被丢，
+     *   whenReady 会等到 READY 再执行，语义不变。
+     * - 使用 withTimeoutOrNull(timeoutMs) 等待：超时只取消等待、作业继续跑，
+     *   返回 TIMEOUT_RUNNING 并记孤儿标志；调用方取消时 CancellationException
+     *   穿透，同样记孤儿（作业收尾时复位）。例外：超时/取消时作用域
+     *   已死，说明作业已死而非在跑，不记孤儿、直接复位并返回 FAILED
+     *   （取消路径仍重抛）。
+     * - 等待方 finally 只解锁互斥，绝不提前复位标志（否则孤儿存活期
+     *   的守门与 running 指示会提前失效）——上条的作用域已死分支
+     *   是唯一例外：此时作业已死，复位不会误清在跑部署的标志。
+     * - 超时系数说明：Base 冷编译实测约 20 秒、热编译约 12 秒，
+     *   180 秒起步已有 9 倍余量，不改系数；超时是语义问题不是时限问题。
+     */
+    /**
+     * H-1 自愈探针：部署作业发出之前，探一次引擎是否已停（STOPPED）。
+     * 探针是空 runOnReady：READY 时即时返回（部署作业无影响）；
+     * STARTING/STOPPING 时等到就绪或真停（与作业体本身的等待同一
+     * 语义，不另造等待）；STOPPED 时立即抛 RimeStoppedException，
+     * 此时先走一次 [RimeDaemon.restartRime] 再发作业——重启是普通
+     * 启动（fullCheck=false，旧 .ocd2 可用），随后本次部署照常重编。
+     * 会话尚未建立（session 为 null）时不探：作业随后在消费循环的
+     * 空会话分支按丢弃处理，沿既有口径。调用方取消原样重抛，不吞
+     * 取消语义；其它异常（会话未建立等）按“未知”处理、直接发作业。
+     * 探针与重启之间无挂起：并发的他路重启若恰落进该微秒窗口，
+     * 最坏结果是一次多余的引擎弹跳（finalize＋startup），无状态错乱。
+     *
+     * @return 是否探到 STOPPED 并已发起重启。
+     */
+    private suspend fun restartEngineIfStopped(): Boolean {
+        val currentSession = session ?: return false
+        val stopped = try {
+            currentSession.runOnReady { }
+            false
+        } catch (e: RimeStoppedException) {
+            true
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            Timber.w(e, "Engine stop probe failed; proceeding without restart")
+            false
+        }
+        if (stopped) {
+            Timber.w("Engine stopped before deploy; restarting before deploy job")
+            daemon.restartRime()
+        }
+        return stopped
+    }
+
+    suspend fun deployAndAwait(
+        timeoutMs: Long,
+        acquireUpdateImportGate: Boolean = true,
+    ): DeployAwaitResult {
+        if (timeoutMs <= 0) return DeployAwaitResult.FAILED
+        if (!deployMutex.tryLock()) return DeployAwaitResult.FAILED
+        // 锁序固定：互斥 → 交叉闸 → 守门锁。更新/导入侧只抢交叉闸、
+        // 从不碰互斥，故不存在闸→互斥的反向锁序、无死锁。
+        val gateToken =
+            if (acquireUpdateImportGate) UpdateImportGate.tryAcquire() else null
+        if (acquireUpdateImportGate && gateToken == null) {
+            deployMutex.unlock()
+            return DeployAwaitResult.FAILED
+        }
+        val gateOk = synchronized(deployGateLock) {
+            var ok = deployGateAllows(
+                EngineDeployState.isRunning(),
+                EngineDeployState.isOrphanRunning(),
+                scope.isActive,
+            )
+            if (ok) {
+                // 门内抢占（D-L6 跟进）：查—置之间另一路可能已抢进，
+                // CAS 抢不到按门禁失败处理（返回 FAILED，不并发部署）。
+                ok = EngineDeployState.tryAcquireRunning()
+            }
+            ok
+        }
+        if (!gateOk) {
+            UpdateImportGate.release(gateToken)
+            deployMutex.unlock()
+            return DeployAwaitResult.FAILED
+        }
+        // 跨进程文件锁（B-X-1）：与交叉闸同进同出——闸抢到后取锁，
+        // 锁被占（忙）与取锁异常（失败）在部署口径里都落为 FAILED
+        // （既有争用口径；Busy 只在 MaintenanceResult 层区分，见
+        // 执行体）。释放归属与闸一致：超时/取消孤儿仍在跑时归作业
+        // 体收尾放，否则归等待方 finally 放（见 lockAcquired）。
+        // 导入事务内部署传 false：事务入口已持锁，此处不重取。
+        val lockAcquired = if (acquireUpdateImportGate) {
+            val lockResult = CrossProcessUserDataLock.tryAcquire(userDataDir)
+            if (lockResult != CrossProcessUserDataLock.AcquireResult.ACQUIRED) {
+                Timber.w("Deploy aborted: cross-process user data lock %s", lockResult)
+                // P0-1：部署位已在本入口抢占（tryAcquireRunning 成功），
+                // 锁失败即 return 时必须复位，否则 running 永久钉死、
+                // 后续部署永久 FAILED（只能强杀）。此处认领机制尚未
+                // 建立、orphan 仍为 false，单次直接释放不双放。
+                EngineDeployState.releaseRunning()
+                UpdateImportGate.release(gateToken)
+                deployMutex.unlock()
+                return DeployAwaitResult.FAILED
+            }
+            true
+        } else {
+            false
+        }
+        // 等待方是否已放弃等待（超时/取消）：放弃后作业仍在跑，
+        // 放闸归作业体收尾；未放弃时放闸归等待方 finally。
+        val waitingGaveUp = java.util.concurrent.atomic.AtomicBoolean(false)
+        // 孤儿对齐快照读点（案-O5）：指针目录名＋镜像原始串。快照
+        // 在作业体内 deploy() 之前现读（最贴近 startRime 读 userDataDir
+        // 的时点），而非入口处取值——入口到作业执行之间指针仍可能被
+        // 换位。读失败返回 null，判定函数按“不变”处理（见下）。
+        val readDeployTarget: () -> OrphanDeployTarget? = {
+            runCatching {
+                val ctx = context ?: return@runCatching null
+                OrphanDeployTarget(
+                    dir = SchemeDirs.currentDirName(ctx),
+                    mirror = ctx.getSharedPreferences(
+                        SchemaManager.PREFS_NAME, Context.MODE_PRIVATE
+                    ).getString(SchemaManager.KEY_ENABLED_IDS, "") ?: "",
+                )
+            }.getOrNull()
+        }
+        // I-L1：部署标志的单次释放权——作业体 finally、onDropped、
+        // 等待方（作用域已死／超时／取消）三方共用同一认领，任一方
+        // 认领后其余方跳过；releaseRunning／releaseOrphanRunning 是
+        // 普通置位，多放一次之间另一路抢到部署位会被误删。
+        val releaseClaimed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val releaseDeployFlagsOnce: () -> Unit = {
+            if (claimDeployReleaseOnce(releaseClaimed)) {
+                EngineDeployState.releaseRunning()
+                EngineDeployState.releaseOrphanRunning()
+            }
+        }
+        // 作用域死亡信号快照（finalize 完成它）：等待方据此立即
+        // FAILED，不等作业体 native 收尾（见 awaitDeployOutcome）。
+        val deathSignal = scopeDeathSignal
+        try {
+            // H-1 自愈：门已过、作业未发之前，先探一次引擎是否已停
+            // （上次部署在 deploy() 内抛错、lifecycle 打回 STOPPED 后，
+            // 作业在 runOnReady 即被拒，本次部署本身也跑不起来——正是
+            // H-1“连下一次部署也被拒”的死锁）。探到 STOPPED 即先重启
+            // 再发作业；重启走 fullCheck=false 的普通启动（旧 .ocd2
+            // 可用，不因一本繁简词典损坏整机无键盘），随后本次部署照
+            // 常重编。探针是空 runOnReady：READY 时即时返回、STARTING
+            // 时等到就绪（与作业体本身的等待同一语义）、STOPPED 时立
+            // 即抛 RimeStoppedException；调用方取消原样重抛。
+            // 本调用必须在 try 内：之前在 try 外，取消／异常会泄漏
+            // 已持有的互斥／交叉闸／部署位／跨进程锁（与 P0-1 不同路）；
+            // 移进 try 后由下方的 catch／finally 统一释放。
+            restartEngineIfStopped()
+            val deferred = CompletableDeferred<DeployAwaitResult>()
+            sendDeployJob(
+                block = {
+                    try {
+                        // 作业取消只记失败、不重抛杀消费循环（原实现重抛，
+                        // 循环若不捕获则整个 jobs 队列陪葬；记 FAILED 已足够诚实）。
+                        val result = try {
+                            val targetBefore = readDeployTarget()
+                            // native 结果挂钩：deploy() 前挂好，Success/
+                            // Failure 通知到达时 Depoly 处理器完成它；
+                            // join 返回前通知已入队，等待只是跨分发线程
+                            // 的毫秒级异步，超时按未知处理（走既有成功路径）。
+                            val outcomeDeferred = CompletableDeferred<Boolean>()
+                            pendingDeployOutcome = outcomeDeferred
+                            deploy()
+                            joinMaintenanceThread()
+                            val nativeOutcome = withTimeoutOrNull(DEPLOY_OUTCOME_TIMEOUT_MS) {
+                                outcomeDeferred.await()
+                            }
+                            if (nativeOutcome == false) {
+                                // native 维护失败：不合成 Finish（原失败路径
+                                // 同口径：initialized 保持 Start 置的 false，
+                                // 不刷新方案表），返回 FAILED；补跑标记已由
+                                // Failure 处理器记下，此处幂等再记一次。
+                                Timber.w("Deploy failed natively; no Finish synthesized")
+                                pendingRedeploy.markFailed()
+                                DeployAwaitResult.FAILED
+                            } else {
+                                // 孤儿对齐（案-O5）：等待方已放弃（超时/取消
+                                // 分支已置 waitingGaveUp，置位发生在调用方
+                                // 回滚之前）且尾快照变了，才重编当前指针
+                                // 目录；否则 native 表即当前目标，不多编
+                                // 一次。重编失败走与首编相同的 FAILED 映
+                                // 射、不发 Finish（原失败路径同口径）。
+                                if (orphanDeployNeedsRealign(
+                                        waitingGaveUp.get(), targetBefore, readDeployTarget()
+                                    )
+                                ) {
+                                    Timber.w(
+                                        "Orphan deploy target changed during wait; " +
+                                            "redeploying current dir to realign native schemas"
+                                    )
+                                    deploy()
+                                    joinMaintenanceThread()
+                                }
+                                // 与部署结果通知同一投递口径（E-M2，见 initialize 作业）。
+                                dispatchAction(
+                                    Action.RimeMessage(
+                                        RimeMessage.DeployMessage(RimeMessage.DeployMessage.State.Finish)
+                                    )
+                                )
+                                DeployAwaitResult.COMPLETED
+                            }
+                        } catch (e: CancellationException) {
+                            // 作业执行失败（非入口守门失败）：与 native 失败
+                            // 同口径记单发补跑；作用域已死时标记随引擎实例
+                            // 销毁而失效，不产生跨实例补跑。
+                            pendingRedeploy.markFailed()
+                            DeployAwaitResult.FAILED
+                        } catch (e: Exception) {
+                            pendingRedeploy.markFailed()
+                            DeployAwaitResult.FAILED
+                        }
+                        // 标志只在 finally 复位一处（I-L1）：此前此处先复位、
+                        // finally 再复位，两次普通置位之间另一路抢到部署位
+                        // 会被第二放误删。complete() 只把等待方的恢复分派
+                        // 到其调度器、从不内联执行等待方，故 finally 的复
+                        // 位仍先于等待方醒来时观测到的状态——“先复位再
+                        // complete”的排序保证不变，只是复位点合而为一。
+                        // 以下均为非挂起调用，作业取消也不会打断这段收尾。
+                        deferred.complete(result)
+                    } finally {
+                        // 唯一复位点：complete 前后的任何异常路径都不滞留标志。
+                        // 等待方已放弃时（超时/取消，孤儿仍在跑）由作业体放闸；
+                        // 否则放闸归等待方 finally。双放安全不靠释放本身
+                        // （releaseRunning 是普通置位、无凭证 CAS）——
+                        // 靠本作业体只在此一处释放、且消费循环的 onDropped
+                        // 只在作业体未执行时才调（QueuedJob.started 守卫），
+                        // 再加等待方共用同一认领（claimDeployReleaseOnce）：
+                        // 等待方已因作用域已死先行认领时，本处跳过、不双放。
+                        releaseDeployFlagsOnce()
+                        if (waitingGaveUp.get()) {
+                            if (lockAcquired) CrossProcessUserDataLock.release()
+                            UpdateImportGate.release(gateToken)
+                        }
+                    }
+                },
+                // 作业体被就绪门丢弃：等待方立即得 FAILED，不空等超时、
+                // 不记孤儿；两项标志复位（与作业体 finally／等待方共用
+                // 同一认领，只放一次）。孤儿复位在此是安全的：孤儿
+                // 标志的本意是“可能有部署在跑”，而被丢弃的作业已死；
+                // 即使另一路等待方此前已因超时记了孤儿，jobs 消费是
+                // 串行的，native 部署永不并发，新部署至多多一次排队
+                // 执行，远好于孤儿永久钉死（见报告契约审计）。
+                onDropped = {
+                    releaseDeployFlagsOnce()
+                    deferred.complete(DeployAwaitResult.FAILED)
+                },
+            )
+            // I-L1：等待方与部署 deferred、作用域死亡信号、超时三者
+            // 竞速——finalize 取消作用域时立即 FAILED，不等作业体
+            // native 收尾（旧口径只等 deferred，作业体卡在 rime-main
+            // 阻塞 native 调用里时等待方等满整个超时）。
+            val awaited = awaitDeployOutcome(deferred, deathSignal, timeoutMs)
+            if (awaited == null) {
+                // 结果判定走共用纯函数（单元测试覆盖）：作用域已死
+                // 时为 FAILED 且不记孤儿，见 deployWaitTimeoutResult。
+                val timeoutResult = deployWaitTimeoutResult(scope.isActive)
+                if (timeoutResult == DeployAwaitResult.FAILED) {
+                    releaseDeployFlagsOnce()
+                } else {
+                    // 记孤儿（D-L6 跟进）：CAS 抢占，已记过即 no-op。
+                    EngineDeployState.tryAcquireOrphanRunning()
+                    // 孤儿仍在编译：等待方不放闸，放闸归作业体收尾。
+                    waitingGaveUp.set(true)
+                }
+                return timeoutResult
+            }
+            // 作业体 FAILED 时等待方认领释放（作业体 finally 可能已
+            // 先认领，认领本身保证只放一次）；COMPLETED 时不认领，
+            // 释放归作业体 finally。
+            if (awaited == DeployAwaitResult.FAILED) releaseDeployFlagsOnce()
+            return awaited
+        } catch (e: CancellationException) {
+            if (!scope.isActive) {
+                releaseDeployFlagsOnce()
+            } else {
+                // 记孤儿（D-L6 跟进）：CAS 抢占，已记过即 no-op。
+                EngineDeployState.tryAcquireOrphanRunning()
+                // 与超时同理：孤儿仍在编译，放闸归作业体收尾。
+                waitingGaveUp.set(true)
+            }
+            throw e
+        } finally {
+            // 先放闸后解互斥：互斥先放会让下一路部署抢到互斥后撞上
+            // 本路尚未放的闸、白白 FAILED；放弃等待时不放（作业体放）。
+            if (!waitingGaveUp.get()) {
+                if (lockAcquired) CrossProcessUserDataLock.release()
+                UpdateImportGate.release(gateToken)
+            }
+            deployMutex.unlock()
+        }
+    }
+
+    //前端提交
+    override fun commit(text: String) {
+        dispatchAction(Action.Commit(text))
+    }
+
+    /**
+     * 成对提交（2026-10-28 截图 6 项）：经同一作业通道投递，
+     * 不直送 actions（直送会超车排队中的 native 提交，见
+     * requestCommit 的超车注释）。
+     */
+    override fun commitPair(pair: String, opener: String) {
+        dispatchAction(Action.CommitPair(pair, opener))
+    }
+
+    private fun requestCommitPair(pair: String, opener: String) {
+        // 成对不参与搭配学习、打断打字学习链，与前端提交同口径。
+        lastLearnSegment = null
+        sendJob {
+            // 直接上屏：前文缓存失效，后续预测读新鲜前文
+            invalidateBeforeCursorCache()
+            if (SymbolComposeOrder.shouldCommitSelectionFirst(getRawInput())) {
+                // 门与作业之间组字已起：退化为普通单字提交（与直接
+                // 敲开符号一致），不成对、不丢字。组字判定读本 job
+                // 执行时点的实时原始输入，不读展示串缓存（缓存由分发
+                // 队列回写，可能滞后于在途按键；见 SymbolComposeOrder）。
+                commitCurrentSelection(opener)
+                return@sendJob
+            }
+            // 回退量走侧队列（JNI 构造签名固定，消息体带不了）：
+            // 入队在 emit 之前、同一作业内；emit 抛错（消息未产生）
+            // 时回滚入队，避免污染下一条提交。
+            pendingFrontendPredictions.offerAndEmit(
+                pair, predictionFieldGen.get(),
+            ) {
+                PairCommitQueue.offer(1)
+                try {
+                    emitCommit(pair)
+                } catch (e: Exception) {
+                    PairCommitQueue.removeLast()
+                    throw e
+                }
+            }
+        }
+    }
+
+    private fun requestCommit(text: String) {
+        // 前端提交（剪贴板/常用语/语音/符号键等）不参与搭配学习，
+        // 且打断打字学习链：粘贴的文本不作为下一个打字词的搭配前文
+        lastLearnSegment = null
+        sendJob {
+            // 直接上屏：前文缓存失效，后续预测读新鲜前文
+            invalidateBeforeCursorCache()
+            if (SymbolComposeOrder.shouldCommitSelectionFirst(getRawInput())) {
+                // 组字中：选中词与 text 由 native 合成一条 Commit
+                // 落屏，其在 handleRimeMessage 的 Commit 分支按打
+                // 字上屏路径于落屏后发起预测——job 内读到的前文
+                // 已含「选中词+text」，是最终结果；此处不再另发
+                // 预测（另发一轮的上下文只能在落屏前拼装，必缺刚
+                // 上屏的组字词）。组字判定读本 job 执行时点的实时
+                // 原始输入（getRawInput），不读展示串缓存（见
+                // SymbolComposeOrder）。
+                commitCurrentSelection(text)
+                return@sendJob
+            }
+            // 经 emitCommit 走引擎消息管线而非直送 actions：上一键的
+            // native Commit 尚在管线中时直送会超车先落屏（如粘贴的
+            // 标点排到刚打的字前面）。直送标记使下游只排序与落屏、
+            // 不按打字上屏记账，与旧直送路径行为等价（见 emitCommit）。
+            // 预测不在此另发 Action：入队待发后由 handleRimeMessage
+            // 在这条直送 Commit 落屏之后认领并发起（见
+            // pendingFrontendPredictions）——旧形态在此读落屏前基
+            // 底、与 Predict 一并定格带走，基底必然缺管线中尚未落
+            // 屏的上一键上屏词。入队排在 emitCommit 之前（条目先
+            // 于消息可见，见 FrontendPredictionQueue.offerAndEmit）：
+            // 消息在 emit 返回前就已对消费者可见，认领可能抢先到
+            // 达，入队在后则认领落空、条目滞留队首；emitCommit
+            // 抛错时按令牌回滚本条目（消息不会产生、无人认领）
+            // 邮箱后缀续打（单字前端提交：符号面板、长按提交）：
+            // 列表正显示、单字对得上就字面上屏（全角点按半角），
+            // 落屏后认领重新给后缀；九宫格数字是拼音编码不续打；
+            // 对不上照常提交，随后预测复核收起列表。多字粘贴不走这里。
+            if (state.emailSuffixVisible) {
+                val normalized = EmailSuffixes.normalizeDomainChar(text)
+                if (normalized != null) {
+                    val isT9Digit = normalized[0] in '0'..'9' &&
+                        EmailSuffixes.isT9SchemaId(
+                            runCatching { currentSchema().schemaId }.getOrNull().orEmpty(),
+                        )
+                    val before = peekTextBeforeCursor(EmailSuffixes.CONTEXT_LENGTH)
+                    if (!isT9Digit && before != null &&
+                        EmailSuffixes.continues(before, normalized)
+                    ) {
+                        pendingFrontendPredictions.offerAndEmit(
+                            normalized, predictionFieldGen.get(),
+                        ) { emitCommit(normalized) }
+                        return@sendJob
+                    }
+                }
+            }
+            pendingFrontendPredictions.offerAndEmit(
+                text, predictionFieldGen.get(),
+            ) { emitCommit(text) }
+        }
+    }
+
+    override fun onInputCleared() {
+        dispatchAction(Action.InputCleared)
+    }
+}
+
+/**
+ * 部署入口的统一守门谓词：reload() 与 deployAndAwait() 共用同一判定，
+ * 两路不得再各自演化出不同的“忙”口径。
+ * - 部署进行中（running）或有超时孤儿在跑（orphanRunning）时禁新部署：
+ *   新部署只会串行排在旧部署之后，白白重编一次。
+ * - 引擎作用域已死时禁新部署：作业根本不会执行，入口置位将无复位方。
+ * 纯函数：单元测试直接覆盖真值表，引擎本体不依赖它做 Android/ native 调用。
+ */
+internal fun deployGateAllows(
+    running: Boolean,
+    orphanRunning: Boolean,
+    scopeActive: Boolean,
+): Boolean = scopeActive && !running && !orphanRunning
+
+/**
+ * 队列满时控制类补投的专属域：单并发。补投协程在多线程域上乱序起跑
+ * 时，后起跑的 send 会先进入通道发送队列、超车先起跑的；单并发域
+ * 按起跑顺序执行任务，挂起后按通道发送队列（FIFO）顺序恢复，合起来
+ * 严格 FIFO。正常深度是个位数、512/256 只是异常兜底，满队列本身
+ * 即异常态——本域只修该边界的顺序，不改正常路径。生产与测试共用本工厂。
+ */
+internal fun createResendDispatcher(): CoroutineDispatcher =
+    Dispatchers.Default.limitedParallelism(1)
+
+/** 部署作业等待 native 成功/失败通知的上限：通知在 join 返回前已入队，分发只是毫秒级异步；超时按未知处理（走既有成功路径，不把通知丢失误报为失败）。 */
+private const val DEPLOY_OUTCOME_TIMEOUT_MS = 10_000L
+
+/**
+ * 部署失败单发补跑：失败标记 → 下次键盘出现时恰好消费一次补跑；
+ * 补跑自身的失败不得续订（否则每次出现都重编），补跑结束后的新失败
+ * 仍可再次标记。两字段同锁：先标记后消费的竞态下消费清标记、
+ * 补跑期内标记被抑制，两种顺序都只补跑一次。
+ */
+internal class PendingRedeploy {
+    private val lock = Any()
+    private var pending = false
+    private var retryInProgress = false
+
+    fun markFailed() = synchronized(lock) {
+        if (!retryInProgress) pending = true
+    }
+
+    fun consumeForRetry(): Boolean = synchronized(lock) {
+        val had = pending
+        pending = false
+        if (had) retryInProgress = true
+        had
+    }
+
+    fun finishRetry() = synchronized(lock) {
+        retryInProgress = false
+    }
+}
+
+/**
+ * deployAndAwait 等待超时的结果判定：作用域已死说明部署作业已死
+ * （消费循环已取消、排队作业永不执行），此时“仍在后台继续”不成立，
+ * 返回 FAILED 而不是 TIMEOUT_RUNNING——后者会让等待方记孤儿标志，
+ * 而孤儿的唯一复位点在永不执行的作业体内，等于把孤儿钉成终态。
+ */
+internal fun deployWaitTimeoutResult(scopeActive: Boolean): DeployAwaitResult =
+    if (scopeActive) DeployAwaitResult.TIMEOUT_RUNNING else DeployAwaitResult.FAILED
+
+/**
+ * 部署等待竞速（I-L1）：等部署 deferred、引擎作用域死亡信号、超时
+ * 三者先到者。作用域已死（finalize 已调）时立即 FAILED，不等作业
+ * 体 native 收尾——作业体跑在 rime-main 单线程上，取消恢复须排在
+ * 阻塞 native 调用之后，作业体 finally 到不了等待方；超时返回 null
+ * （调用方走既有超时分支）。返回 FAILED 时调用方须经
+ * [claimDeployReleaseOnce] 只释放一次标志（作业体 finally 与
+ * onDropped 共用同一认领）。
+ */
+internal suspend fun awaitDeployOutcome(
+    deferred: Deferred<DeployAwaitResult>,
+    scopeDeath: Deferred<Unit>,
+    timeoutMs: Long,
+): DeployAwaitResult? = withTimeoutOrNull(timeoutMs) {
+    select {
+        deferred.onAwait { it }
+        scopeDeath.onAwait { DeployAwaitResult.FAILED }
+    }
+}
+
+/**
+ * 部署标志释放权的单次认领（I-L1）：同一 deployAndAwait 调用的
+ * 三方释放点（作业体 finally、onDropped、等待方的作用域已死／
+ * 超时／取消分支）共用一个认领，首次调用返回 true（调用方执行
+ * 释放），之后恒 false。releaseRunning／releaseOrphanRunning 是
+ * 普通置位，多放一次之间另一路抢到部署位会被误删，单次性不在
+ * 释放函数内、而在此认领保证。
+ */
+internal fun claimDeployReleaseOnce(
+    claimed: java.util.concurrent.atomic.AtomicBoolean,
+): Boolean = claimed.compareAndSet(false, true)
+
+/**
+ * 超时孤儿部署的目标快照：作业启动时读到的指针目录名＋镜像原始串。
+ * 镜像比原始串（不解析成列表）：回滚写镜像与快照读同一偏好键、同一
+ * 拼接格式，串相等即启用表未变；串不等即回滚（或等价改动）发生。
+ */
+internal data class OrphanDeployTarget(val dir: String, val mirror: String)
+
+/**
+ * 孤儿对齐判定（案-O5，纯函数，单元测试覆盖）：
+ * - 等待方未放弃（正常完成）时恒 false：调用方仍在等结果，指针
+ *   变动不是回滚，且多编一次会改完成语义、浪费一次全量编译。
+ * - 等待方已放弃但快照不变时 false：无回滚的超时（如 FAB 部署），
+ *   native 表即当前目标，重编纯属浪费。
+ * - 等待方已放弃且指针或镜像任一变了时 true：切换/导入回滚指针＋
+ *   镜像、管理页回滚同目录 custom＋镜像，native 表编的是已回滚掉
+ *   的内容，必须在孤儿收尾当场重编当前指针目录，不留到下次部署。
+ * - 任一快照读不到（null）时 false：无法证明回滚发生，盲目重编会
+ *   把无回滚的超时也拖进双倍编译；读失败的部署走旧行为（Finish
+ *   照发、结果 COMPLETED），残余只在快照读点本身，不扩散。
+ */
+internal fun orphanDeployNeedsRealign(
+    waitingGaveUp: Boolean,
+    before: OrphanDeployTarget?,
+    after: OrphanDeployTarget?,
+): Boolean = waitingGaveUp && before != null && after != null && before != after
+
+/**
+ * 部署轮次的成功/失败跟踪（E-S1）：native 部署以 Start 开始、
+ * Success/Failure 结束；initialize/Reload 在 join 后合成 Finish——
+ * 合成的 Finish 必须查本轮的实际结果，不能无条件报成功。
+ * - Start 打开一轮；Failure 记下本轮失败；Finish 消费一次判定。
+ * - 失败毒化本轮的全部 Finish，直到下一轮 Start 为止（I-M1，
+ *   2026-11-13 复查修正旧口径）：旧口径“失败只毒化其后的第一
+ *   个 Finish”之前提不成立——跳部署的 Reload 合成的第二个
+ *   Finish 不是“只是补发”，它跑的是完整收尾（含方案表刷新），
+ *   此时磁盘产物可能是失败部署留下的半成品；若第二个 Finish
+ *   按成功处理，引擎会被重新标为 initialized=true 并用半成品
+ *   方案表工作。毒化期内任何 Finish 都按失败处理（不置
+ *   initialized、不刷新方案表），pendingRedeploy 亦不被清除，
+ *   下次键盘出现仍补跑。下一轮 Start 到达即开新轮次，旧失败失效。
+ * - 无 Start 的 Failure 同样记在本轮（部署未及发 Start 即失败时，
+ *   下一个 Finish 仍应按失败处理）；从未部署过时失败标志为 -1，
+ *   与轮次 0 不相等，Finish 恒按成功处理。
+ * 只在 reduce 串行点调用（handleEngineMessage 的 Depoly 分支），无需加锁。
+ */
+internal class DeployRunTracker {
+    private var runId = 0L
+    private var failedRunId = -1L
+
+    fun onStart() {
+        runId++
+    }
+
+    fun onFailure() {
+        failedRunId = runId
+    }
+
+    /**
+     * 消费一次 Finish 判定：本轮明确失败时返回 true；否则返回 false。
+     * 同一失败轮次的第二次及以后的 Finish 同样返回 true（I-M1）——
+     * 判定是轮次属性，不是“一次性票据”，不再设已消费标记。
+     */
+    fun consumeFinishFailed(): Boolean {
+        return failedRunId == runId
+    }
+}
+
+/**
+ * 动作队列满时丢弃 RimeMessage 的 suppress 标志清理判定（E-L6，纯函数）：
+ * Commit 置起的 suppressNextEmptyCandidates 由随后第一帧 Candidates
+ * 消费；该帧若在队列满时被丢弃，标志须随丢弃同步清掉，否则滞留吞掉
+ * 下一帧合法空候选。只有产出 EngineMessage.Candidates 的两类
+ * （Candidate 首屏／Menu 菜单）是标志的消费对象，其余类型不触标志。
+ */
+internal fun shouldClearSuppressOnDrop(
+    messageType: RimeMessage.MessageType,
+    suppressSet: Boolean,
+): Boolean = suppressSet &&
+    (messageType == RimeMessage.MessageType.Candidate ||
+        messageType == RimeMessage.MessageType.Menu)
+
+/**
+ * finalize 时排空 jobs 通道（E-S3）：关库后残留的作业永不会被消费循环
+ * 取走，逐条调丢弃回调让等待方快速失败。单条回调抛错不得阻断其余
+ * 条目（回调契约本是不抛错，此处是纵深防御）。tryReceive 只取已入队
+ * 条目：消费循环并发取走的条目走它自己的取消路径，两边不重复。
+ */
+internal fun drainJobsOnFinalize(jobs: Channel<RimeEngine.QueuedJob>) {
+    while (true) {
+        val entry = jobs.tryReceive().getOrNull() ?: break
+        runCatching { entry.onDropped?.invoke() }
+    }
+}
+
+/**
+ * WO52 1.5：native t9PinyinList 的空格切分（与对端“按空格切分”
+ * 同口径）。空串／纯空白 → 空列表；连续空格不产生空条目。
+ */
+internal fun parseT9PinyinList(raw: String): List<String> =
+    raw.split(' ').filter { it.isNotEmpty() }
+
+/**
+ * B-P-1/P-2：native 分页帧定帧（纯函数，可单测）。
+ *
+ * - 末页：总数确切时 `(pageNo+1)×pageSize >= total`；总数未知
+ *   （total==-1，bulk 取满）时本页条数未满 bulk 上限即末页。
+ * - 下标：bulk 窗口自当前 native 页起，窗口内下标＋页内偏移
+ *   （pageNo×pageSize）才是全局下标（选词按全局下标定位，见
+ *   Selection）；第 0 页偏移为 0。
+ * @return Triple(定帧后列表, 页号, 是否末页)
+ */
+/**
+ * 生僻字补字帧（纯函数，RimeEngine.supplementedCandidates 的可测本体）：
+ * 未补时返回 null（调用方原样发出旧帧）；补字时新帧沿用入帧的页号／
+ * 末页——旧实现在此处硬编码页号 0、末页 false，翻页后的补字帧会把
+ * 面板打回首屏、末页判定也丢了（1.8）。
+ */
+internal fun supplementedCandidateFrame(
+    list: List<EngineMessage.Candidate>,
+    highlighted: Int,
+    total: Int,
+    spellings: List<String>,
+    firstRawInput: String,
+    page: Int,
+    isLastPage: Boolean,
+    isDeleted: (String) -> Boolean,
+): EngineMessage.Candidates? {
+    val outcome = RareCharPolicy.applySupplement(
+        list,
+        spellings,
+        firstRawInput,
+        enabled = true,
+        isDeleted = isDeleted,
+    )
+    if (outcome.insertedAt < 0) return null
+    return EngineMessage.Candidates(
+        outcome.list,
+        RareCharPolicy.remapHighlight(highlighted, outcome),
+        page,
+        total = RareCharPolicy.adjustedTotal(total, outcome),
+        isLastPage = isLastPage,
+    )
+}
+
+internal fun frameNativeCandidatePage(
+    candidates: List<Candidate>,
+    total: Int,
+    pageSize: Int,
+    pageNo: Int,
+    bulkLimit: Int,
+): Triple<List<Candidate>, Int, Boolean> {
+    val isLast = when {
+        total >= 0 && pageSize > 0 -> (pageNo + 1) * pageSize >= total
+        total < 0 -> candidates.size < bulkLimit
+        else -> false
+    }
+    val offset = pageNo * pageSize
+    val framed = if (offset > 0) {
+        candidates.map { it.copy(index = it.index + offset) }
+    } else {
+        candidates
+    }
+    return Triple(framed, pageNo, isLast)
+}
