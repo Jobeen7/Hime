@@ -13,12 +13,22 @@ object MergePrefs {
     const val KEY_CLIPBOARD_CHUNK_ON = "merge_clipboard_chunk_on"
     const val KEY_SCHEME = "merge_scheme"
     const val KEY_HEAVY_FEATURES = "merge_heavy_features"
+    const val KEY_FLOATING_SCALE = "merge_floating_scale"
+    const val KEY_CLIPBOARD_SYNC = "merge_clipboard_sync"
+    const val KEY_AI = "merge_ai"
+    const val KEY_BACKUP_ON = "merge_backup_on"
+    const val KEY_SCRIPT_ALLOW = "merge_script_allow"
 
     fun defaultFor(key: String): String = when (key) {
         KEY_NEIGHBOR_CORRECT -> "true"
         KEY_FUZZY_SOUND -> "true"
         KEY_CLIPBOARD_CHUNK_ON -> "false"
         KEY_SCHEME -> "wanxiang"
+        KEY_FLOATING_SCALE -> "0.72"
+        KEY_CLIPBOARD_SYNC -> "false"
+        KEY_AI -> "false"
+        KEY_BACKUP_ON -> "false"
+        KEY_SCRIPT_ALLOW -> "false"
         else -> ""
     }
 }
