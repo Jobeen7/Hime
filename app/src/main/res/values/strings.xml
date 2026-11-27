@@ -466,6 +466,16 @@
     <!-- 命令面板（WO52 9.1；副标题取对端 SETTINGS-UI.md 原文） -->
     <string name="ai_title">命令面板</string>
     <string name="row_sub_ai">管理命令面板、AI 与子模式设置</string>
+    <string name="merged_title">合并功能</string>
+    <string name="row_sub_merged">合并功能开关与状态</string>
+    <string name="merged_switches">功能开关</string>
+    <string name="merged_status">功能状态</string>
+    <string name="merged_layout">布局导入演示</string>
+    <string name="merged_layout_hint">粘贴布局文本后解析</string>
+    <string name="merged_parse_yaml">解析 YAML</string>
+    <string name="merged_parse_ini">解析 INI</string>
+    <string name="merged_empty_result">解析结果为空（未开启布局转换或文本非法）</string>
+    <string name="merged_floating">悬浮键盘尺寸</string>
     <string name="ai_providers">服务商</string>
     <string name="ai_new_provider">新服务商</string>
     <string name="ai_provider_add">新增服务商</string>

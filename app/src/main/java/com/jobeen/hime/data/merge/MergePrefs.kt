@@ -18,6 +18,12 @@ object MergePrefs {
     const val KEY_AI = "merge_ai"
     const val KEY_BACKUP_ON = "merge_backup_on"
     const val KEY_SCRIPT_ALLOW = "merge_script_allow"
+    const val KEY_HANDWRITING = "merge_handwriting"
+    const val KEY_OCR = "merge_ocr"
+    const val KEY_FLOATING_ON = "merge_floating_on"
+    const val KEY_MULTILANG = "merge_multilang"
+    const val KEY_EXTERNAL = "merge_external"
+    const val KEY_LAYOUT = "merge_layout"
 
     fun defaultFor(key: String): String = when (key) {
         KEY_NEIGHBOR_CORRECT -> "true"
@@ -29,6 +35,12 @@ object MergePrefs {
         KEY_AI -> "false"
         KEY_BACKUP_ON -> "false"
         KEY_SCRIPT_ALLOW -> "false"
+        KEY_HANDWRITING -> "false"
+        KEY_OCR -> "false"
+        KEY_FLOATING_ON -> "false"
+        KEY_MULTILANG -> "false"
+        KEY_EXTERNAL -> "false"
+        KEY_LAYOUT -> "false"
         else -> ""
     }
 }

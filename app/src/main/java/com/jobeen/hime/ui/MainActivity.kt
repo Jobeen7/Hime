@@ -20,6 +20,7 @@ import com.jobeen.hime.engine.rime.daemon.RimeSession
 import com.jobeen.hime.ImeApplication
 import com.jobeen.hime.data.manager.KeyboardManager
 import com.jobeen.hime.input.ImeInputMethodService
+import com.jobeen.hime.data.merge.MergeWiring
 import com.jobeen.hime.ui.screen.MainScreen
 
 class MainActivity : ImeActivity() {
@@ -123,6 +124,7 @@ class MainActivity : ImeActivity() {
 
     override fun onCreateBeforeContent(savedInstanceState: Bundle?) {
         requestPostNotificationsOnce()
+        MergeWiring.syncFromPrefs(this)
         // C-L-12：只在全新创建时处理 deep link——重建（旋转等，
         // savedInstanceState 非空）时 intent 里仍是旧 deep link，
         // 再跑一次会二次跳转；新 intent 照常走 onNewIntent。
@@ -219,6 +221,11 @@ class MainActivity : ImeActivity() {
             onOpenAi = {
                 startActivity(
                     Intent(this@MainActivity, AiActivity::class.java)
+                )
+            },
+            onOpenMerged = {
+                startActivity(
+                    Intent(this@MainActivity, MergedActivity::class.java)
                 )
             },
             onOpenModelSettings = {

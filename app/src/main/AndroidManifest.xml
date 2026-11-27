@@ -214,6 +214,13 @@
             android:theme="@style/Theme.Ime" />
 
         <activity
+            android:name=".ui.MergedActivity"
+            android:exported="false"
+            android:label="@string/merged_title"
+            android:launchMode="singleTop"
+            android:theme="@style/Theme.Ime" />
+
+        <activity
             android:name=".ui.WordCreationActivity"
             android:exported="false"
             android:label="@string/word_creation_title"

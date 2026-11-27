@@ -179,10 +179,10 @@ class DeepLinkRouterTest {
             "schema", "scheme_update", "rime", "candidates", "skin", "scripts",
             "keyboard", "keyboardMenu", "toolbar", "symbol_bar",
             "skin_editor", "appearance", "clipboard", "phrase",
-            "ai", "voice", "stats", "userdict", "backup", "files",
+            "ai", "merged", "voice", "stats", "userdict", "backup", "files",
             "about",
         )
-        assertEquals(21, keys.size)
+        assertEquals(22, keys.size)
         for (key in keys) {
             assertEquals(key, pageOf("hime://com.jobeen.hime/$key"))
         }
