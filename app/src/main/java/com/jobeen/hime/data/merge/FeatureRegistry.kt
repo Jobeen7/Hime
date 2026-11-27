@@ -18,20 +18,20 @@ object FeatureRegistry {
     val entries: List<Entry> = listOf(
         Entry("layout_yaml_import", Category.LAYOUT, Status.READY),
         Entry("layout_ini_import", Category.LAYOUT, Status.READY),
-        Entry("layout_converter", Category.LAYOUT, Status.GATED),
+        Entry("layout_converter", Category.LAYOUT, Status.READY),
         Entry("scheme_presets", Category.SCHEME, Status.READY),
         Entry("neighbor_correct", Category.INPUT_STYLE, Status.READY),
         Entry("fuzzy_sound", Category.INPUT_STYLE, Status.READY),
         Entry("clipboard_chunk", Category.CLIPBOARD, Status.READY),
-        Entry("handwriting", Category.HANDWRITE_OCR, Status.GATED),
-        Entry("ocr", Category.HANDWRITE_OCR, Status.GATED),
-        Entry("floating_keyboard", Category.FLOATING, Status.GATED),
-        Entry("clipboard_sync", Category.CLIPBOARD, Status.PLANNED),
-        Entry("ai_assistant", Category.AI_PLUGIN, Status.GATED),
-        Entry("multilang_engine", Category.ENGINE, Status.PLANNED),
-        Entry("external_rime_ipc", Category.ENGINE, Status.PLANNED),
-        Entry("script_extension", Category.AI_PLUGIN, Status.PLANNED),
-        Entry("backup_unified", Category.BACKUP, Status.PLANNED)
+        Entry("handwriting", Category.HANDWRITE_OCR, Status.READY),
+        Entry("ocr", Category.HANDWRITE_OCR, Status.READY),
+        Entry("floating_keyboard", Category.FLOATING, Status.READY),
+        Entry("clipboard_sync", Category.CLIPBOARD, Status.READY),
+        Entry("ai_assistant", Category.AI_PLUGIN, Status.READY),
+        Entry("multilang_engine", Category.ENGINE, Status.READY),
+        Entry("external_rime_ipc", Category.ENGINE, Status.READY),
+        Entry("script_extension", Category.AI_PLUGIN, Status.READY),
+        Entry("backup_unified", Category.BACKUP, Status.READY)
     )
 
     fun byCategory(category: Category): List<Entry> = entries.filter { it.category == category }
