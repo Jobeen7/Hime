@@ -9,10 +9,8 @@ object MergePrefs {
 
     const val KEY_NEIGHBOR_CORRECT = "merge_neighbor_correct"
     const val KEY_FUZZY_SOUND = "merge_fuzzy_sound"
-    const val KEY_LAYOUT_SOURCE = "merge_layout_source"
     const val KEY_CLIPBOARD_CHUNK_ON = "merge_clipboard_chunk_on"
     const val KEY_SCHEME = "merge_scheme"
-    const val KEY_HEAVY_FEATURES = "merge_heavy_features"
     const val KEY_FLOATING_SCALE = "merge_floating_scale"
     const val KEY_CLIPBOARD_SYNC = "merge_clipboard_sync"
     const val KEY_AI = "merge_ai"

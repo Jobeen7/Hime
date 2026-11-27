@@ -476,6 +476,8 @@
     <string name="merged_parse_ini">解析 INI</string>
     <string name="merged_empty_result">解析结果为空（未开启布局转换或文本非法）</string>
     <string name="merged_floating">悬浮键盘尺寸</string>
+    <string name="merged_selfcheck">模块自检（全部 18 个模块）</string>
+    <string name="merged_selfcheck_run">运行自检</string>
     <string name="ai_providers">服务商</string>
     <string name="ai_new_provider">新服务商</string>
     <string name="ai_provider_add">新增服务商</string>
