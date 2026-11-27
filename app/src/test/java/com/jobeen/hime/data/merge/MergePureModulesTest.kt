@@ -23,7 +23,7 @@ class MergePureModulesTest {
     @Test
     fun fuzzy_zh_to_z() {
         // zh- 归一为 z-（模糊音第一组）
-        assertEquals("zhuang", FuzzySound.normalize("zhuang"))
+        assertEquals("zuang", FuzzySound.normalize("zhuang"))
     }
 
     @Test
