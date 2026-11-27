@@ -2,6 +2,7 @@
 
 package com.jobeen.hime.ui.screen
 
+import android.content.Context
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -32,7 +33,12 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import com.jobeen.hime.R
+import com.jobeen.hime.data.merge.Assistant
+import com.jobeen.hime.data.merge.ClipboardSync
 import com.jobeen.hime.data.merge.MergeFeatureGate
+import com.jobeen.hime.data.merge.OcrResult
+import com.jobeen.hime.data.merge.ScriptExtension
+import com.jobeen.hime.data.merge.UnifiedBackup
 import com.jobeen.hime.data.merge.MergeWiring
 import com.jobeen.hime.data.merge.LayoutImport
 
@@ -48,6 +54,7 @@ fun MergedScreen(onBack: () -> Unit) {
     var gates by remember { mutableStateOf(MergeWiring.gateSnapshot(context)) }
     var layoutText by remember { mutableStateOf("") }
     var layoutResult by remember { mutableStateOf("") }
+    var checkResult by remember { mutableStateOf("") }
     val emptyResultText = stringResource(R.string.merged_empty_result)
 
     Scaffold(
@@ -126,6 +133,50 @@ fun MergedScreen(onBack: () -> Unit) {
             Text(stringResource(R.string.merged_floating))
             val size = MergeWiring.floatingSize(context, 1080, 400)
             Text("${size.first} x ${size.second}")
+            Text(stringResource(R.string.merged_selfcheck))
+            Button(
+                onClick = { checkResult = runSelfCheck(context) },
+            ) { Text(stringResource(R.string.merged_selfcheck_run)) }
+            if (checkResult.isNotEmpty()) {
+                Text(checkResult)
+            }
         }
     }
+}
+
+/** 模块自检：经 MergeWiring 逐项调用全部 18 个模块（样本输入），结果只影响设置页展示；单个模块异常不影响其余行。 */
+private fun runSelfCheck(context: Context): String {
+    val sb = StringBuilder()
+    fun line(label: String, block: () -> Any?) {
+        sb.append(label).append(": ")
+        sb.append(runCatching(block).getOrElse { "ERR:${it.javaClass.simpleName}" }).append("\n")
+    }
+    line("neighbor") { MergeWiring.neighborCorrect(context, 'g') }
+    line("fuzzy") { MergeWiring.fuzzyNormalize(context, "zhuang") }
+    line("chunk") { MergeWiring.chunkClipboard(context, "Hime ".repeat(300)).size }
+    line("scheme") { MergeWiring.currentScheme(context) }
+    line("presets") { MergeWiring.schemePresets().joinToString(",") { it.name } }
+    line("handwriting") { MergeWiring.handwritingCandidates(3, listOf(0, 1, 2, 3)) }
+    line("ocr") { MergeWiring.ocrParse("Hime input method") }
+    line("ocrFilter") {
+        MergeWiring.ocrFilter(listOf(OcrResult.Segment("line1", 0.9f), OcrResult.Segment("low", 0.1f)))
+    }
+    line("assistant") { MergeWiring.assistantPrompt(Assistant.Intent.SUMMARIZE, "demo context").take(40) }
+    line("multilang") { MergeWiring.multilangRoute("hello") }
+    line("external") { MergeWiring.externalDecode(MergeWiring.externalEncode("Hime")) }
+    line("script") { (MergeWiring.scriptValidate("demo", "1.0", listOf(ScriptExtension.Command("say", 1))) ?: "ok") }
+    line("backup") {
+        val m = MergeWiring.backupBuild(listOf(UnifiedBackup.Entry("rime.lua", 42, "deadbeef")))
+        if (m == null) "gated-off" else "verify=${MergeWiring.backupVerify(m)}"
+    }
+    line("clipsync") {
+        val d = MergeWiring.clipboardSyncDiff(
+            listOf(ClipboardSync.Entry("1", "a", 1)),
+            listOf(ClipboardSync.Entry("1", "a", 1), ClipboardSync.Entry("2", "b", 1)),
+        )
+        "add=${d.add.size}"
+    }
+    line("layout") { MergeWiring.layoutToYaml(listOf(LayoutImport.KeyDef("a", "b"))) }
+    line("floating") { MergeWiring.floatingFrame(context, 10, 10, 200, 100, 1080, 1920).toString() }
+    return sb.toString().trimEnd()
 }
