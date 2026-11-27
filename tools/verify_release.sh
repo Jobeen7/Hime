@@ -23,7 +23,9 @@ set -u
 APK="${1:?usage: verify_release.sh <apk> <versionName> <versionCode>}"
 EXPECTED_VERSION_NAME="${2:?usage: verify_release.sh <apk> <versionName> <versionCode>}"
 EXPECTED_VERSION_CODE="${3:?usage: verify_release.sh <apk> <versionName> <versionCode>}"
-EXPECTED_SIGNER_SHA256="511831cbb45c4248d15508c0ca1fe563799b31be2b45ac07b40ded6bf9a44744"
+EXPECTED_SIGNER_SHA256="3b7c73facdfe4e2c53b6dc1aafe249662d2d5fd211a65ec6d938e118eb074c5a"
+# 2026-11-28 修正：原常量 511831… 系旧 JIME 证书（仓库重写时从 JIME 残留未更新）
+# Hime 自有证书：CN=Hime, OU=Hime, O=Jobeen7, L=Shanghai, ST=Shanghai, C=CN。CI keystore 固定，包之间可覆盖升级。
 EXPECTED_RESOURCE_SHA256="4cc687077aaf66905dfe0de62b74f72a408aad612232ecc68cf7ddb4402df41a"
 # 自编 sherpa-onnx 库（关 TTS）在 APK lib/arm64-v8a 下的未压缩字节数
 EXPECTED_SHERPA_JNI=3514248
