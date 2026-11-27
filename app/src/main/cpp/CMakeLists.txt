@@ -61,6 +61,30 @@ unset(_hime_nl_patch)
 unset(_hime_nl_content)
 unset(_hime_nl_patch_result)
 
+# Hime: expose schema `kind` through the C API struct so the JNI bridge
+# can detect double-pinyin schemes (SchemaItem.kind). The field is read
+# from schema/kind at list time; levers entries carry an empty kind.
+# See patches/librime-schema-kind.patch.
+set(_hime_sk_header "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime/src/rime_api.h")
+set(_hime_sk_patch "${CMAKE_CURRENT_SOURCE_DIR}/patches/librime-schema-kind.patch")
+if(EXISTS "${_hime_sk_header}" AND EXISTS "${_hime_sk_patch}")
+  file(READ "${_hime_sk_header}" _hime_sk_content)
+  if(NOT _hime_sk_content MATCHES "char\\* kind;")
+    message(STATUS "Hime: applying vendored librime patch (schema kind field)")
+    execute_process(
+      COMMAND patch -p1 --forward --silent -i "${_hime_sk_patch}"
+      WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/deps/librime"
+      RESULT_VARIABLE _hime_sk_patch_result)
+    if(NOT _hime_sk_patch_result EQUAL 0)
+      message(FATAL_ERROR "Hime: failed to apply librime schema kind patch")
+    endif()
+  endif()
+endif()
+unset(_hime_sk_header)
+unset(_hime_sk_patch)
+unset(_hime_sk_content)
+unset(_hime_sk_patch_result)
+
 set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 
 # general options

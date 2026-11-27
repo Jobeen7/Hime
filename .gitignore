@@ -12,6 +12,7 @@ local.properties
 .kotlin/
 release.keystore
 *.jks
+!app/src/test/resources/tls/*.jks
 *.keystore
 *.p12
 *.pepk

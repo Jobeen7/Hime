@@ -1,0 +1,60 @@
+diff --git a/src/rime/lever/levers_api_impl.h b/src/rime/lever/levers_api_impl.h
+index 60263a7..5af80ae 100644
+--- a/src/rime/lever/levers_api_impl.h
++++ b/src/rime/lever/levers_api_impl.h
+@@ -110,6 +110,7 @@ static Bool rime_levers_get_available_schema_list(
+     item.name = const_cast<char*>(info.name.c_str());
+     item.layout = const_cast<char*>(info.layout.c_str());
+     item.punctuation = const_cast<char*>(info.punctuation.c_str());
++    item.kind = const_cast<char*>("");
+     item.reserved = const_cast<SchemaInfo*>(&info);
+     ++list->size;
+   }
+@@ -131,6 +132,7 @@ static Bool rime_levers_get_selected_schema_list(RimeSwitcherSettings* settings,
+     item.name = NULL;
+     item.layout = const_cast<char*>("");
+     item.punctuation = const_cast<char*>("");
++    item.kind = const_cast<char*>("");
+     item.reserved = NULL;
+     ++list->size;
+   }
+diff --git a/src/rime_api.h b/src/rime_api.h
+index 450cfc0..b281f0f 100644
+--- a/src/rime_api.h
++++ b/src/rime_api.h
+@@ -223,6 +223,7 @@ typedef struct rime_schema_list_item_t {
+   char* name;
+   char* layout;
+   char* punctuation;
++  char* kind;
+   void* reserved;
+ } RimeSchemaListItem;
+ 
+diff --git a/src/rime_api_impl.h b/src/rime_api_impl.h
+index 9eb192d..40347f6 100644
+--- a/src/rime_api_impl.h
++++ b/src/rime_api_impl.h
+@@ -627,7 +627,14 @@ RIME_DEPRECATED Bool RimeGetSchemaList(RimeSchemaList* output) {
+     strcpy(x.layout, schema.layout().c_str());
+     x.punctuation = new char[schema.punctuation().length() + 1];
+     strcpy(x.punctuation, schema.punctuation().c_str());
+-    x.reserved = NULL;
++    string kind_str;
++    if (schema.config() && schema.config()->GetString("schema/kind", &kind_str)) {
++      x.kind = new char[kind_str.length() + 1];
++      strcpy(x.kind, kind_str.c_str());
++    } else {
++      x.kind = new char[1];
++      x.kind[0] = '\0';
++    }
+     ++output->size;
+   }
+   if (output->size == 0) {
+@@ -647,6 +654,7 @@ RIME_DEPRECATED void RimeFreeSchemaList(RimeSchemaList* schema_list) {
+       delete[] schema_list->list[i].name;
+       delete[] schema_list->list[i].layout;
+       delete[] schema_list->list[i].punctuation;
++      delete[] schema_list->list[i].kind;
+     }
+     delete[] schema_list->list;
+   }
