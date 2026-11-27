@@ -15,6 +15,7 @@ import com.jobeen.hime.R
 import com.jobeen.hime.base.feedback.InputFeedbacks
 import com.jobeen.hime.data.keyboard.theme.KeyboardColors
 import com.jobeen.hime.data.manager.ClipboardManager
+import com.jobeen.hime.data.merge.MergeWiring
 import com.jobeen.hime.data.database.ClipboardGroup
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -56,6 +57,8 @@ class ClipboardView(
         // ClipboardView 是常驻 View，会随输入窗口 detach/attach；detach 时旧 scope 已取消，
         // 必须重建，否则重新挂载后剪贴板与常用语都无法再异步加载。
         viewScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+        // 合并门控随剪贴板挂载刷新；只用 applicationContext 读偏好，不持有 Activity/Service。
+        MergeWiring.syncFromPrefs(context.applicationContext)
     }
 
     override fun onDetachedFromWindow() {

@@ -28,6 +28,7 @@ import com.jobeen.hime.data.manager.KeyboardDeployTexts
 import com.jobeen.hime.data.manager.KeyboardManager
 import com.jobeen.hime.data.manager.RimeSyncPrefs
 import com.jobeen.hime.data.manager.SchemaManager
+import com.jobeen.hime.data.merge.MergeWiring
 import com.jobeen.hime.engine.EngineFactory
 import com.jobeen.hime.engine.RimeEngine
 import com.jobeen.hime.engine.IEngine
@@ -138,6 +139,7 @@ class ImeInputMethodService : InputMethodService() {
 
     override fun onCreate() {
         super.onCreate()
+        MergeWiring.syncFromPrefs(this)
         lastOrientation = resources.configuration.orientation
         // 已删除功能的残留清理：删掉旧版语音专名纠错学到的词对文件
         // （及其 tmp）；只删不建，文件不存在时为空操作，后续不再生成。

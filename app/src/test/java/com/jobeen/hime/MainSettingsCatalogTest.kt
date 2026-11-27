@@ -159,7 +159,7 @@ class MainSettingsCatalogTest {
     }
 
     @Test
-    fun catalogPages_nineteenKeysInOrder() {
+    fun catalogPages_twentyKeysInOrder() {
         // 19 键：Emoji 设置入口、按键符号页、皮肤脚本页、皮肤编辑器页、
         // LevelDB 页、皮肤库页、脚本页、Wi-Fi 传输页已删；
         // 键盘皮肤页（skin）2026-11-18 恢复（内置选择＋扫码导入）；
@@ -168,7 +168,7 @@ class MainSettingsCatalogTest {
         assertEquals(
             listOf(
                 "schema", "scheme_update", "rime", "candidates", "skin", "keyboard",
-                "keyboardMenu", "toolbar", "symbol_bar", "appearance", "clipboard", "phrase", "ai", "voice", "stats", "userdict",
+                "keyboardMenu", "toolbar", "symbol_bar", "appearance", "clipboard", "phrase", "ai", "merged", "voice", "stats", "userdict",
                 "backup", "files", "about",
             ),
             keys,

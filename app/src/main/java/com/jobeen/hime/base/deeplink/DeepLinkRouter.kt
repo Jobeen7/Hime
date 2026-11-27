@@ -72,7 +72,7 @@ object DeepLinkRouter {
         "schema", "scheme_update", "rime", "candidates", "skin", "scripts",
         "keyboard", "keyboardMenu", "toolbar", "symbol_bar",
         "skin_editor", "appearance", "clipboard", "phrase",
-        "ai", "voice", "stats", "userdict", "backup", "files",
+        "ai", "merged", "voice", "stats", "userdict", "backup", "files",
         "about",
     )
 

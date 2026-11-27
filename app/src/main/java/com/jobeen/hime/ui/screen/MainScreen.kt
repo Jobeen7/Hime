@@ -109,6 +109,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.jobeen.hime.R
 import com.jobeen.hime.base.util.TraditionalConverter
+import com.jobeen.hime.data.merge.FloatingKeyboard
+import com.jobeen.hime.data.merge.MergeWiring
 import com.jobeen.hime.ui.screen.ScreenComponent.GroupCard
 import com.jobeen.hime.ui.screen.ScreenComponent.GroupDivider
 import com.jobeen.hime.ui.screen.ScreenComponent.NavRow
@@ -145,6 +147,7 @@ fun MainScreen(
     onOpenClipboard: () -> Unit,
     onOpenPhrase: () -> Unit = {},
     onOpenAi: () -> Unit = {},
+    onOpenMerged: () -> Unit = {},
     onOpenModelSettings: () -> Unit,
     onOpenVoiceSettings: () -> Unit,
     onOpenUserDict: () -> Unit,
@@ -203,7 +206,10 @@ fun MainScreen(
     val context = LocalContext.current
     val fabPrefs = remember { context.getSharedPreferences("hime_fab", Context.MODE_PRIVATE) }
     val density = LocalDensity.current
-    val fabSizePx = with(density) { 60.dp.toPx() }
+    // 悬浮缩放接线：默认比值 1（保持 60.dp）；用户在合并功能页改缩放后按比例跟随。
+    val fabScale = remember { MergeWiring.floatingScale(context.applicationContext) }
+    val fabDp = 60.dp * (fabScale / FloatingKeyboard.SCALE_MEDIUM)
+    val fabSizePx = with(density) { (if (fabDp < 24.dp) 24.dp else fabDp).toPx() }
     val fabMarginPx = with(density) { 16.dp.toPx() }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
     var fabFrac by remember {
@@ -319,6 +325,7 @@ fun MainScreen(
         "clipboard" to onOpenClipboard,
         "phrase" to onOpenPhrase,
         "ai" to onOpenAi,
+        "merged" to onOpenMerged,
         "voice" to onOpenVoiceSettings,
         "stats" to onOpenInputStats,
         "userdict" to onOpenUserDict,
