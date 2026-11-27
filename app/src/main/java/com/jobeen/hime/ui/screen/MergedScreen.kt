@@ -48,6 +48,7 @@ fun MergedScreen(onBack: () -> Unit) {
     var gates by remember { mutableStateOf(MergeWiring.gateSnapshot(context)) }
     var layoutText by remember { mutableStateOf("") }
     var layoutResult by remember { mutableStateOf("") }
+    val emptyResultText = stringResource(R.string.merged_empty_result)
 
     Scaffold(
         topBar = {
@@ -102,7 +103,7 @@ fun MergedScreen(onBack: () -> Unit) {
                     onClick = {
                         val keys: List<LayoutImport.KeyDef> = MergeWiring.parseLayoutYaml(layoutText)
                         layoutResult = if (keys.isEmpty()) {
-                            stringResource(R.string.merged_empty_result)
+                            emptyResultText
                         } else {
                             keys.joinToString("\n") { "${it.label}: ${it.value}" }
                         }
@@ -112,7 +113,7 @@ fun MergedScreen(onBack: () -> Unit) {
                     onClick = {
                         val keys: List<LayoutImport.KeyDef> = MergeWiring.parseLayoutIni(layoutText)
                         layoutResult = if (keys.isEmpty()) {
-                            stringResource(R.string.merged_empty_result)
+                            emptyResultText
                         } else {
                             keys.joinToString("\n") { "${it.label}: ${it.value}" }
                         }
