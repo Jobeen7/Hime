@@ -18,13 +18,14 @@ object ExternalEngine {
 
     /** 编码：4 字节大端长度 + UTF-8 内容。 */
     fun encode(text: String): ByteArray {
-        val body = text.toByteArray(Charsets.UTF_8).take(maxBytesBody(text))
-        val out = ByteArray(4 + body.size)
-        out[0] = (body.size ushr 24).toByte()
-        out[1] = (body.size ushr 16).toByte()
-        out[2] = (body.size ushr 8).toByte()
-        out[3] = body.size.toByte()
-        body.copyInto(out, 4)
+        val src = text.toByteArray(Charsets.UTF_8)
+        val n = minOf(MAX_BYTES, src.size)
+        val out = ByteArray(4 + n)
+        out[0] = (n ushr 24).toByte()
+        out[1] = (n ushr 16).toByte()
+        out[2] = (n ushr 8).toByte()
+        out[3] = n.toByte()
+        System.arraycopy(src, 0, out, 4, n)
         return out
     }
 
@@ -38,7 +39,4 @@ object ExternalEngine {
         if (len < 0 || len > MAX_BYTES || 4 + len > bytes.size) return ""
         return bytes.copyOfRange(4, 4 + len).toString(Charsets.UTF_8)
     }
-
-    private fun maxBytesBody(text: String): Int =
-        minOf(MAX_BYTES, text.toByteArray(Charsets.UTF_8).size)
 }
