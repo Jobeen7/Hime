@@ -163,6 +163,14 @@ object MergeWiring {
             Assistant.buildPrompt(intent, contextText)
         }
 
+    /** 命令字面量解析（纯函数，无门控）：设置页自检调用，防止整函数被裁。 */
+    fun assistantParseIntent(command: String): String =
+        Assistant.parseIntent(command).name
+
+    /** 回复清洗（纯函数，无门控）：设置页自检调用，防止整函数被裁。 */
+    fun assistantCleanReply(reply: String): String =
+        Assistant.cleanReply(reply)
+
     fun multilangRoute(text: String): String = MergeFeatureGate.runIfEnabled(
         MergeFeatureGate.Feature.MULTILANG_ENGINE, MultilangEngine.DEFAULT_ENGINE,
     ) {
