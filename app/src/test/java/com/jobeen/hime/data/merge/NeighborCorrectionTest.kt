@@ -26,7 +26,7 @@ class NeighborCorrectionTest {
     fun correct_singleRecord_noDoublePut() {
         NeighborCorrection.clearAll()
         NeighborCorrection.recordMistake('k', 'j')
-        assertEquals(1, NeighborCorrection.learnedMappings().size + 0 + 1 - 1 + 1 - 1)
+        assertEquals(0, NeighborCorrection.learnedMappings().size)
         // learnedMappings 只含达阈值项：单次记录不出现
         assertTrue(NeighborCorrection.learnedMappings().isEmpty())
     }

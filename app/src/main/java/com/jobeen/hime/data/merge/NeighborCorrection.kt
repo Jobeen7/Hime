@@ -25,8 +25,9 @@ object NeighborCorrection {
     }
 
     fun learnedMappings(): Map<Char, Char> = counts
+        .entries
         .filter { it.value >= THRESHOLD }
-        .mapKeys { it.key.first }
+        .associate { it.key.first to it.key.second }
 
     fun clearAll() = counts.clear()
 }
