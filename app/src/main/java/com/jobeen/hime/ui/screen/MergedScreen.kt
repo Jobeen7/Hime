@@ -35,6 +35,7 @@ import androidx.compose.ui.unit.dp
 import com.jobeen.hime.R
 import com.jobeen.hime.data.merge.Assistant
 import com.jobeen.hime.data.merge.ClipboardSync
+import com.jobeen.hime.data.merge.Handwriting
 import com.jobeen.hime.data.merge.MergeFeatureGate
 import com.jobeen.hime.data.merge.OcrResult
 import com.jobeen.hime.data.merge.ScriptExtension
