@@ -22,8 +22,6 @@ class MergeWiringTest {
         assertEquals(ByteArray(0).size, MergeWiring.externalEncode("hi").size)
         assertEquals("", MergeWiring.externalDecode(ByteArray(0)))
         assertTrue(MergeWiring.parseLayoutYaml("a: b").isEmpty())
-        assertTrue(MergeWiring.handwritingNormalize(listOf(Handwriting.Point(0, 0))).isEmpty())
-        assertTrue(MergeWiring.ocrParse("line").isEmpty())
         assertFalse(MergeWiring.backupVerify(UnifiedBackup.Manifest(1, emptyList())))
         assertEquals("disabled", MergeWiring.scriptValidate("n", "1", listOf(ScriptExtension.Command("c", 0))))
         assertEquals(FloatingKeyboard.Frame(0, 0, 0, 0), MergeWiring.floatingFrame(dummyContext(), 0, 0, 10, 10, 100, 100))

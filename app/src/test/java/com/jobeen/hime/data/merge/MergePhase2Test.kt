@@ -11,39 +11,6 @@ import org.junit.Test
 class MergePhase2Test {
 
     @Test
-    fun handwriting_normalize_caps() {
-        val pts = (1..200).map { Handwriting.Point(it, it) }
-        assertTrue(Handwriting.normalize(pts).size <= 32)
-        assertTrue(Handwriting.candidates(3, listOf(1, 2)).isNotEmpty())
-    }
-
-    @Test
-    fun handwriting_empty_noCandidate() {
-        assertTrue(Handwriting.candidates(0, emptyList()).isEmpty())
-    }
-
-    @Test
-    fun ocr_parse_filtersBlank() {
-        assertEquals(2, OcrResult.parse("a\n\nb\n").size)
-        assertTrue(OcrResult.parse("").isEmpty())
-    }
-
-    @Test
-    fun ocr_buildJob_rejectsBlank() {
-        assertNull(OcrResult.buildJob("  "))
-        assertEquals("img1", OcrResult.buildJob("img1")?.imageId)
-    }
-
-    @Test
-    fun ocr_filter_respectsThreshold() {
-        val segs = listOf(
-            OcrResult.Segment("keep", 0.9f),
-            OcrResult.Segment("drop", 0.1f)
-        )
-        assertEquals(listOf("keep"), OcrResult.filter(segs))
-    }
-
-    @Test
     fun floating_clamp_keepsInside() {
         val f = FloatingKeyboard.clamp(-100, 99999, 300, 200, 400, 800)
         assertTrue(f.x >= 0 && f.y >= 0 && f.x + f.width <= 400 && f.y + f.height <= 800)
@@ -129,6 +96,6 @@ class MergePhase2Test {
 
     @Test
     fun registry_allReady() {
-        assertTrue(FeatureRegistry.readyIds().size == 16)
+        assertTrue(FeatureRegistry.readyIds().size == 14)
     }
 }

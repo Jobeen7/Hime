@@ -35,9 +35,7 @@ import androidx.compose.ui.unit.dp
 import com.jobeen.hime.R
 import com.jobeen.hime.data.merge.Assistant
 import com.jobeen.hime.data.merge.ClipboardSync
-import com.jobeen.hime.data.merge.Handwriting
 import com.jobeen.hime.data.merge.MergeFeatureGate
-import com.jobeen.hime.data.merge.OcrResult
 import com.jobeen.hime.data.merge.ScriptExtension
 import com.jobeen.hime.data.merge.UnifiedBackup
 import com.jobeen.hime.data.merge.MergeWiring
@@ -157,16 +155,6 @@ private fun runSelfCheck(context: Context): String {
     line("chunk") { MergeWiring.chunkClipboard(context, "Hime ".repeat(300)).size }
     line("scheme") { MergeWiring.currentScheme(context) }
     line("presets") { MergeWiring.schemePresets().joinToString(",") { it.name } }
-    line("handwriting") { MergeWiring.handwritingCandidates(3, listOf(0, 1, 2, 3)) }
-    line("hwNormalize") {
-        MergeWiring.handwritingNormalize(
-            listOf(Handwriting.Point(0, 0), Handwriting.Point(3, 4), Handwriting.Point(9, 2)),
-        ).size
-    }
-    line("ocr") { MergeWiring.ocrParse("Hime input method") }
-    line("ocrFilter") {
-        MergeWiring.ocrFilter(listOf(OcrResult.Segment("line1", 0.9f), OcrResult.Segment("low", 0.1f)))
-    }
     line("assistant") { MergeWiring.assistantPrompt(Assistant.Intent.SUMMARIZE, "demo context").take(40) }
     line("assistantAll") {
         listOf(
@@ -206,7 +194,6 @@ private fun runSelfCheck(context: Context): String {
             listOf(LayoutImport.KeyDef("a", "b"), LayoutImport.KeyDef("c", "d")),
         ).size
     }
-    line("ocrJob") { MergeWiring.ocrJob("img-1").toString() }
     line("features") { MergeWiring.featureEntries().size }
     line("neighborRec") {
         MergeWiring.neighborRecord(context, 'g', 'f')

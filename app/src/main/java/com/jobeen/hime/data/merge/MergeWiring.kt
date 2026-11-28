@@ -18,17 +18,9 @@ object MergeWiring {
     private fun prefs(context: Context) =
         context.applicationContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-    /** 从偏好同步全部 10 个重功能门控；进程启动与设置页打开时调用。 */
+    /** 从偏好同步全部 8 个重功能门控；进程启动与设置页打开时调用。 */
     fun syncFromPrefs(context: Context) {
         val p = prefs(context)
-        MergeFeatureGate.setEnabled(
-            MergeFeatureGate.Feature.HANDWRITING,
-            p.getBoolean(MergePrefs.KEY_HANDWRITING, false),
-        )
-        MergeFeatureGate.setEnabled(
-            MergeFeatureGate.Feature.OCR,
-            p.getBoolean(MergePrefs.KEY_OCR, false),
-        )
         MergeFeatureGate.setEnabled(
             MergeFeatureGate.Feature.FLOATING,
             p.getBoolean(MergePrefs.KEY_FLOATING_ON, false),
@@ -70,8 +62,6 @@ object MergeWiring {
     }
 
     private fun prefKeyFor(feature: MergeFeatureGate.Feature): String = when (feature) {
-        MergeFeatureGate.Feature.HANDWRITING -> MergePrefs.KEY_HANDWRITING
-        MergeFeatureGate.Feature.OCR -> MergePrefs.KEY_OCR
         MergeFeatureGate.Feature.FLOATING -> MergePrefs.KEY_FLOATING_ON
         MergeFeatureGate.Feature.CLIPBOARD_SYNC -> MergePrefs.KEY_CLIPBOARD_SYNC
         MergeFeatureGate.Feature.AI_ASSISTANT -> MergePrefs.KEY_AI
@@ -237,40 +227,6 @@ object MergeWiring {
             MergeFeatureGate.Feature.LAYOUT_CONVERT, emptyList(),
         ) {
             LayoutConvert.toDvorak(keys)
-        }
-
-    fun handwritingNormalize(points: List<Handwriting.Point>): List<Int> =
-        MergeFeatureGate.runIfEnabled(
-            MergeFeatureGate.Feature.HANDWRITING, emptyList(),
-        ) {
-            Handwriting.normalize(points)
-        }
-
-    fun handwritingCandidates(strokes: Int, dirs: List<Int>): List<String> =
-        MergeFeatureGate.runIfEnabled(
-            MergeFeatureGate.Feature.HANDWRITING, emptyList(),
-        ) {
-            Handwriting.candidates(strokes, dirs)
-        }
-
-    fun ocrJob(imageId: String, page: Int = 1): OcrResult.Job? =
-        MergeFeatureGate.runIfEnabled(
-            MergeFeatureGate.Feature.OCR, null,
-        ) {
-            OcrResult.buildJob(imageId, page)
-        }
-
-    fun ocrParse(raw: String): List<String> = MergeFeatureGate.runIfEnabled(
-        MergeFeatureGate.Feature.OCR, emptyList(),
-    ) {
-        OcrResult.parse(raw)
-    }
-
-    fun ocrFilter(segments: List<OcrResult.Segment>): List<String> =
-        MergeFeatureGate.runIfEnabled(
-            MergeFeatureGate.Feature.OCR, emptyList(),
-        ) {
-            OcrResult.filter(segments)
         }
 
     // ── 状态（设置页展示） ──
