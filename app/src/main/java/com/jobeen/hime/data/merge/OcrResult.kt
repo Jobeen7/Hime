@@ -23,11 +23,18 @@ object OcrResult {
         return Job(imageId.trim(), page.coerceIn(1, 99))
     }
 
-    /** 解析原始 OCR 文本为干净段落，非法输入返回空列表。 */
+    /** 解析原始 OCR 文本为干净段落，非法输入返回空列表；全长累计不超过 MAX_CHARS。 */
     fun parse(raw: String): List<String> {
         if (raw.isBlank()) return emptyList()
-        return raw.lines().map { it.trim() }.filter { it.isNotEmpty() }
-            .take(MAX_LINES).map { if (it.length > MAX_CHARS) it.take(MAX_CHARS) else it }
+        val lines = raw.lines().map { it.trim() }.filter { it.isNotEmpty() }.take(MAX_LINES)
+        var total = 0
+        return lines.mapNotNull { line ->
+            if (total >= MAX_CHARS) return@mapNotNull null
+            val room = (MAX_CHARS - total).coerceAtLeast(0)
+            val seg = if (line.length > room) line.take(room) else line
+            total += seg.length
+            seg
+        }
     }
 
     /** 按置信度过滤候选段，低于阈值丢弃，输出上限 64 段。 */

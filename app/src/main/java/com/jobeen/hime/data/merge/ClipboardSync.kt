@@ -18,8 +18,11 @@ object ClipboardSync {
     data class Diff(val add: List<Entry>, val removeIds: List<String>, val keep: List<Entry>)
 
     fun diff(local: List<Entry>, remote: List<Entry>): Diff {
-        val l = local.distinctBy { it.id }.take(MAX_ENTRIES).filter { it.text.length <= MAX_TEXT_LEN }
-        val r = remote.distinctBy { it.id }.take(MAX_ENTRIES).filter { it.text.length <= MAX_TEXT_LEN }
+        // 超长文本截断保留（原先整条丢弃会丢同步内容）；id 空白丢弃。
+        val l = local.distinctBy { it.id }.take(MAX_ENTRIES)
+            .filter { it.id.isNotBlank() }.map { it.copy(text = it.text.take(MAX_TEXT_LEN)) }
+        val r = remote.distinctBy { it.id }.take(MAX_ENTRIES)
+            .filter { it.id.isNotBlank() }.map { it.copy(text = it.text.take(MAX_TEXT_LEN)) }
         val lMap = l.associateBy { it.id }
         val rMap = r.associateBy { it.id }
         val add = mutableListOf<Entry>()
@@ -30,6 +33,8 @@ object ClipboardSync {
             when {
                 old == null -> add.add(e)
                 e.version > old.version -> add.add(e)
+                // 同版本但文本不同视为冲突，远端胜出（原先静默保留本地会丢更新）
+                e.version == old.version && e.text != old.text -> add.add(e)
                 else -> keep.add(old)
             }
         }

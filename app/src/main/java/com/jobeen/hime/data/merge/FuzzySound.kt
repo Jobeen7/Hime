@@ -8,12 +8,18 @@ package com.jobeen.hime.data.merge
  */
 object FuzzySound {
 
+    // 规范化目标固定（单向，避免循环）：s/z 归 z，f/h 归 h，p/b 归 b，t/d 归 d，k/g 归 g
     private val rules = mapOf(
         "zh" to "z",
         "ch" to "c",
         "sh" to "s",
+        "s" to "z",
         "l" to "n",
-        "r" to "l"
+        "r" to "l",
+        "f" to "h",
+        "k" to "g",
+        "p" to "b",
+        "t" to "d"
     )
 
     fun normalize(pinyin: String): String {

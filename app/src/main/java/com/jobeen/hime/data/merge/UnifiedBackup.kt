@@ -16,11 +16,15 @@ object UnifiedBackup {
 
     data class Manifest(val schema: Int, val entries: List<Entry>)
 
+    private fun isHex8(s: String): Boolean = s.length == 8 && s.all { it in '0'..'9' || it in 'a'..'f' || it in 'A'..'F' }
+    private fun isSafePath(s: String): Boolean =
+        s.isNotBlank() && !s.startsWith("/") && !s.contains("..") && !s.contains("\\")
+
     fun build(entries: List<Entry>): Manifest? {
-        val clean = entries.filter { it.path.isNotBlank() && it.bytes >= 0 && it.checksum.length == 8 }
-        if (clean.size != entries.size) return null
-        if (clean.size > MAX_ENTRIES) return null
-        return Manifest(SCHEMA, clean)
+        if (entries.any { !isSafePath(it.path) || it.bytes < 0 || !isHex8(it.checksum) }) return null
+        if (entries.distinctBy { it.path }.size != entries.size) return null
+        if (entries.size > MAX_ENTRIES) return null
+        return Manifest(SCHEMA, entries)
     }
 
     /** 校验清单：schema、路径、条目数全部合法才返回 true。 */
@@ -28,8 +32,7 @@ object UnifiedBackup {
         if (manifest.schema != SCHEMA) return false
         if (manifest.entries.size > MAX_ENTRIES) return false
         if (manifest.entries.isEmpty()) return false
-        return manifest.entries.all {
-            it.path.isNotBlank() && !it.path.startsWith("/") && it.bytes >= 0 && it.checksum.length == 8
-        }
+        return manifest.entries.all { isSafePath(it.path) && it.bytes >= 0 && isHex8(it.checksum) } &&
+            manifest.entries.distinctBy { it.path }.size == manifest.entries.size
     }
 }
