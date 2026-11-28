@@ -49,18 +49,18 @@ jobs:
         run: bash tools/wanxiang-builtin/build-resource.sh
 
       - name: Unit tests
-        run: ./gradlew testDebugUnitTest
+        run: ./gradlew testFullDebugUnitTest
 
       - name: Install native deps
         run: bash install-deps.sh
 
       - name: Assemble Debug
-        run: ./gradlew assembleDebug
+        run: ./gradlew assembleFullDebug
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: debug-apk-${{ github.sha }}
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/full/debug/*.apk
           if-no-files-found: warn
