@@ -4,7 +4,7 @@ import android.content.Context
 import android.text.InputType
 import android.view.inputmethod.EditorInfo
 import com.jobeen.hime.R
-import com.jobeen.hime.base.util.InputFieldPolicy
+import com.jobeen.hime.base.util.InputModeResolver
 import com.jobeen.hime.base.util.appContext
 import com.jobeen.hime.base.util.ToastUtil
 import com.jobeen.hime.data.PunctuationMode
@@ -578,14 +578,8 @@ object KeyboardStateManager {
     }
 
     fun startInput(info: EditorInfo, fieldChanged: Boolean = false) {
-        val inputClass = info.inputType and InputType.TYPE_MASK_CLASS
-        val variation = info.inputType and InputType.TYPE_MASK_VARIATION
-        // 文本类密码框自动切英文键盘（Qwerty + engine 侧强制 ascii_mode 直输）；
-        // 数字密码走数字键盘，不在此处理
-        val isPasswordText = inputClass == InputType.TYPE_CLASS_TEXT &&
-            (variation == InputType.TYPE_TEXT_VARIATION_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD ||
-                variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD)
+        // 布局决策已抽为纯函数（InputModeResolver，脱离框架可单测）；
+        // 本函数只落盘副作用，与旧内联分支逐项一致。
         // 场景强制键盘（数字/电话/密码）不被自创布局替换（B3
         // §3.3 优先级表第一行）：走直达通道；主键盘位走 switchTo 解析
         // （I-S1：直达分支同时交代类型状态——数字／电话进 numeric
@@ -595,28 +589,29 @@ object KeyboardStateManager {
         // 把密码框的 alphabetic 留成下次进程启动的首挂类型。
         // 强制名另记 forcedKeyboardName：密码框＋自定义 alphabetic
         // 绑定时类型解析目标是自创布局、仍会切走，强制名兜底重显）。
-        when {
-            inputClass == InputType.TYPE_CLASS_NUMBER ||
-                inputClass == InputType.TYPE_CLASS_PHONE -> {
+        val resolution = InputModeResolver.resolve(info.inputType, fieldChanged)
+        when (resolution.forcedLayout) {
+            InputModeResolver.ForcedLayout.NUMBER -> {
                 switchToResolvedWithType(
                     NumberKeyboard.NAME, KeyboardTypes.NUMERIC, persist = false,
                 )
                 forcedKeyboardName = NumberKeyboard.NAME
             }
-            isPasswordText -> {
+            InputModeResolver.ForcedLayout.QWERTY -> {
+                // 文本类密码框自动切英文键盘（Qwerty + engine 侧强制 ascii_mode 直输）。
                 switchToResolvedWithType(
                     QwertyKeyboard.NAME, KeyboardTypes.ALPHABETIC, persist = false,
                 )
                 forcedKeyboardName = QwertyKeyboard.NAME
             }
-            else -> {
+            InputModeResolver.ForcedLayout.NONE -> {
                 // 文本字段接管：不再是场景强制键盘。
                 forcedKeyboardName = null
                 // 新窗口复位（施工单 12）：字段身份变化时先回列表第一
                 // 个方案（含类型复位），再按当前方案切布局；数字／
                 // 密码框走直达分支，不复位。登录账号框（邮箱／人名／
                 // 网址类）与密码框一样豁免复位（WO30 §4），停在当前键盘。
-                if (fieldChanged && !InputFieldPolicy.isAccountField(info)) resetToFirstSchema()
+                if (resolution.resetToFirstSchema) resetToFirstSchema()
                 switchTo(currentSchema?.layout ?: defaultKeyboardName)
             }
         }
