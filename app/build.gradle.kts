@@ -129,7 +129,7 @@ fun readBundledWanxiangVersionForStamp(): String {
         }
     }
 
-    flavorDimensions("mode")
+    flavorDimensions += "mode"
     productFlavors {
         create("main") { dimension = "mode" }
         create("offline") { dimension = "mode" }
