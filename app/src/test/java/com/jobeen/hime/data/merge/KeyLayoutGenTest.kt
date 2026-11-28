@@ -21,10 +21,10 @@ class KeyLayoutGenTest {
         assertTrue(KeyLayoutGen.isValidPartition(g, "abcdefghijklmnopqrstuvwxyz"))
     }
     @Test fun generate_9_14_valid() {
-        assertTrue(KeyLayoutGen.isValidPartition(KeyLayoutGen.generate(9, "abcdefghijklmnopqrstuvwxyz")))
+        assertTrue(KeyLayoutGen.isValidPartition(KeyLayoutGen.generate(9, "abcdefghijklmnopqrstuvwxyz"), "abcdefghijklmnopqrstuvwxyz"))
         assertEquals(9, KeyLayoutGen.generate(9, "abcdefghijklmnopqrstuvwxyz").size)
         assertEquals(14, KeyLayoutGen.generate(14, "abcdefghijklmnopqrstuvwxyz").size)
-        assertTrue(KeyLayoutGen.isValidPartition(KeyLayoutGen.generate(14, "abcdefghijklmnopqrstuvwxyz")))
+        assertTrue(KeyLayoutGen.isValidPartition(KeyLayoutGen.generate(14, "abcdefghijklmnopqrstuvwxyz"), "abcdefghijklmnopqrstuvwxyz"))
     }
     @Test fun generate_illegalCount_empty() {
         assertTrue(KeyLayoutGen.generate(10, "abcdefghijklmnopqrstuvwxyz").isEmpty())
