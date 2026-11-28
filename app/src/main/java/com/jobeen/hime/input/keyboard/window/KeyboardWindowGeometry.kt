@@ -20,11 +20,11 @@ object KeyboardWindowGeometry {
     /** 决策：屏幕横屏或宽度超阈值 -> LANDSCAPE_FLOAT / SPLIT；单手开 -> SINGLE_HAND。 */
     fun decide(
         screenW: Int,
-        screenH: Int,
+        screenH: Int
         isLandscape: Boolean,
         singleHand: Boolean,
         splitEnabled: Boolean,
-        splitThresholdPx: Int,
+        splitThresholdPx: Int
     ): WindowMode = when {
         isLandscape -> WindowMode.LANDSCAPE_FLOAT
         splitEnabled && screenW >= splitThresholdPx -> WindowMode.SPLIT
@@ -37,18 +37,18 @@ object KeyboardWindowGeometry {
 
     /** 悬浮框：位置钳制到屏内，复用 FloatingKeyboard.clamp。 */
     fun floatingFrame(
-        x: Int, y: Int, w: Int, h: Int, screenW: Int, screenH: Int,
+        x: Int, y: Int, w: Int, h: Int, screenW: Int, screenH: Int
     ): FloatingKeyboard.Frame = FloatingKeyboard.clamp(x, y, w, h, screenW, screenH)
 
     /** 拖动平移后的钳制框。 */
     fun draggedFrame(
-        current: FloatingKeyboard.Frame, dx: Int, dy: Int, screenW: Int, screenH: Int,
+        current: FloatingKeyboard.Frame, dx: Int, dy: Int, screenW: Int, screenH: Int
     ): FloatingKeyboard.Frame =
         FloatingKeyboard.clamp(current.x + dx, current.y + dy, current.width, current.height, screenW, screenH)
 
     /** 双角缩放：按缩放系数改宽高，钳制在缩放区间内，锚点钳制进屏。 */
     fun cornerScaled(
-        frame: FloatingKeyboard.Frame, scale: Float, screenW: Int, screenH: Int,
+        frame: FloatingKeyboard.Frame, scale: Float, screenW: Int, screenH: Int
     ): FloatingKeyboard.Frame {
         val s = scale.coerceIn(0.5f, 2.0f)
         val w = (frame.width * s).toInt().coerceAtLeast(200)
@@ -77,7 +77,7 @@ object KeyboardWindowGeometry {
 
     /** 分体左右半区框：逐行拆点以总宽与间隙计算后钳制。 */
     fun splitFrames(
-        screenW: Int, screenH: Int, leftW: Int, rightW: Int, gapPx: Int, y: Int, h: Int,
+        screenW: Int, screenH: Int leftW: Int, rightW: Int, gapPx: Int, y: Int, h: Int,
     ): Pair<FloatingKeyboard.Frame, FloatingKeyboard.Frame> {
         val gap = gapPx.coerceIn(0, 200)
         val totalW = leftW + rightW + gap
