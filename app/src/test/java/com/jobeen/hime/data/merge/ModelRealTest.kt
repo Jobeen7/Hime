@@ -2,10 +2,9 @@
 package com.jobeen.hime.data.merge
 import org.junit.Assert.*
 import org.junit.Test
-import java.nio.file.Files
 class ModelRealTest {
     @Test fun registerAndLoad() {
-        val dir = Files.createTempDirectory("model-real").toFile()
+        val dir = java.io.File.createTempDir("model-real")
         try {
             ModelReal.clear()
             val f = java.io.File(dir, "hw.bin")

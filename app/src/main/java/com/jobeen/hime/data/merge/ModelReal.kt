@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.jobeen.hime.data.merge
 import java.io.File
-import java.nio.file.Files
 /** 模型文件落地：从目录注册/校验模型文件，归一化预处理（真实文件 IO）。 */
 object ModelReal {
     data class Loaded(val descriptor: ModelLoader.Descriptor, val bytes: ByteArray)
@@ -17,7 +16,7 @@ object ModelReal {
         if (!f.exists() || !f.isFile || f.length() > ModelLoader.MAX_MODEL_BYTES) return null
         val descriptor = ModelLoader.get(name) ?: return null
         return try {
-            val bytes = Files.readAllBytes(f.toPath())
+            val bytes = f.readBytes()
             if (f.length() != descriptor.bytes) null else Loaded(descriptor, bytes)
         } catch (e: Exception) { null }
     }
