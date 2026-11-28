@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Hime icon picker display names: form + color. -->
+    <string name="hime_icon_yue_wbg_teal">月 · 虹彩青</string>
+    <string name="hime_icon_yue_wbg_blue">月 · 输入法蓝</string>
+    <string name="hime_icon_yue_wbg_ruby">月 · 绯红</string>
+    <string name="hime_icon_yue_wbg_orange">月 · 烈橙</string>
+    <string name="hime_icon_yue_tile_black">月 · 黑</string>
+    <string name="hime_icon_yue_tile_blue">月 · 蓝</string>
+    <string name="hime_icon_yue_tile_cyan">月 · 青</string>
+    <string name="hime_icon_yue_tile_lightblue">月 · 浅蓝</string>
+    <string name="hime_icon_yue_tile_orange">月 · 橙</string>
+    <string name="hime_icon_yue_tile_red">月 · 红</string>
+    <string name="hime_icon_yue_tile_violet">月 · 紫</string>
+    <string name="hime_icon_yue_tile_white">月 · 白</string>
+    <string name="hime_icon_yue_tile_yellow">月 · 黄</string>
+    <string name="hime_icon_yue_tile_mint">月 · 薄荷绿</string>
+    <string name="hime_icon_feng_wbg_teal">风 · 虹彩青</string>
+    <string name="hime_icon_feng_wbg_blue">风 · 输入法蓝</string>
+    <string name="hime_icon_feng_wbg_ruby">风 · 绯红</string>
+    <string name="hime_icon_feng_wbg_orange">风 · 烈橙</string>
+    <string name="hime_icon_feng_tile_black">风 · 黑</string>
+    <string name="hime_icon_feng_tile_blue">风 · 蓝</string>
+    <string name="hime_icon_feng_tile_cyan">风 · 青</string>
+    <string name="hime_icon_feng_tile_lightblue">风 · 浅蓝</string>
+    <string name="hime_icon_feng_tile_orange">风 · 橙</string>
+    <string name="hime_icon_feng_tile_red">风 · 红</string>
+    <string name="hime_icon_feng_tile_violet">风 · 紫</string>
+    <string name="hime_icon_feng_tile_white">风 · 白</string>
+    <string name="hime_icon_feng_tile_yellow">风 · 黄</string>
+    <string name="hime_icon_feng_tile_mint">风 · 薄荷绿</string>
+    <string name="hime_icon_xiang_wbg_teal">翔 · 虹彩青</string>
+    <string name="hime_icon_xiang_wbg_blue">翔 · 输入法蓝</string>
+    <string name="hime_icon_xiang_wbg_ruby">翔 · 绯红</string>
+    <string name="hime_icon_xiang_wbg_orange">翔 · 烈橙</string>
+    <string name="hime_icon_xiang_tile_black">翔 · 黑</string>
+    <string name="hime_icon_xiang_tile_blue">翔 · 蓝</string>
+    <string name="hime_icon_xiang_tile_cyan">翔 · 青</string>
+    <string name="hime_icon_xiang_tile_lightblue">翔 · 浅蓝</string>
+    <string name="hime_icon_xiang_tile_orange">翔 · 橙</string>
+    <string name="hime_icon_xiang_tile_red">翔 · 红</string>
+    <string name="hime_icon_xiang_tile_violet">翔 · 紫</string>
+    <string name="hime_icon_xiang_tile_white">翔 · 白</string>
+    <string name="hime_icon_xiang_tile_yellow">翔 · 黄</string>
+    <string name="hime_icon_xiang_tile_mint">翔 · 薄荷绿</string>
+</resources>
