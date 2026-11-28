@@ -44,7 +44,7 @@ object BaiduBdsReader {
                 while (entry != null) {
                     if (!entry.isDirectory) {
                         val buf = ByteArrayOutputStream()
-                        buf.write(zip.readAllBytes())
+                        zip.copyTo(buf)
                         out.add(entry.name to buf.toByteArray())
                         if (out.size > 200) break
                     }
