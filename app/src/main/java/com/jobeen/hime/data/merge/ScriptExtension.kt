@@ -15,14 +15,19 @@ object ScriptExtension {
 
     data class Command(val name: String, val paramCount: Int)
 
+    private val cmdPattern = Regex("^[a-z][a-z0-9_-]{0,31}$")
+
     fun validate(name: String, version: String, commands: List<Command>): String? {
         if (name.isBlank()) return "name empty"
+        if (name.length > 64) return "name too long"
         if (version.isBlank()) return "version empty"
+        if (version.length > 32) return "version too long"
         if (commands.isEmpty()) return "commands empty"
         if (commands.size > MAX_COMMANDS) return "too many commands"
         for (c in commands) {
             if (c.name.isBlank()) return "command name empty"
             if (c.name.length > MAX_PARAM_LEN) return "command name too long"
+            if (!cmdPattern.matches(c.name)) return "bad command name"
             if (c.paramCount < 0 || c.paramCount > 8) return "bad paramCount"
         }
         return null
