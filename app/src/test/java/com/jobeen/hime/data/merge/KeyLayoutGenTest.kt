@@ -36,7 +36,7 @@ class KeyLayoutGenTest {
     }
     @Test fun splitAndMerge_preserveLetters() {
         val g18 = KeyLayoutGen.generate(18, "abcdefghijklmnopqrstuvwxyz")
-        val split = KeyLayoutGen.splitGroup(g18, 17, 1)
+        val split = KeyLayoutGen.splitGroup(g18, 0, 1)
         assertNotNull(split)
         assertEquals(19, split!!.size)
         assertTrue(KeyLayoutGen.isValidPartition(split, "abcdefghijklmnopqrstuvwxyz"))
