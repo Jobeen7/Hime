@@ -67,7 +67,7 @@ jobs:
           git diff --stat -- gradle/verification-metadata.xml || true
 
       - name: Upload verification metadata
-        uses: actions/upload-artifact@ea165891db0d67debdfb185e31808d1d0060a4a46 # v4
+        uses: actions/upload-artifact@v4
         with:
           name: verification-metadata
           path: gradle/verification-metadata.xml
@@ -97,7 +97,7 @@ jobs:
           exit 1
 
       - name: Upload R8 mapping
-        uses: actions/upload-artifact@ea165891db0d67debdfb185e31808d1d0060a4a46 # v4
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: r8-mapping-${{ github.sha }}
