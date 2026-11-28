@@ -793,6 +793,8 @@
     <string name="app_appearance_light">亮色</string>
     <string name="app_appearance_dark">暗色</string>
     <string name="app_appearance_monet">莫奈色</string>
+    <string name="launcher_icon_title">桌面图标</string>
+    <string name="launcher_icon_subtitle">切换桌面启动图标（42 个变体）</string>
     <string name="app_appearance_monet_note">莫奈色随壁纸变色（需 Android 12 及以上，低版本显示普通亮／暗色）；与皮肤颜色模式相互独立，只影响设置页。</string>
 
     <!-- 主题键盘·外观对话框（2026-11-07 按视频定稿重设计）：标题／三标签／实时预览提示。 -->

@@ -45,6 +45,7 @@ import com.jobeen.hime.ui.screen.ScreenComponent.SettingsGroup
 import com.jobeen.hime.ui.screen.ScreenComponent.SingleChoiceDialog
 import com.jobeen.hime.ui.screen.SettingsPageScaffold
 import com.jobeen.hime.ui.theme.AppAppearanceMode
+import com.jobeen.hime.ui.theme.LauncherIcon
 import java.io.ByteArrayOutputStream
 import androidx.compose.ui.unit.sp
 
@@ -57,10 +58,13 @@ import androidx.compose.ui.unit.sp
 fun AppearanceScreen(
     mode: AppAppearanceMode,
     onModeChange: (AppAppearanceMode) -> Unit,
+    launcherIcon: String,
+    onLauncherIconChange: (String) -> Unit,
     onBack: () -> Unit,
 ) {
     val context = LocalContext.current
     var showModeDialog by remember { mutableStateOf(false) }
+    var showIconDialog by remember { mutableStateOf(false) }
     // 2026-11-01 默认跟随系统：选项为跟随系统／莫奈色／亮色／暗色
     // （与枚举顺序一致；标签与 modeValues 按下标配对，增项须同序增标签）。
     val modeLabels = listOf(
@@ -189,6 +193,11 @@ fun AppearanceScreen(
                             subtitle = modeLabels[modeValues.indexOf(mode)],
                             onClick = { showModeDialog = true },
                         )
+                        NavRow(
+                            title = stringResource(R.string.launcher_icon_title),
+                            subtitle = LauncherIcon.displayName(context, launcherIcon),
+                            onClick = { showIconDialog = true },
+                        )
                     }
                     Text(
                         text = stringResource(R.string.app_appearance_monet_note),
@@ -210,6 +219,20 @@ fun AppearanceScreen(
                 showModeDialog = false
             },
             onDismiss = { showModeDialog = false },
+        )
+    }
+
+    if (showIconDialog) {
+        val iconLabels = remember { LauncherIcon.SLUGS.map { LauncherIcon.displayName(context, it) } }
+        SingleChoiceDialog(
+            title = stringResource(R.string.launcher_icon_title),
+            options = iconLabels,
+            selectedIndex = LauncherIcon.SLUGS.indexOf(launcherIcon),
+            onSelect = { index ->
+                onLauncherIconChange(LauncherIcon.SLUGS[index])
+                showIconDialog = false
+            },
+            onDismiss = { showIconDialog = false },
         )
     }
 

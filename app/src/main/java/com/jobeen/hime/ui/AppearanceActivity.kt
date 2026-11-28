@@ -12,6 +12,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import com.jobeen.hime.ui.screen.AppearanceScreen
 import com.jobeen.hime.ui.theme.AppAppearance
+import com.jobeen.hime.ui.theme.LauncherIcon
 import com.jobeen.hime.ui.theme.ImeTheme
 
 /**
@@ -26,6 +27,9 @@ class AppearanceActivity : ComponentActivity() {
             var mode by androidx.compose.runtime.remember {
                 mutableStateOf(AppAppearance.getMode(this))
             }
+            var launcherIcon by androidx.compose.runtime.remember {
+                mutableStateOf(LauncherIcon.getSelected(this))
+            }
             val systemDark = isSystemInDarkTheme()
             ImeTheme(
                 themeMode = AppAppearance.themeModeFor(mode, systemDark),
@@ -39,6 +43,11 @@ class AppearanceActivity : ComponentActivity() {
                     onModeChange = { newMode ->
                         AppAppearance.setMode(this, newMode)
                         mode = newMode
+                    },
+                    launcherIcon = launcherIcon,
+                    onLauncherIconChange = { slug ->
+                        LauncherIcon.setSelected(this, slug)
+                        launcherIcon = slug
                     },
                     onBack = { finish() },
                 )
