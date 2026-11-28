@@ -8,13 +8,13 @@
 # coroutines-test 1.9.0 的 .module——冲突仲裁会抓落选版本的元数据
 # 文件，这类登记缺口本地因缓存记录不可见、只能以远端实跑为准；
 # coroutines 与 tracing 两簇全部版本已按官方 sha1 双核补齐。
-# 已知前提：testMainDebugUnitTest 与 lint 不打包 APK、不执行 CMake 原生
+# 已知前提：testFullDebugUnitTest 与 lint 不打包 APK、不执行 CMake 原生
 # 构建，按 AGP 任务图不需要 app/src/main/cpp/deps 产物，故不跑
 # install-deps.sh。若实际运行时因 externalNativeBuild 配置期检查等
 # 原因失败，在 test 步骤前加一步：
 #   - name: Install native deps
 #     run: bash install-deps.sh
-# assembleMainRelease 已纳入（C-L-05）：release 轮覆盖 R8 混淆后 JNI 反射
+# assembleFullRelease 已纳入（C-L-05）：release 轮覆盖 R8 混淆后 JNI 反射
 # 与原生构建。签名用 CI 内现生成的临时 keystore（只验构建与 dex，
 # 不出可发包；正式签名 key 只在发布机上）；原生 deps 由 install-deps.sh
 # 拉取。verify_release.sh 只在发布机跑（它核对正式签名指纹与发布
@@ -59,7 +59,7 @@ jobs:
         run: bash tools/wanxiang-builtin/build-resource.sh
 
       - name: Unit tests
-        run: ./gradlew testMainDebugUnitTest
+        run: ./gradlew testFullDebugUnitTest
 
       - name: Lint
         run: ./gradlew lint
@@ -70,7 +70,7 @@ jobs:
       - name: Release build (R8 + native)
         run: |
           keytool -genkeypair -keystore ci-debug.keystore -storepass ci-debug -keypass ci-debug -alias ci-debug -keyalg RSA -keysize 2048 -validity 1 -dname "CN=CI" -noprompt
-          ./gradlew clean assembleMainRelease -PHIME_STORE_FILE=$PWD/ci-debug.keystore -PHIME_STORE_PASSWORD=ci-debug -PHIME_KEY_ALIAS=ci-debug -PHIME_KEY_PASSWORD=ci-debug
+          ./gradlew clean assembleFullRelease -PHIME_STORE_FILE=$PWD/ci-debug.keystore -PHIME_STORE_PASSWORD=ci-debug -PHIME_KEY_ALIAS=ci-debug -PHIME_KEY_PASSWORD=ci-debug
 
       - name: Verify Rime.handleMessage survived R8 (dex grep)
         run: |
