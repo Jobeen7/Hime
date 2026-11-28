@@ -15,7 +15,7 @@ import timber.log.Timber
 
 object ThemeStore {
     private const val THEMES_FILE = "themes.json"
-    const val MAX_CUSTOM_THEMES = 2
+    const val MAX_CUSTOM_THEMES = 20
 
     // themes.json 使用可读的关键字（长 key）与 #AARRGGBB 十六进制颜色，美化排版。
     // 只认这一种现行格式：两代旧格式（长 key+Int 颜色、紧凑短 key）的
