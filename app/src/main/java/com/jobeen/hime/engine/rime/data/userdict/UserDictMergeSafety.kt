@@ -12,7 +12,7 @@ import java.util.Locale
 import timber.log.Timber
 
 /**
- * 词库备份/合并安全流程（松烟思路自研重写，不搬松烟代码）。
+ * 词库备份/合并安全流程（自研实现） 。
  *
  * 只学“合并前备份、可恢复、整批校验、只增不减”的做法，具体实现按
  * Hime 现有链路与 librime 行为从头写：
@@ -32,7 +32,7 @@ import timber.log.Timber
  *   里报告跳过的行号——与 librime 本身的导入口径一致（vendored
  *   librime `rime/dict/tsv.cc` 的 TsvReader 遇坏行记警告后继续，
  *   不中断整批；其解析器 `rime/dict/table_db.cc` 也没有码长上限）。
- *   松烟的“整批先校验”同样只是快照身份/格式/版本这一批级检查，
+ *   整批先校验同样只是快照身份/格式/版本这一批级检查，
  *   空快照直接跳过（`RimeLearningBackup.mergeSnapshotFiles`），
  *   从不对行级问题整批拒绝。② 合并前把当前词库导出成
  *   `before-merge.json` 安全副本；③ 批内同词条去重取最大权重后
@@ -398,7 +398,7 @@ object UserDictMergeSafety {
      *   选文件/远端文件时已定归属；行内没有词典列，归属只能查到这一层。
      *
      * 口径与对端一致：librime 的 TsvReader 遇坏行记警告后继续导入
-     * （`rime/dict/tsv.cc`），松烟只做快照批级校验、空快照直接跳过，
+     * （`rime/dict/tsv.cc`），仅做快照批级校验、空快照直接跳过，
      * 对照的另一实现不做行级校验、直接交给 native 导入——各实现都不因个别坏行
      * 拒绝整批。
      */
@@ -1187,7 +1187,7 @@ object UserDictMergeSafety {
                 if (allowEmpty && validation.issues.size == 1 &&
                     validation.issues[0].code == IssueCode.EMPTY_BATCH
                 ) {
-                    // 空词典同步：无词可合不是失败（松烟同口径：空快照直接跳过）。
+                    // 空词典同步：无词可合不是失败（空快照直接跳过）。
                     Timber.i("跳过空词典合并：$batchLabel（文件里没有任何词条）")
                     heapSamples += sampleHeap("validate-after")
                     return MergeResult(0, heapSamples = heapSamples)

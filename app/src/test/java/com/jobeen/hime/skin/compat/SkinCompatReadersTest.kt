@@ -14,9 +14,9 @@ import java.util.zip.ZipOutputStream
 
 class SkinCompatReadersTest {
 
-    @Test fun trimeYamlParses() {
+    @Test fun themeYamlParses() {
         val yaml = "name: TestTheme\nbackground: bg.png\naccent: \"#FF0000\"\nkeys:\n- q: q\n- w: w\n"
-        val layout = TrimeYamlReader.parse(yaml, "t1")
+        val layout = ThemeYamlReader.parse(yaml, "t1")
         assertNotNull(layout)
         assertEquals("TestTheme", layout!!.name)
         assertEquals("bg.png", layout.style.backgroundPath)
@@ -27,14 +27,14 @@ class SkinCompatReadersTest {
         assertEquals("t1", model.layoutId)
     }
 
-    @Test fun trimeYamlBlankReturnsNull() {
-        assertNull(TrimeYamlReader.parse("  ", "t2"))
-        assertNull(TrimeYamlReader.parse("name: x\n", "t2"))
+    @Test fun themeYamlBlankReturnsNull() {
+        assertNull(ThemeYamlReader.parse("  ", "t2"))
+        assertNull(ThemeYamlReader.parse("name: x\n", "t2"))
     }
 
     @Test fun bdsListsZipEntries() {
         val bytes = makeBds()
-        val listing = BaiduBdsReader.parse(bytes, "bds1")
+        val listing = BdsSkinReader.parse(bytes, "bds1")
         assertNotNull(listing)
         assertTrue(listing!!.entries.any { it.endsWith("keys.txt") })
         assertTrue(listing.entries.any { it.endsWith(".png", true) })
@@ -42,14 +42,14 @@ class SkinCompatReadersTest {
     }
 
     @Test fun bdsEmptyReturnsNull() {
-        assertNull(BaiduBdsReader.parse(byteArrayOf(), "bds2"))
-        assertNull(BaiduBdsReader.parse(byteArrayOf(1, 2, 3), "bds2"))
+        assertNull(BdsSkinReader.parse(byteArrayOf(), "bds2"))
+        assertNull(BdsSkinReader.parse(byteArrayOf(1, 2, 3), "bds2"))
     }
 
-    @Test fun songyanJsonParses() {
+    @Test fun customJsonParses() {
         val json = """{"name":"SY","background":"b.png","rows":[{"keys":[{"label":"A","text":"a","width":2},{"label":"B","text":"b"}]}]}"""
         val tree = Json.parseToJsonElement(json) as JsonObject
-        val layout = SongyanLayoutReader.parse(tree, "sy1")
+        val layout = CustomLayoutReader.parse(tree, "sy1")
         assertNotNull(layout)
         assertEquals("SY", layout!!.name)
         assertEquals(2, layout.rows[0].size)
@@ -58,9 +58,9 @@ class SkinCompatReadersTest {
         assertEquals(2, model.keyCount)
     }
 
-    @Test fun songyanMissingRowsReturnsNull() {
+    @Test fun customMissingRowsReturnsNull() {
         val tree = Json.parseToJsonElement("""{"name":"X"}""") as JsonObject
-        assertNull(SongyanLayoutReader.parse(tree, "sy2"))
+        assertNull(CustomLayoutReader.parse(tree, "sy2"))
     }
 
     private fun makeBds(): ByteArray {

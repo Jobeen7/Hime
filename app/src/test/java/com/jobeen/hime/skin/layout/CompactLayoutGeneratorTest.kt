@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 紧凑布局自动生成（松烟 merged14/merged18 思路，自研）：
+ * 紧凑布局自动生成（紧凑布局思路，自研）：
  * 9 键为既有 T9 分组锚点；14/18 键为 QWERTY 行内相邻合并。
  */
 class CompactLayoutGeneratorTest {

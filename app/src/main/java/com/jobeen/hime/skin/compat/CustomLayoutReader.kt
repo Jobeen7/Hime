@@ -10,10 +10,10 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
 /**
- * F10 松烟 JSON 直读：解析松烟布局/外观文件（rows[].keys[]，label/text/width），
+ * F10 自定义 JSON 直读：解析布局/外观文件（rows[].keys[]，label/text/width），
  * 直接在 Hime 运行时映射为 LayoutModel 规格，选即用，不经外部转换包。
  */
-object SongyanLayoutReader {
+object CustomLayoutReader {
 
     fun parse(tree: JsonObject, layoutId: String): CompatLayout? {
         val name = (tree["name"] as? JsonPrimitive)?.contentOrNull ?: layoutId

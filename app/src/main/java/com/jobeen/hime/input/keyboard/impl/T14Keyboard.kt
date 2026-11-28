@@ -21,7 +21,7 @@ import com.jobeen.hime.input.keyboard.key.sidePannelKey
 import com.jobeen.hime.input.keyboard.key.spaceKey
 
 /**
- * 14 键紧凑拼音键盘（松烟 merged14 思路，自研）：
+ * 14 键紧凑拼音键盘（紧凑布局思路，自研）：
  * QWERTY 行内相邻键合并的 14 个字母键（qw/er/ty/ui/op/as/df/gh/
  * jk/l/zx/cv/bn/m），点按发首字母、长按发次字母，同一词库与学习词，
  * 组合消歧见 PinYinUtil.possibleCompactCombinations 与 native

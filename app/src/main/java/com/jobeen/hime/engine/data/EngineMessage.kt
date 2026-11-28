@@ -152,7 +152,7 @@ internal fun candidatesContentEqual(
 }
 
 /**
- * 候选帧代次门（松烟模型，2026-11-16 取代纯 revision 比较）：
+ * 候选帧代次门（自研模型，2026-11-16 取代纯 revision 比较）：
  * 纯状态机，不含 Android 依赖，可单测。窗口层 setCandidates 的
  * 唯一版本守卫——网格层另有自己的 CandidateGridRevisionGate，
  * 两道门各守各的入口，不互相推测。
@@ -160,7 +160,7 @@ internal fun candidatesContentEqual(
  * 为什么不用“revision 严格递增就丢弃”（.2 不能打字案的教训）：
  * 引擎重建后 requestId 从头计，新帧 revision 小于窗口已应用值；
  * 旧门把它当迟到旧帧丢掉，浮动窗网格永远等不到首帧，T9 "wo"
- * 只剩组字栏。松烟式做法是显式代次：会话边界调 [newGeneration]
+ * 只剩组字栏。自研做法是显式代次：会话边界调 [newGeneration]
  * 复位，复位后小 revision 是新代次的首帧、必须放行。
  *
  * 代次边界（调用方必须在这些点调 [newGeneration]）：
