@@ -52,7 +52,7 @@ class MergePureModulesTest {
     fun gate_disabled_returnsDefaultWithoutRunning() {
         MergeFeatureGate.clearAll()
         var ran = false
-        val v = MergeFeatureGate.runIfEnabled(MergeFeatureGate.Feature.OCR, "def") { ran = true; "real" }
+        val v = MergeFeatureGate.runIfEnabled(MergeFeatureGate.Feature.CLIPBOARD_SYNC, "def") { ran = true; "real" }
         assertEquals("def", v)
         assertFalse(ran)
     }
@@ -60,8 +60,8 @@ class MergePureModulesTest {
     @Test
     fun gate_exception_isIsolated() {
         MergeFeatureGate.clearAll()
-        MergeFeatureGate.setEnabled(MergeFeatureGate.Feature.OCR, true)
-        val v = MergeFeatureGate.runIfEnabled(MergeFeatureGate.Feature.OCR, "def") { throw RuntimeException("boom") }
+        MergeFeatureGate.setEnabled(MergeFeatureGate.Feature.CLIPBOARD_SYNC, true)
+        val v = MergeFeatureGate.runIfEnabled(MergeFeatureGate.Feature.CLIPBOARD_SYNC, "def") { throw RuntimeException("boom") }
         assertEquals("def", v)
         MergeFeatureGate.clearAll()
     }

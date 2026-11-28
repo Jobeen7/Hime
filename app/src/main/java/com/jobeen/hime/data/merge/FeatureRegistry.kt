@@ -9,7 +9,7 @@ package com.jobeen.hime.data.merge
  */
 object FeatureRegistry {
 
-    enum class Category { LAYOUT, SCHEME, INPUT_STYLE, HANDWRITE_OCR, FLOATING, CLIPBOARD, BACKUP, AI_PLUGIN, ENGINE }
+    enum class Category { LAYOUT, SCHEME, INPUT_STYLE, FLOATING, CLIPBOARD, BACKUP, AI_PLUGIN, ENGINE }
 
     enum class Status { READY, GATED, PLANNED }
 
@@ -23,8 +23,6 @@ object FeatureRegistry {
         Entry("neighbor_correct", Category.INPUT_STYLE, Status.READY),
         Entry("fuzzy_sound", Category.INPUT_STYLE, Status.READY),
         Entry("clipboard_chunk", Category.CLIPBOARD, Status.READY),
-        Entry("handwriting", Category.HANDWRITE_OCR, Status.READY),
-        Entry("ocr", Category.HANDWRITE_OCR, Status.READY),
         Entry("floating_keyboard", Category.FLOATING, Status.READY),
         Entry("clipboard_sync", Category.CLIPBOARD, Status.READY),
         Entry("ai_assistant", Category.AI_PLUGIN, Status.READY),

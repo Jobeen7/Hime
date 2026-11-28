@@ -83,21 +83,6 @@ class MergeGapRepairTest {
     }
 
     @Test
-    fun ocr_parse_overallCap() {
-        val raw = (1..100).joinToString("\n") { "l" + "x".repeat(100) }
-        val segs = OcrResult.parse(raw)
-        val total = segs.joinToString("").length
-        assertTrue(total <= OcrResult.MAX_CHARS)
-        assertTrue(segs.isNotEmpty())
-    }
-
-    @Test
-    fun handwriting_candidates_remainsRulePlaceholder() {
-        // 无真机/模型时仅规则分桶，不得宣称为真实识别通过
-        assertTrue(Handwriting.candidates(3, listOf(1, 2)).isNotEmpty())
-    }
-
-    @Test
     fun floating_and_assistant_guardsHold() {
         assertFalse(FloatingKeyboard.clamp(0, 0, 0, 0, 400, 800).width <= 0)
         assertTrue(Assistant.buildPrompt(Assistant.Intent.SUMMARIZE, "x").isNotEmpty())

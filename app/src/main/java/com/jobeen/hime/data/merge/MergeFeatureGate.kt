@@ -9,7 +9,7 @@ package com.jobeen.hime.data.merge
 object MergeFeatureGate {
 
     enum class Feature {
-        HANDWRITING, OCR, FLOATING, CLIPBOARD_SYNC, AI_ASSISTANT, MULTILANG_ENGINE,
+        FLOATING, CLIPBOARD_SYNC, AI_ASSISTANT, MULTILANG_ENGINE,
         EXTERNAL_ENGINE, SCRIPT_EXT, BACKUP, LAYOUT_CONVERT
     }
 
