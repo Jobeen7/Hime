@@ -43,7 +43,7 @@ object GlassMaterialPolicy {
         gradientBorderAlpha = if (borderOn) 0.35f else 0f,
         bottom3DPx = 3f,
         pressScale = 0.96f,
-        pressSinkPx = 1.5f,
+        pressSinkPx = 1.5f
     )
 
     /** 日夜主题轮询：跟随系统时按 isDark 取同模式下一主题；手动模式直接取指定。 */
