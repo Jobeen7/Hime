@@ -517,6 +517,9 @@ object BackupManager {
                 aiConversationsCount = aiExport.conversations.size,
                 aiMessagesCount = aiExport.messages.size,
                 inputStatsPresent = root.has("input_stats_json"),
+                clipSyncConfigPresent = root.has("prefs"),
+                voicePresetsPresent = root.has("speech_model_prefs"),
+                themesDirsPresent = root.has("themes"),
             ),
         )
         root.put("manifest", manifest.toJsonObject())
@@ -1478,6 +1481,9 @@ object BackupManager {
             aiConversationsCount = root.optJSONArray("ai_conversations")?.length() ?: 0,
             aiMessagesCount = root.optJSONArray("ai_messages")?.length() ?: 0,
             inputStatsPresent = root.has("input_stats_json"),
+            clipSyncConfigPresent = root.has("prefs"),
+            voicePresetsPresent = root.has("speech_model_prefs"),
+            themesDirsPresent = root.has("themes"),
         )
     }
 
