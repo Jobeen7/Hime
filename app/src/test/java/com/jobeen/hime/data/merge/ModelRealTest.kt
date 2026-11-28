@@ -4,7 +4,7 @@ import org.junit.Assert.*
 import org.junit.Test
 class ModelRealTest {
     @Test fun registerAndLoad() {
-        val dir = java.io.File.createTempDir("model-real")
+        val dir = java.io.File(System.getProperty("java.io.tmpdir"), "model-real-" + System.currentTimeMillis()).also { it.mkdirs() }
         try {
             ModelReal.clear()
             val f = java.io.File(dir, "hw.bin")
