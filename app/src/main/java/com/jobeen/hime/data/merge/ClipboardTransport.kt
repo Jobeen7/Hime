@@ -6,7 +6,7 @@ object ClipboardTransport {
     const val MAX_QUEUE = 32
     data class Clip(val id: String, val text: String, val atMs: Long)
     data class Decision(val accepted: Boolean, val reason: String)
-    fun fingerprint(text: String): String = BackupIo.fnv1a(text.toByteArray(Charsets.UTF_8))
+    fun fingerprint(text: String): String { var h = 2166136261u; for (b in text.toByteArray(Charsets.UTF_8)) { h = h xor (b.toInt() and 0xFF).toUInt(); h *= 16777619u }; return "%08x".format(h.toInt()) }
     fun shouldAccept(now: Long, lastAt: Long, text: String, lastText: String): Decision {
         if (text.isBlank()) return Decision(false, "blank")
         if (text.length > ClipboardSync.MAX_TEXT_LEN) return Decision(false, "too_long")
