@@ -82,7 +82,7 @@ object NeighborCorrection {
     private val VOWELS = setOf('a', 'o', 'e', 'i', 'u', 'v')
     /** 将编码切为音节：以元音为核，超长单音节截断上限 5。 */
     fun splitSyllables(code: String): List<String> {
-        val s = code.toLowerCase()
+        val s = code.lowercase()
         if (s.trim().length == 0) return emptyList()
         val out = mutableListOf<String>()
         var cur = StringBuilder()
