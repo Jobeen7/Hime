@@ -45,6 +45,7 @@ import com.jobeen.hime.ui.screen.ScreenComponent.SettingsGroup
 import com.jobeen.hime.ui.screen.ScreenComponent.SingleChoiceDialog
 import com.jobeen.hime.ui.screen.SettingsPageScaffold
 import com.jobeen.hime.ui.theme.AppAppearanceMode
+import com.jobeen.hime.ui.theme.LauncherIcon
 import java.io.ByteArrayOutputStream
 import androidx.compose.ui.unit.sp
 
@@ -61,6 +62,11 @@ fun AppearanceScreen(
 ) {
     val context = LocalContext.current
     var showModeDialog by remember { mutableStateOf(false) }
+    // 桌面图标：当前变体在组合时读一次（切换后本地刷新），无常驻逻辑。
+    var showIconDialog by remember { mutableStateOf(false) }
+    var currentIconSlug by remember {
+        mutableStateOf(LauncherIcon.getCurrentVariant(context))
+    }
     // 2026-11-01 默认跟随系统：选项为跟随系统／莫奈色／亮色／暗色
     // （与枚举顺序一致；标签与 modeValues 按下标配对，增项须同序增标签）。
     val modeLabels = listOf(
@@ -189,6 +195,11 @@ fun AppearanceScreen(
                             subtitle = modeLabels[modeValues.indexOf(mode)],
                             onClick = { showModeDialog = true },
                         )
+                        NavRow(
+                            title = stringResource(R.string.launcher_icon),
+                            subtitle = LauncherIcon.labelForSlug(currentIconSlug),
+                            onClick = { showIconDialog = true },
+                        )
                     }
                     Text(
                         text = stringResource(R.string.app_appearance_monet_note),
@@ -210,6 +221,21 @@ fun AppearanceScreen(
                 showModeDialog = false
             },
             onDismiss = { showModeDialog = false },
+        )
+    }
+
+    if (showIconDialog) {
+        SingleChoiceDialog(
+            title = stringResource(R.string.launcher_icon),
+            options = LauncherIcon.VARIANTS.map { it.label },
+            selectedIndex = LauncherIcon.indexForSlug(currentIconSlug),
+            onSelect = { index ->
+                val slug = LauncherIcon.VARIANTS[index].slug
+                LauncherIcon.setVariant(context, slug)
+                currentIconSlug = slug
+                showIconDialog = false
+            },
+            onDismiss = { showIconDialog = false },
         )
     }
 
