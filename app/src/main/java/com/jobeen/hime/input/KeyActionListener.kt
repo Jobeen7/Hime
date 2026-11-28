@@ -7,6 +7,7 @@ import android.text.InputType
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputConnection
 import com.jobeen.hime.data.manager.CandidateManager
+import com.jobeen.hime.data.merge.MergeKeyBridge
 import com.jobeen.hime.data.manager.KeyboardManager
 import com.jobeen.hime.engine.EngineFactory
 import com.jobeen.hime.engine.IEngine
@@ -46,7 +47,9 @@ class KeyActionListener(
         val dispatchStart = com.jobeen.hime.skin.perf.PerfMonitor.stageStart()
         when (action) {
             is KeyboardAction.KeySequenceAction -> {
-                engine?.processKey(service, action.asKeyEvent())
+                // 合并接线：键序先经邻近纠错+模糊音归一化再进引擎（纯函数，异常回原串）。
+                val normalized = MergeKeyBridge.normalizeSequence(service, action.sequence)
+                engine?.processKey(service, KeyEvent.SequenceEvent(normalized))
             }
 
             is KeyboardAction.KeyCodeAction -> {
