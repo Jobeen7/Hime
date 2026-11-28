@@ -14,7 +14,7 @@ object KeyLayoutGen {
     /** 将 alphabet 切分为 keyCount 组（每字母恰出现一次）。非法计数返回空。 */
     fun generate(keyCount: Int, alphabet: String): List<String> {
         if (keyCount !in SUPPORTED_COUNTS) return emptyList()
-        val lowerAlpha = alphabet.toLowerCase()
+        val lowerAlpha = alphabet.lowercase()
         val letters = StringBuilder()
         for (ch in lowerAlpha) {
             if (ch in 'a'..'z' && letters.indexOf(ch.toString()) < 0) letters.append(ch)
@@ -45,14 +45,14 @@ object KeyLayoutGen {
             if (g.length == 0) return false
             for (ch in g) if (ch !in 'a'..'z') return false
         }
-        val joined = groups.joinToString("").toLowerCase()
+        val joined = groups.joinToString("").lowercase()
         val seen = mutableSetOf<Char>()
         for (ch in joined) {
             if (seen.contains(ch)) return false
             seen.add(ch)
         }
         val expected = mutableSetOf<Char>()
-        for (ch in alphabet.toLowerCase()) expected.add(ch)
+        for (ch in alphabet.lowercase()) expected.add(ch)
         return seen == expected && joined.length == expected.size
     }
 
