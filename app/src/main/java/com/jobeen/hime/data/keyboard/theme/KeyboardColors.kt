@@ -41,6 +41,12 @@ object KeyboardColors {
         val pinner: PinnerColors,
         val toastBackground: Int = specialKeyBackground,
         val toastText: Int = keyText,
+        /** 键盘背景图资产 id（null = 无背景图，纯色 background）。 */
+        val backgroundImageAsset: String? = null,
+        /** 背景图内容模式：fill / center / fit，默认 fill。 */
+        val backgroundImageMode: String = "fill",
+        /** 玻璃拟态：半透明底 + 系统背景模糊（低版本回落半透明）。 */
+        val glassEnabled: Boolean = false,
     ) {
         @Serializable
         data class PanelColors(

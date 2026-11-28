@@ -29,6 +29,7 @@ import androidx.core.view.isGone
 import com.jobeen.hime.R
 import com.jobeen.hime.data.keyboard.theme.GlobalFonts
 import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.skin.image.SkinImageStore
 import com.jobeen.hime.skin.layout.CompactLayoutGenerator
 import com.jobeen.hime.skin.symbolbar.AppSymbolBarTypeStore
 import com.jobeen.hime.skin.symbolbar.SymbolBarConfig
@@ -180,6 +181,10 @@ class KeyboardWindowView(
 
     /** 当前窗口背景 GIF 动图（SDK≥28 时解原文件；无 GIF 时 null）。 */
     private var gifDrawable: android.graphics.drawable.AnimatedImageDrawable? = null
+
+    /** 当前已应用的背景图资产 id；解码完成前为请求中的 id，drawable 挂载后不变。 */
+    private var windowBackgroundAsset: String? = null
+    private var windowBackgroundDrawable: android.graphics.drawable.Drawable? = null
 
     /**
      * 键盘顶角（2026-10-29 外观轮全局样式）：贴底键盘只论顶角——
@@ -1298,10 +1303,64 @@ class KeyboardWindowView(
         // 解码失败回落制备位图（原有口径）；28 以下静态首帧。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) gifDrawable?.stop()
         gifDrawable = null
-        // 皮肤 v3 死壳删除后快照恒为 null，无背景位图／渐变／GIF，
-        // 恒回落主题纯色背景。
+        // 原生皮肤：玻璃（半透明底 + 系统背景模糊）与背景图（异步解码、
+        // 失败/无图回落纯色底）。背景位图只在主题刷新时请求，不进按键热路径。
+        val scheme = cachedColors
+        val glass = scheme.glassEnabled
+        val baseColor = if (glass) {
+            android.graphics.Color.argb(
+                110,
+                android.graphics.Color.red(scheme.background),
+                android.graphics.Color.green(scheme.background),
+                android.graphics.Color.blue(scheme.background),
+            )
+        } else {
+            scheme.background
+        }
+        applyGlassBlur(glass)
+        val assetId = scheme.backgroundImageAsset?.takeIf { it.isNotBlank() }
+        if (assetId == null) {
+            windowBackgroundAsset = null
+            windowBackgroundDrawable = null
+            background = null
+            setBackgroundColor(baseColor)
+            return
+        }
+        if (assetId == windowBackgroundAsset && windowBackgroundDrawable != null) {
+            background = windowBackgroundDrawable
+            return
+        }
+        windowBackgroundAsset = assetId
+        // 先铺底色，避免异步解码期间空白
         background = null
-        setBackgroundColor(cachedColors.background)
+        setBackgroundColor(baseColor)
+        val reqW = width.takeIf { it > 0 } ?: 1080
+        val reqH = height.takeIf { it > 0 } ?: 480
+        SkinImageStore.request(context, assetId, reqW, reqH) { bitmap ->
+            // 回调恒主线程；资产已变化（主题切换）时丢弃
+            if (bitmap != null && windowBackgroundAsset == assetId &&
+                cachedColors.backgroundImageAsset == assetId
+            ) {
+                val drawable = android.graphics.drawable.BitmapDrawable(resources, bitmap)
+                windowBackgroundDrawable = drawable
+                background = drawable
+            }
+        }
+    }
+
+    /**
+     * 玻璃模糊：Android 12+ 走系统窗口背景模糊（只作用窗口底，不进
+     * 按键热路径）；低版本/取不到窗口时回落半透明底色。
+     */
+    private fun applyGlassBlur(glass: Boolean) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
+        runCatching {
+            val window = (context as? android.inputmethodservice.InputMethodService)?.window
+                ?: return@runCatching
+            val attrs = window.attributes
+            attrs.blurBehindRadius = if (glass) 60 else 0
+            window.attributes = attrs
+        }
     }
 
     /** 底部安全间距生效值：皮肤 presence 指定时取皮肤值，否则全局偏好（定稿四.3）。 */
