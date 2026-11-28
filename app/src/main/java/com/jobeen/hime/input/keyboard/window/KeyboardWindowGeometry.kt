@@ -20,7 +20,7 @@ object KeyboardWindowGeometry {
     /** 决策：屏幕横屏或宽度超阈值 -> LANDSCAPE_FLOAT / SPLIT；单手开 -> SINGLE_HAND。 */
     fun decide(
         screenW: Int,
-        screenH: Int
+        screenH: Int,
         isLandscape: Boolean,
         singleHand: Boolean,
         splitEnabled: Boolean,
@@ -77,7 +77,7 @@ object KeyboardWindowGeometry {
 
     /** 分体左右半区框：逐行拆点以总宽与间隙计算后钳制。 */
     fun splitFrames(
-        screenW: Int, screenH: Int leftW: Int, rightW: Int, gapPx: Int, y: Int, h: Int,
+        screenW: Int, screenH: Int, leftW: Int, rightW: Int, gapPx: Int, y: Int, h: Int,
     ): Pair<FloatingKeyboard.Frame, FloatingKeyboard.Frame> {
         val gap = gapPx.coerceIn(0, 200)
         val totalW = leftW + rightW + gap
