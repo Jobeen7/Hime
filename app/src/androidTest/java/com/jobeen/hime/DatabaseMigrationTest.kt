@@ -287,8 +287,10 @@ class DatabaseMigrationTest {
         const val IME_DB_NAME_19_20 = "ime_database_migration_19_20_test"
 
         // v19 建表 SQL 逐字摘自 app/schemas 导出（AppDatabase/19.json
-        // 的 createSql，占位符已替换为表名；索引不在此列，与 12→14
-        // 一例同口径——Room 开库只比对 room_master_table 的身份哈希）。
+        // 的 createSql，占位符已替换为表名；19.json 各实体的 indices
+        // 必须一并建索引：Room 生产开库会做 TableInfo 校验（含索引），
+        // 只建表不建索引会抛 Migration didn't properly handle。
+        // 实机 v19 库经 MIGRATION_14_15/15_16 已有这些索引。
         val V19_CREATE_SQLS = listOf(
             "CREATE TABLE IF NOT EXISTS `candidate_sorting_v2` (`sorting_key` TEXT NOT NULL, `candidateIds` TEXT NOT NULL, PRIMARY KEY(`sorting_key`))",
             "CREATE TABLE IF NOT EXISTS `candidate_prefers` (`text` TEXT NOT NULL, `click_count` INTEGER NOT NULL, `context` TEXT NOT NULL, `created_at` INTEGER NOT NULL, `updated_at` INTEGER NOT NULL, PRIMARY KEY(`text`))",
@@ -300,6 +302,17 @@ class DatabaseMigrationTest {
             "CREATE TABLE IF NOT EXISTS `AIInstruction` (`id` TEXT NOT NULL, `name` TEXT NOT NULL, `detail` TEXT NOT NULL, `systemPromptID` TEXT, `userPromptID` TEXT, `providerID` TEXT, `sort` INTEGER NOT NULL, PRIMARY KEY(`id`))",
             "CREATE TABLE IF NOT EXISTS `AIConversation` (`id` TEXT NOT NULL, `title` TEXT NOT NULL, `createdAt` INTEGER NOT NULL, `updatedAt` INTEGER NOT NULL, `isTitleUserEdited` INTEGER NOT NULL, `systemPromptID` TEXT, `providerID` TEXT, `modelID` TEXT, `snapshotJSON` TEXT, PRIMARY KEY(`id`))",
             "CREATE TABLE IF NOT EXISTS `AIMessage` (`id` TEXT NOT NULL, `conversationId` TEXT, `role` TEXT NOT NULL, `status` TEXT NOT NULL, `sequence` INTEGER NOT NULL, `createdAt` INTEGER NOT NULL, `originalInput` TEXT, `renderedRequest` TEXT, `userPromptName` TEXT, `content` TEXT NOT NULL, `tokenEstimate` INTEGER NOT NULL, `usageJSON` TEXT, `errorCategory` TEXT, `requestID` TEXT, `regenerationOfID` TEXT, `isSuperseded` INTEGER NOT NULL, `configSnapshotJSON` TEXT, PRIMARY KEY(`id`), FOREIGN KEY(`conversationId`) REFERENCES `AIConversation`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE INDEX IF NOT EXISTS `index_phrase_records_shortcut` ON `phrase_records` (`shortcut`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIProvider_defaultModelId` ON `AIProvider` (`defaultModelId`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIProvider_sort` ON `AIProvider` (`sort`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIProviderModel_providerId` ON `AIProviderModel` (`providerId`)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS `index_AISystemPrompt_name` ON `AISystemPrompt` (`name`)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS `index_AIUserPrompt_name` ON `AIUserPrompt` (`name`)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS `index_AIInstruction_name` ON `AIInstruction` (`name`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIConversation_updatedAt` ON `AIConversation` (`updatedAt`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIMessage_conversationId` ON `AIMessage` (`conversationId`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIMessage_sequence` ON `AIMessage` (`sequence`)",
+            "CREATE INDEX IF NOT EXISTS `index_AIMessage_status` ON `AIMessage` (`status`)",
         )
 
         /** v19 服务商行：旧明文 token（升级前用户自填的值）。 */
