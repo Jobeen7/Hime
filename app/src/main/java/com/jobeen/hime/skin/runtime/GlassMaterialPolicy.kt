@@ -17,7 +17,7 @@ object GlassMaterialPolicy {
         val gradientBorderAlpha: Float,
         val bottom3DPx: Float,
         val pressScale: Float,
-        val pressSinkPx: Float,
+        val pressSinkPx: Float
     )
 
     /** 背景模糊回退：API 36+ 有系统模糊用之；否则 API 31+ 用 Window.setBackgroundBlurRadius；更低则无。 */
