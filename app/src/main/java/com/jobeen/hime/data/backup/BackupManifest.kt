@@ -62,6 +62,7 @@ internal data class BackupManifest(
             "aiProvidersCount", "aiInstructionsCount",
             "aiConversationsCount", "aiMessagesCount",
             "inputStatsPresent",
+            "clipSyncConfigPresent", "voicePresetsPresent", "themesDirsPresent",
         )
 
         /** 不符时的显示名（与 JSON 键不同的几项；未列出的即键本身）。 */
@@ -76,17 +77,20 @@ internal data class BackupManifest(
             "aiConversationsCount" to "ai_conversations",
             "aiMessagesCount" to "ai_messages",
             "inputStatsPresent" to "inputStats",
+            "clipSyncConfigPresent" to "clipSyncConfig",
+            "voicePresetsPresent" to "voicePresets",
+            "themesDirsPresent" to "themesDirs",
         )
 
         /** Boolean 存在标记键（其余一律为 Int 计数）。 */
         private val BOOLEAN_KEYS: Set<String> = setOf(
-            "inputStatsPresent",
+            "inputStatsPresent", "clipSyncConfigPresent", "voicePresetsPresent", "themesDirsPresent",
         )
 
         /** v2 清单之后新增的计数键（旧清单无这些键，解析与校验都跳过）。 */
         private val NEW_KEYS: Set<String> = setOf(
             "aiProvidersCount", "aiInstructionsCount",
-            "aiConversationsCount", "aiMessagesCount",
+            "aiConversationsCount", "aiMessagesCount", "clipSyncConfigPresent", "voicePresetsPresent", "themesDirsPresent",
         )
 
         /**
@@ -127,6 +131,9 @@ internal fun manifestCounts(
     aiConversationsCount: Int = 0,
     aiMessagesCount: Int = 0,
     inputStatsPresent: Boolean,
+    clipSyncConfigPresent: Boolean = false,
+    voicePresetsPresent: Boolean = false,
+    themesDirsPresent: Boolean = false,
 ): Map<String, Any> = linkedMapOf(
     "prefsFiles" to prefsFiles,
     "prefsEntries" to prefsEntries,
@@ -140,4 +147,7 @@ internal fun manifestCounts(
     "aiConversationsCount" to aiConversationsCount,
     "aiMessagesCount" to aiMessagesCount,
     "inputStatsPresent" to inputStatsPresent,
+    "clipSyncConfigPresent" to clipSyncConfigPresent,
+    "voicePresetsPresent" to voicePresetsPresent,
+    "themesDirsPresent" to themesDirsPresent,
 )
