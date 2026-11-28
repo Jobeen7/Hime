@@ -1357,9 +1357,9 @@ class KeyboardWindowView(
         runCatching {
             val window = (context as? android.inputmethodservice.InputMethodService)?.window
                 ?: return@runCatching
-            val attrs = window.attributes
+            val attrs = window.getAttributes()
             attrs.blurBehindRadius = if (glass) 60 else 0
-            window.attributes = attrs
+            window.setAttributes(attrs)
         }
     }
 
