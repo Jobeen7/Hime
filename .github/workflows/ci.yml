@@ -58,6 +58,21 @@ jobs:
       - name: Rebuild resource.zip
         run: bash tools/wanxiang-builtin/build-resource.sh
 
+      - name: Generate verification metadata (PR helper)
+        run: |
+          set +e
+          ./gradlew --write-verification-metadata connectedDebugAndroidTest || true
+          ./gradlew --write-verification-metadata :app:dependencies --configuration :app:_internal-unified-test-platform-android-test-plugin-host-additional-test-output || true
+          echo "gen done"
+          git diff --stat -- gradle/verification-metadata.xml || true
+
+      - name: Upload verification metadata
+        uses: actions/upload-artifact@ea165891db0d67debdfb185e31808d1d0060a4a46 # v4
+        with:
+          name: verification-metadata
+          path: gradle/verification-metadata.xml
+          if-no-files-found: error
+
       - name: Unit tests
         run: ./gradlew testDebugUnitTest
 
@@ -80,3 +95,11 @@ jobs:
           done
           echo "handleMessage not found in dex" >&2
           exit 1
+
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@ea165891db0d67debdfb185e31808d1d0060a4a46 # v4
+        if: always()
+        with:
+          name: r8-mapping-${{ github.sha }}
+          path: app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
