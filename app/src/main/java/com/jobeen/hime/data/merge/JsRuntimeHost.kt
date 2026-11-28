@@ -9,7 +9,7 @@ object JsRuntimeHost {
     enum class Code { OK, DENIED, BAD_MANIFEST, TOO_MANY, TIMEOUT }
     data class Outcome(val code: Code, val value: String = "")
 
-    private val domainPattern = Regex("^[a-z0-9.-]+\.[a-z]{2,}$", RegexOption.IGNORE_CASE)
+    private val domainPattern = Regex("^[a-z0-9.-]+\\.[a-z]{2,}$", RegexOption.IGNORE_CASE)
 
     fun validate(m: Manifest): String? {
         if (m.name.isBlank() || m.name.length > 64) return "name"
