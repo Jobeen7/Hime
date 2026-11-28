@@ -58,6 +58,14 @@ jobs:
           echo "handleMessage not found in dex" >&2
           exit 1
 
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r8-mapping-${{ github.sha }}
+          path: app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
+
       - name: Publish Release (draft preview)
         # 与 HIME 一致：v* tag 自动建草稿（draft）+ 预览（prerelease），仅协作者可见，
         # 不设为 Latest；正式版再在网页点 Publish 切换为公开 Latest。

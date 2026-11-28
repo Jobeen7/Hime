@@ -80,3 +80,11 @@ jobs:
           done
           echo "handleMessage not found in dex" >&2
           exit 1
+
+      - name: Upload R8 mapping
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: r8-mapping-${{ github.sha }}
+          path: app/build/outputs/mapping/release/mapping.txt
+          if-no-files-found: warn
