@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.jobeen.hime.data.merge
 
-/** F01 候选字卡与词库导入（纯函数）：字卡组装、表情折叠开关、TXT/搜狗/QQ 解析与事务化导入（坏行整批回滚）。真实 Rime 用户词典写盘由调用方承载。 */
+/** F01 候选字卡与词库导入（纯函数）：字卡组装、表情折叠开关、TXT/外部词库格式解析与事务化导入（坏行整批回滚）。真实 Rime 用户词典写盘由调用方承载。 */
 object CandidateDict {
     enum class Source { TXT, SOGOU, QQ }
     data class Detail(val text: String, val readings: List<String>, val radical: String = "", val strokes: Int = 0, val unicodeHex: String, val wubiCode: String = "")
@@ -15,7 +15,7 @@ object CandidateDict {
     }
     fun emojiCollapsed(collapse: Boolean): Boolean = collapse
 
-    /** 解析词库文本：每行 "词 权重"（QQ 允许 "词" 无权重默认 1）；任一行非法整批返回 null，不做半导入。 */
+    /** 解析词库文本：每行 "词 权重"（紧凑格式允许 "词" 无权重默认 1）；任一行非法整批返回 null，不做半导入。 */
     fun parse(text: String, source: Source): List<Entry>? {
         val out = mutableListOf<Entry>()
         for (raw in text.lines()) {

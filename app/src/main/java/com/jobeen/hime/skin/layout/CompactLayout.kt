@@ -3,7 +3,7 @@
 package com.jobeen.hime.skin.layout
 
 /**
- * 紧凑拼音布局自动生成（松烟 merged14/merged18 思路，自研重写，未搬代码）：
+ * 紧凑拼音布局自动生成（紧凑布局思路，自研重写）：
  *
  * - 字母表来源：方案字母表（默认 a–z，即万象拼音方案的字母表；
  *   PinYinUtil.allPinyin 的全部音节只用这 26 个字母）。

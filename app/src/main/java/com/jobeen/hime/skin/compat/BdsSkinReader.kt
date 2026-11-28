@@ -7,10 +7,10 @@ import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
 
 /**
- * F10 百度 .bds 直读：.bds 实为 ZIP 包。运行时直接解包，把切图/底图清单与键位/音效映射为中间规格。
+ * F10 BDS 皮肤包直读：.bds 实为 ZIP 包。运行时直接解包，把切图/底图清单与键位/音效映射为中间规格。
  * 本层只清单+解析（不把位图塞 SkinImageStore；落盘由 Android 侧调用方完成）。
  */
-object BaiduBdsReader {
+object BdsSkinReader {
 
     data class BdsListing(val entries: List<String>, val layout: CompatLayout?)
 

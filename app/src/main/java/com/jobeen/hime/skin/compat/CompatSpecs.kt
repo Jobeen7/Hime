@@ -5,7 +5,7 @@ import com.jobeen.hime.skin.layout.LayoutKeyModel
 import com.jobeen.hime.skin.layout.LayoutModel
 import com.jobeen.hime.skin.model.SkinAction
 
-/** 兼容层中间规格：三个直读器（Trime YAML / 百度 .bds / 松烟 JSON）共用，再映射到 LayoutModel。 */
+/** 兼容层中间规格：三个直读器（YAML 主题 / BDS 皮肤包 / 自定义 JSON）共用，再映射到 LayoutModel。 */
 data class CompatKey(val label: String, val widthWeight: Double = 1.0, val text: String = "")
 data class CompatStyleSnapshot(val backgroundPath: String? = null, val accentColor: String? = null, val mappingText: String = "")
 data class CompatLayout(val layoutId: String, val name: String, val rows: List<List<CompatKey>>, val style: CompatStyleSnapshot)

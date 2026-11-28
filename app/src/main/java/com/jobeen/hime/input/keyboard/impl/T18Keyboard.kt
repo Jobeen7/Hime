@@ -21,7 +21,7 @@ import com.jobeen.hime.input.keyboard.key.sidePannelKey
 import com.jobeen.hime.input.keyboard.key.spaceKey
 
 /**
- * 18 键紧凑拼音键盘（松烟 merged18 思路，自研）：
+ * 18 键紧凑拼音键盘（紧凑布局思路，自研）：
  * QWERTY 行内相邻键合并的 18 个字母键（qw/er/ty/u/i/o/p/as/df/
  * gh/j/k/l/zx/cv/b/n/m），点按发首字母、长按发次字母，同一词库
  * 与学习词，组合消歧见 PinYinUtil.possibleCompactCombinations

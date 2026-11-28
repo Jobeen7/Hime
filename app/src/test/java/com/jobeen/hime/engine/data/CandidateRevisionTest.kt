@@ -8,7 +8,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 候选帧代次门（松烟模型，2026-11-16 取代 shouldApplyCandidateFrame
+ * 候选帧代次门（自研模型，2026-11-16 取代 shouldApplyCandidateFrame
  * 的纯 revision 比较）：首屏取 restoreCandidates 的 requestId，追加页
  * 取批次号，未版本化（合成帧如清空、联想）缺省 0。消费侧先比代次，
  * 再比内容（P2 无变化丢弃）；追加页不走 setCandidates，版本号不与

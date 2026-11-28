@@ -2,11 +2,11 @@
 package com.jobeen.hime.skin.compat
 
 /**
- * F10 Trime YAML 直读：解析 .yaml 主题配色、按键样式、九宫格/全键布局与背景图路径，
+ * F10 YAML 主题直读：解析 .yaml 主题配色、按键样式、九宫格/全键布局与背景图路径，
  * 映射为 CompatLayout（再经 CompatLayoutMapper.toLayoutModel 进 Hime 主干）。
- * 仅实现 Trime 常用子集：两空格缩进的 key: value、列表行 "- label"、九宫格 keys 段。
+ * 仅实现常用子集：两空格缩进的 key: value、列表行 "- label"、九宫格 keys 段。
  */
-object TrimeYamlReader {
+object ThemeYamlReader {
 
     fun parse(yamlText: String, fallbackId: String): CompatLayout? {
         if (yamlText.isBlank()) return null

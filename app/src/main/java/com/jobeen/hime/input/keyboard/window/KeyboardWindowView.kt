@@ -1593,7 +1593,7 @@ class KeyboardWindowView(
     private var lastCandidatePageNo: Int = 0
     private var lastCandidateIsLastPage: Boolean = false
 
-    // 已应用的首屏候选帧代次门（松烟模型）：窗口生命周期内 requestId
+    // 已应用的首屏候选帧代次门（自研模型）：窗口生命周期内 requestId
     // 单调递增；引擎重建后从头计，凭 epoch 检测放行新代次首帧
     // （.2 案），见 CandidateFrameGate。
     private val candidateFrameGate = CandidateFrameGate()
