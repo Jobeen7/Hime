@@ -29,6 +29,7 @@ import androidx.core.view.isGone
 import com.jobeen.hime.R
 import com.jobeen.hime.data.keyboard.theme.GlobalFonts
 import com.jobeen.hime.data.keyboard.theme.KeyboardColors
+import com.jobeen.hime.skin.image.SkinImageStore
 import com.jobeen.hime.skin.layout.CompactLayoutGenerator
 import com.jobeen.hime.skin.symbolbar.AppSymbolBarTypeStore
 import com.jobeen.hime.skin.symbolbar.SymbolBarConfig
@@ -180,6 +181,12 @@ class KeyboardWindowView(
 
     /** 当前窗口背景 GIF 动图（SDK≥28 时解原文件；无 GIF 时 null）。 */
     private var gifDrawable: android.graphics.drawable.AnimatedImageDrawable? = null
+
+    /** 当前已应用的背景图资产 id；解码完成前为请求中的 id，位图到手后不变。 */
+    private var windowBackgroundAsset: String? = null
+    private var windowBackgroundBitmap: android.graphics.Bitmap? = null
+    /** 玻璃模糊背景层（独立 ImageView，只在玻璃+背景图时出现）。 */
+    private var glassBlurLayer: android.widget.ImageView? = null
 
     /**
      * 键盘顶角（2026-10-29 外观轮全局样式）：贴底键盘只论顶角——
@@ -1298,10 +1305,113 @@ class KeyboardWindowView(
         // 解码失败回落制备位图（原有口径）；28 以下静态首帧。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) gifDrawable?.stop()
         gifDrawable = null
-        // 皮肤 v3 死壳删除后快照恒为 null，无背景位图／渐变／GIF，
-        // 恒回落主题纯色背景。
+        // 原生皮肤：玻璃（半透明底 + 背景层模糊）与背景图（异步解码、
+        // 失败/无图回落纯色底）。背景位图只在主题刷新时请求，不进按键热路径。
+        val scheme = cachedColors
+        val glass = scheme.glassEnabled
+        val baseColor = if (glass) {
+            android.graphics.Color.argb(
+                110,
+                android.graphics.Color.red(scheme.background),
+                android.graphics.Color.green(scheme.background),
+                android.graphics.Color.blue(scheme.background),
+            )
+        } else {
+            scheme.background
+        }
+        val assetId = scheme.backgroundImageAsset?.takeIf { it.isNotBlank() }
+        if (assetId == null) {
+            windowBackgroundAsset = null
+            windowBackgroundBitmap = null
+            hideGlassLayer()
+            background = null
+            setBackgroundColor(baseColor)
+            return
+        }
+        if (assetId == windowBackgroundAsset && windowBackgroundBitmap != null) {
+            applyBackgroundBitmap(windowBackgroundBitmap!!, glass, scheme.backgroundImageMode, baseColor)
+            return
+        }
+        windowBackgroundAsset = assetId
+        windowBackgroundBitmap = null
+        hideGlassLayer()
+        // 先铺底色，避免异步解码期间空白
         background = null
-        setBackgroundColor(cachedColors.background)
+        setBackgroundColor(baseColor)
+        val reqW = width.takeIf { it > 0 } ?: 1080
+        val reqH = height.takeIf { it > 0 } ?: 480
+        SkinImageStore.request(context, assetId, reqW, reqH) { bitmap ->
+            // 回调恒主线程；资产已变化（主题切换）时丢弃
+            if (bitmap != null && windowBackgroundAsset == assetId &&
+                cachedColors.backgroundImageAsset == assetId
+            ) {
+                windowBackgroundBitmap = bitmap
+                applyBackgroundBitmap(
+                    bitmap,
+                    cachedColors.glassEnabled,
+                    cachedColors.backgroundImageMode,
+                    baseColor,
+                )
+            }
+        }
+    }
+
+    /**
+     * 背景位图挂载：玻璃开启且 Android 12+ 时，图片只上独立背景层并
+     * 挂 RenderEffect 模糊（只作用背景层，不进按键热路径）；其余直接
+     * 设视图背景。低版本玻璃请调用方传 glass=false 走半透明回落。
+     */
+    private fun applyBackgroundBitmap(
+        bitmap: android.graphics.Bitmap,
+        glass: Boolean,
+        mode: String,
+        baseColor: Int,
+    ) {
+        if (glass && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            background = null
+            setBackgroundColor(baseColor)
+            showGlassLayer(bitmap, mode)
+        } else {
+            hideGlassLayer()
+            background = android.graphics.drawable.BitmapDrawable(resources, bitmap)
+        }
+    }
+
+    /** 玻璃模糊背景层：独立 ImageView 垫底，只在玻璃+背景图时出现。 */
+    private fun showGlassLayer(bitmap: android.graphics.Bitmap, mode: String) {
+        val layer = glassBlurLayer ?: android.widget.ImageView(context).also {
+            glassBlurLayer = it
+            it.isClickable = false
+            it.isFocusable = false
+            addView(
+                it,
+                0,
+                android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        layer.scaleType = when (mode.trim().lowercase()) {
+            "center" -> android.widget.ImageView.ScaleType.CENTER
+            "fit" -> android.widget.ImageView.ScaleType.FIT_CENTER
+            else -> android.widget.ImageView.ScaleType.CENTER_CROP
+        }
+        layer.setImageBitmap(bitmap)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            layer.setRenderEffect(
+                android.graphics.RenderEffect.createBlurEffect(
+                    18f,
+                    18f,
+                    android.graphics.Shader.TileMode.CLAMP,
+                ),
+            )
+        }
+        layer.visibility = View.VISIBLE
+    }
+
+    private fun hideGlassLayer() {
+        glassBlurLayer?.visibility = View.GONE
     }
 
     /** 底部安全间距生效值：皮肤 presence 指定时取皮肤值，否则全局偏好（定稿四.3）。 */

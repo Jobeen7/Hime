@@ -264,8 +264,11 @@ abstract class KeyView(
      * 落定（失败帧跳过、不卡住整组，旧口径 mapNotNull 同理）。
      */
     private fun requestKeyImage(assetId: String, onBitmap: (Bitmap?) -> Unit) {
-        // 皮肤 v3 死壳删除后图片缓存恒空（字节源只由死 provider 安装），恒以 null 落定。
-        onBitmap(null)
+        // 原生图片资产供给：SkinImageStore 从皮肤库目录/内置资产异步解码，
+        // 失败回调 null，调用方以颜色键面回落（回调恒主线程）。
+        com.jobeen.hime.skin.image.SkinImageStore.request(context, assetId) { bitmap ->
+            onBitmap(bitmap)
+        }
     }
 
     /** 多图异步集齐（卡通帧／物理位图）：按原顺序收集已解出的位图，全部落定（成功或失败）后回调一次；代次已变时不回调。 */

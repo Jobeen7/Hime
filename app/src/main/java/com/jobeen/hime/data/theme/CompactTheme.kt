@@ -65,6 +65,9 @@ data class CompactTheme(
                     ),
                     toastBackground = colors.toastBackground,
                     toastText = colors.toastText,
+                    backgroundImageAsset = colors.backgroundImageAsset,
+                    backgroundImageMode = colors.backgroundImageMode,
+                    glassEnabled = colors.glassEnabled,
                 )
             )
         }
@@ -95,6 +98,10 @@ data class CompactColors(
     @SerialName("pn") val pinner: CompactPinner,
     @SerialName("tb") val toastBackground: Int? = null,
     @SerialName("tt") val toastText: Int? = null,
+    // 原生皮肤字段（旧码缺失时取默认，兼容旧版二维码）
+    @SerialName("bi") val backgroundImageAsset: String? = null,
+    @SerialName("bm") val backgroundImageMode: String = "fill",
+    @SerialName("ge") val glassEnabled: Boolean = false,
 ) {
     fun toColorScheme(): KeyboardColors.ColorScheme = KeyboardColors.ColorScheme(
         keyBackground = keyBackground,
@@ -139,6 +146,9 @@ data class CompactColors(
         ),
         toastBackground = toastBackground ?: specialKeyBackground,
         toastText = toastText ?: keyText,
+        backgroundImageAsset = backgroundImageAsset,
+        backgroundImageMode = backgroundImageMode.ifBlank { "fill" },
+        glassEnabled = glassEnabled,
     )
 }
 
