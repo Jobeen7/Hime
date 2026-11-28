@@ -129,6 +129,11 @@ fun readBundledWanxiangVersionForStamp(): String {
         }
     }
 
+    flavorDimensions("mode")
+    productFlavors {
+        create("main") { dimension = "mode" }
+        create("offline") { dimension = "mode" }
+    }
     buildTypes {
         debug {
             // debug 带 .debug 后缀，与正式版不同包名：同机可并存，
