@@ -74,7 +74,7 @@ jobs:
 
       - name: Verify Rime.handleMessage survived R8 (dex grep)
         run: |
-          APK=$(ls app/build/outputs/apk/release/*.apk | head -n 1)
+          APK=$(ls app/build/outputs/apk/full/release/*.apk | head -n 1)
           for DEX in $(unzip -l "$APK" | awk '/classes[0-9]*\.dex/ {print $4}'); do
             unzip -p "$APK" "$DEX" | strings | grep -q handleMessage && exit 0
           done
@@ -86,5 +86,5 @@ jobs:
         if: always()
         with:
           name: r8-mapping-${{ github.sha }}
-          path: app/build/outputs/mapping/release/mapping.txt
+          path: app/build/outputs/mapping/fullRelease/mapping.txt
           if-no-files-found: warn
