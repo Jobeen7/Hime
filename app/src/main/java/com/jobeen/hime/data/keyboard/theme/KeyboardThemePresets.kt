@@ -160,11 +160,144 @@ object KeyboardThemePresets {
         colors = MonetPalette.LightFallback,
     )
 
+    // ---- 原生皮肤（对照输入法效果原生实现，不含任何第三方资产）----
+
+    /** 风景图片风：整键盘背景图 + 半透明键面，图片走内置资产 scenic。 */
+    val Scenic = KeyboardTheme(
+        id = "native_scenic",
+        name = "风景图片",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.argb(210, 255, 255, 255),
+            keyPressed = Color.argb(230, 210, 225, 245),
+            keyBorderStroke = Color.argb(0, 0, 0, 0),
+            specialKeyBackground = Color.argb(210, 240, 245, 255),
+            specialKeyPressed = Color.argb(230, 200, 215, 240),
+            specialKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            accentKeyBackground = Color.rgb(70, 130, 200),
+            accentKeyPressed = Color.rgb(55, 110, 180),
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(25, 45, 80),
+            specialKeyText = Color.rgb(40, 70, 110),
+            accentKeyText = Color.rgb(255, 255, 255),
+            altText = Color.rgb(100, 130, 170),
+            background = Color.rgb(120, 160, 210),
+            backgroundImageAsset = "scenic",
+            backgroundImageMode = "fill",
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                background = Color.argb(170, 230, 240, 255),
+                toolbarText = Color.rgb(25, 45, 80),
+                toolbarActived = Color.rgb(70, 130, 200),
+                toolbarIcon = Color.rgb(60, 90, 130),
+                candidateBackground = Color.argb(210, 255, 255, 255),
+                candidateText = Color.rgb(25, 45, 80),
+                candidateIndex = Color.rgb(100, 130, 170),
+                candidateDivider = Color.argb(120, 160, 190, 220),
+                selectedCandidateText = Color.rgb(70, 130, 200),
+                toolbarPressed = Color.rgb(25, 45, 80),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.argb(220, 255, 255, 255),
+                textColor = Color.rgb(25, 45, 80),
+                secondaryTextColor = Color.rgb(100, 130, 170),
+            ),
+            toastBackground = Color.rgb(50, 75, 110),
+            toastText = Color.rgb(255, 255, 255),
+        ),
+    )
+
+    /** 玻璃拟态：半透明底 + 系统背景模糊（低版本回落半透明）。 */
+    val Glass = KeyboardTheme(
+        id = "native_glass",
+        name = "玻璃拟态",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.argb(140, 255, 255, 255),
+            keyPressed = Color.argb(180, 220, 235, 255),
+            keyBorderStroke = Color.argb(60, 255, 255, 255),
+            specialKeyBackground = Color.argb(120, 240, 248, 255),
+            specialKeyPressed = Color.argb(170, 210, 230, 255),
+            specialKeyBorderStroke = Color.argb(60, 255, 255, 255),
+            accentKeyBackground = Color.argb(220, 90, 160, 230),
+            accentKeyPressed = Color.argb(235, 70, 140, 215),
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(245, 250, 255),
+            specialKeyText = Color.rgb(230, 242, 255),
+            accentKeyText = Color.rgb(255, 255, 255),
+            altText = Color.argb(170, 220, 235, 255),
+            background = Color.rgb(35, 55, 85),
+            glassEnabled = true,
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                background = Color.argb(120, 35, 55, 85),
+                toolbarText = Color.rgb(245, 250, 255),
+                toolbarActived = Color.rgb(140, 200, 250),
+                toolbarIcon = Color.rgb(220, 235, 255),
+                candidateBackground = Color.argb(150, 255, 255, 255),
+                candidateText = Color.rgb(30, 50, 80),
+                candidateIndex = Color.rgb(160, 190, 225),
+                candidateDivider = Color.argb(100, 255, 255, 255),
+                selectedCandidateText = Color.rgb(90, 160, 230),
+                toolbarPressed = Color.rgb(255, 255, 255),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.argb(190, 45, 65, 95),
+                textColor = Color.rgb(245, 250, 255),
+                secondaryTextColor = Color.rgb(170, 200, 230),
+            ),
+            toastBackground = Color.rgb(45, 65, 95),
+            toastText = Color.rgb(245, 250, 255),
+        ),
+    )
+
+    /** 简约风：素色扁平、低圆角、无图片与模糊。 */
+    val Minimal = KeyboardTheme(
+        id = "native_minimal",
+        name = "简约",
+        colors = KeyboardColors.ColorScheme(
+            keyBackground = Color.rgb(250, 250, 250),
+            keyPressed = Color.rgb(235, 235, 235),
+            keyBorderStroke = Color.argb(0, 0, 0, 0),
+            specialKeyBackground = Color.rgb(245, 245, 245),
+            specialKeyPressed = Color.rgb(230, 230, 230),
+            specialKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            accentKeyBackground = Color.rgb(50, 110, 210),
+            accentKeyPressed = Color.rgb(40, 95, 190),
+            accentKeyBorderStroke = Color.argb(0, 0, 0, 0),
+            keyText = Color.rgb(35, 35, 40),
+            specialKeyText = Color.rgb(90, 90, 100),
+            accentKeyText = Color.rgb(255, 255, 255),
+            altText = Color.rgb(130, 130, 140),
+            background = Color.rgb(242, 242, 245),
+            surfaceStyle = KeyboardColors.SurfaceStyle.Flat,
+            cornerRadius = 2f,
+            panel = KeyboardColors.ColorScheme.PanelColors(
+                background = Color.rgb(242, 242, 245),
+                toolbarText = Color.rgb(35, 35, 40),
+                toolbarActived = Color.rgb(50, 110, 210),
+                toolbarIcon = Color.rgb(110, 110, 120),
+                candidateBackground = Color.rgb(255, 255, 255),
+                candidateText = Color.rgb(35, 35, 40),
+                candidateIndex = Color.rgb(130, 130, 140),
+                candidateDivider = Color.argb(100, 180, 180, 190),
+                selectedCandidateText = Color.rgb(50, 110, 210),
+                toolbarPressed = Color.rgb(35, 35, 40),
+            ),
+            pinner = KeyboardColors.ColorScheme.PinnerColors(
+                background = Color.rgb(255, 255, 255),
+                textColor = Color.rgb(35, 35, 40),
+                secondaryTextColor = Color.rgb(130, 130, 140),
+            ),
+            toastBackground = Color.rgb(60, 60, 68),
+            toastText = Color.rgb(255, 255, 255),
+        ),
+    )
+
     val ALL: List<KeyboardTheme>
         get() = listOf(
             Amoled,
             Light,
             Sunset,
             Monet,
+            Scenic,
+            Glass,
+            Minimal,
         ) + customThemes
 }
