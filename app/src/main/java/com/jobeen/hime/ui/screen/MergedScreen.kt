@@ -111,7 +111,7 @@ fun MergedScreen(onBack: () -> Unit) {
                         layoutResult = if (keys.isEmpty()) {
                             emptyResultText
                         } else {
-                            keys.joinToString("\n") { "${it.label}: ${it.value}" }
+                            appendLayoutConvert(keys)
                         }
                     },
                 ) { Text(stringResource(R.string.merged_parse_yaml)) }
@@ -121,7 +121,7 @@ fun MergedScreen(onBack: () -> Unit) {
                         layoutResult = if (keys.isEmpty()) {
                             emptyResultText
                         } else {
-                            keys.joinToString("\n") { "${it.label}: ${it.value}" }
+                            appendLayoutConvert(keys)
                         }
                     },
                 ) { Text(stringResource(R.string.merged_parse_ini)) }
@@ -209,4 +209,22 @@ private fun runSelfCheck(context: Context): String {
     }
     line("floating") { MergeWiring.floatingFrame(context, 10, 10, 200, 100, 1080, 1920).toString() }
     return sb.toString().trimEnd()
+}
+
+/** 布局导入后的转换链（设置页真实入口）：解析结果追加 YAML 导出与 Dvorak 转换计数；
+ *  门控关闭时两者返回空，此处不追加，保持原解析展示。 */
+private fun appendLayoutConvert(keys: List<LayoutImport.KeyDef>): String {
+    val base = keys.joinToString("\n") { "${it.label}: ${it.value}" }
+    val yaml = MergeWiring.layoutToYaml(keys)
+    val dvorak = MergeWiring.layoutToDvorak(keys)
+    return buildString {
+        append(base)
+        if (yaml.isNotBlank()) {
+            append("\n--- yaml ---\n")
+            append(yaml)
+        }
+        if (dvorak.isNotEmpty()) {
+            append("\n--- dvorak: ${dvorak.size} keys ---")
+        }
+    }
 }
