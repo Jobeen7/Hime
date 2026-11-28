@@ -182,9 +182,11 @@ class KeyboardWindowView(
     /** 当前窗口背景 GIF 动图（SDK≥28 时解原文件；无 GIF 时 null）。 */
     private var gifDrawable: android.graphics.drawable.AnimatedImageDrawable? = null
 
-    /** 当前已应用的背景图资产 id；解码完成前为请求中的 id，drawable 挂载后不变。 */
+    /** 当前已应用的背景图资产 id；解码完成前为请求中的 id，位图到手后不变。 */
     private var windowBackgroundAsset: String? = null
-    private var windowBackgroundDrawable: android.graphics.drawable.Drawable? = null
+    private var windowBackgroundBitmap: android.graphics.Bitmap? = null
+    /** 玻璃模糊背景层（独立 ImageView，只在玻璃+背景图时出现）。 */
+    private var glassBlurLayer: android.widget.ImageView? = null
 
     /**
      * 键盘顶角（2026-10-29 外观轮全局样式）：贴底键盘只论顶角——
@@ -1303,7 +1305,7 @@ class KeyboardWindowView(
         // 解码失败回落制备位图（原有口径）；28 以下静态首帧。
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) gifDrawable?.stop()
         gifDrawable = null
-        // 原生皮肤：玻璃（半透明底 + 系统背景模糊）与背景图（异步解码、
+        // 原生皮肤：玻璃（半透明底 + 背景层模糊）与背景图（异步解码、
         // 失败/无图回落纯色底）。背景位图只在主题刷新时请求，不进按键热路径。
         val scheme = cachedColors
         val glass = scheme.glassEnabled
@@ -1317,20 +1319,22 @@ class KeyboardWindowView(
         } else {
             scheme.background
         }
-        applyGlassBlur(glass)
         val assetId = scheme.backgroundImageAsset?.takeIf { it.isNotBlank() }
         if (assetId == null) {
             windowBackgroundAsset = null
-            windowBackgroundDrawable = null
+            windowBackgroundBitmap = null
+            hideGlassLayer()
             background = null
             setBackgroundColor(baseColor)
             return
         }
-        if (assetId == windowBackgroundAsset && windowBackgroundDrawable != null) {
-            background = windowBackgroundDrawable
+        if (assetId == windowBackgroundAsset && windowBackgroundBitmap != null) {
+            applyBackgroundBitmap(windowBackgroundBitmap!!, glass, scheme.backgroundImageMode, baseColor)
             return
         }
         windowBackgroundAsset = assetId
+        windowBackgroundBitmap = null
+        hideGlassLayer()
         // 先铺底色，避免异步解码期间空白
         background = null
         setBackgroundColor(baseColor)
@@ -1341,26 +1345,73 @@ class KeyboardWindowView(
             if (bitmap != null && windowBackgroundAsset == assetId &&
                 cachedColors.backgroundImageAsset == assetId
             ) {
-                val drawable = android.graphics.drawable.BitmapDrawable(resources, bitmap)
-                windowBackgroundDrawable = drawable
-                background = drawable
+                windowBackgroundBitmap = bitmap
+                applyBackgroundBitmap(
+                    bitmap,
+                    cachedColors.glassEnabled,
+                    cachedColors.backgroundImageMode,
+                    baseColor,
+                )
             }
         }
     }
 
     /**
-     * 玻璃模糊：Android 12+ 走系统窗口背景模糊（只作用窗口底，不进
-     * 按键热路径）；低版本/取不到窗口时回落半透明底色。
+     * 背景位图挂载：玻璃开启且 Android 12+ 时，图片只上独立背景层并
+     * 挂 RenderEffect 模糊（只作用背景层，不进按键热路径）；其余直接
+     * 设视图背景。低版本玻璃请调用方传 glass=false 走半透明回落。
      */
-    private fun applyGlassBlur(glass: Boolean) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return
-        runCatching {
-            val window = (context as? android.inputmethodservice.InputMethodService)?.window
-                ?: return@runCatching
-            val attrs = window.getAttributes()
-            attrs.blurBehindRadius = if (glass) 60 else 0
-            window.setAttributes(attrs)
+    private fun applyBackgroundBitmap(
+        bitmap: android.graphics.Bitmap,
+        glass: Boolean,
+        mode: String,
+        baseColor: Int,
+    ) {
+        if (glass && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            background = null
+            setBackgroundColor(baseColor)
+            showGlassLayer(bitmap, mode)
+        } else {
+            hideGlassLayer()
+            background = android.graphics.drawable.BitmapDrawable(resources, bitmap)
         }
+    }
+
+    /** 玻璃模糊背景层：独立 ImageView 垫底，只在玻璃+背景图时出现。 */
+    private fun showGlassLayer(bitmap: android.graphics.Bitmap, mode: String) {
+        val layer = glassBlurLayer ?: android.widget.ImageView(context).also {
+            glassBlurLayer = it
+            it.isClickable = false
+            it.isFocusable = false
+            addView(
+                it,
+                0,
+                android.widget.FrameLayout.LayoutParams(
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                    android.widget.FrameLayout.LayoutParams.MATCH_PARENT,
+                ),
+            )
+        }
+        layer.scaleType = when (mode.trim().lowercase()) {
+            "center" -> android.widget.ImageView.ScaleType.CENTER
+            "fit" -> android.widget.ImageView.ScaleType.FIT_CENTER
+            else -> android.widget.ImageView.ScaleType.CENTER_CROP
+        }
+        layer.setImageBitmap(bitmap)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            layer.setRenderEffect(
+                android.graphics.RenderEffect.createBlurEffect(
+                    18f,
+                    18f,
+                    android.graphics.Shader.TileMode.CLAMP,
+                ),
+            )
+        }
+        layer.visibility = View.VISIBLE
+    }
+
+    private fun hideGlassLayer() {
+        glassBlurLayer?.visibility = View.GONE
     }
 
     /** 底部安全间距生效值：皮肤 presence 指定时取皮肤值，否则全局偏好（定稿四.3）。 */
